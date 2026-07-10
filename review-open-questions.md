@@ -78,6 +78,8 @@ Retry/fallback ข้าม provider, cost accounting, prompt caching, rate limi
 
 ### P1 — ตอบระหว่าง detailed design (ก่อน implement component นั้น)
 
+> **สถานะ: ตอบครบแล้ว** — ดู `decisions.md` (D5–D8 และตาราง P1/P2)
+
 | # | คำถาม |
 |---|---|
 | Q7 | Checkpoint granularity: persist ทุก LLM call หรือทุก tool call? หน่วยของ resume คืออะไร? |
