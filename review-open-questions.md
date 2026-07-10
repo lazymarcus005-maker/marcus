@@ -65,6 +65,8 @@ Retry/fallback ข้าม provider, cost accounting, prompt caching, rate limi
 
 ### P0 — ต้องตอบก่อนเริ่ม implement (blocking)
 
+> **สถานะ: ตอบครบแล้ว** — ดูคำตอบและผลกระทบใน `decisions.md`
+
 | # | คำถาม | ตัวเลือก/ข้อสังเกต |
 |---|---|---|
 | Q1 | ภาษาหลักของระบบ? | Python+FastAPI (iterate เร็ว, MCP SDK แข็งแรง) vs .NET 10 (ecosystem เดิม) — เอกสารเสนอทั้งคู่ ต้องเลือกหนึ่ง |
