@@ -2,14 +2,16 @@
 
 แตกจาก `review-open-questions.md` §4 ตามการตัดสินใจใน `decisions.md` — ทุก task เป็น GitHub issue แล้ว (เลข issue ตรงกับลำดับ)
 
-## Phase 0 — Foundation
+**สถานะ: Phase 0–1 เสร็จแล้ว (#1–#13 ปิดหมด)** — core loop ทำงานจริง ผ่าน real Postgres/Redis/RabbitMQ, มี API ให้คุยกับ agent ได้ครบ (create run → poll → message/cancel), crash-safe ทั้ง tool execution (write-ahead + idempotency) และ run lease (heartbeat + reaper)
+
+## Phase 0 — Foundation ✅
 | Issue | Task |
 |---|---|
 | [#1](https://github.com/lazymarcus005-maker/marcus/issues/1) | Project scaffold: Python + FastAPI + uv + ruff + pytest + CI |
 | [#2](https://github.com/lazymarcus005-maker/marcus/issues/2) | Docker Compose: PG + Redis + RabbitMQ + api + worker |
 | [#3](https://github.com/lazymarcus005-maker/marcus/issues/3) | Core DB schema v1 + Alembic migrations |
 
-## Phase 1 — Core Loop (ต้องเสถียรก่อนอย่างอื่น)
+## Phase 1 — Core Loop (ต้องเสถียรก่อนอย่างอื่น) ✅
 | Issue | Task |
 |---|---|
 | [#4](https://github.com/lazymarcus005-maker/marcus/issues/4) | Run state machine + repository layer (optimistic locking) |
