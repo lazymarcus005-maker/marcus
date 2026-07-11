@@ -10,6 +10,7 @@ from harness.llm.gateway import LLMError, LLMGateway
 from harness.llm.types import ToolCall
 from harness.llm.usage import record_usage
 from harness.runtime import guardrails
+from harness.runtime.compaction import maybe_compact
 from harness.runtime.context import build_llm_messages
 from harness.runtime.native_tools import (
     ASK_USER_TOOL_NAME,
@@ -165,6 +166,7 @@ class RunEngine:
 
         (in which case the run has already been checkpointed to Failed and committed).
         """
+        await maybe_compact(self.session, self.llm, run)
         messages = await build_llm_messages(self.session, run)
         tool_specs = [
             t.to_spec()

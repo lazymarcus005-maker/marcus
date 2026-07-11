@@ -23,9 +23,10 @@ async def build_llm_messages(session: AsyncSession, run: AgentRun) -> list[LLMMe
     # refreshes `run` after most writes, which expires relationship collections,
     # and lazy-loading them here would require IO the async driver can't do
     # implicitly mid-attribute-access.
-    conversation = await _load_messages(session, run.id)
-    steps = await _load_steps(session, run.id)
-    executions_by_step = await _load_tool_executions_by_step(session, run.id)
+    conversation = await load_messages(session, run.id)
+    steps = await load_steps(session, run.id)
+    executions_by_step = await load_tool_executions_by_step(session, run.id)
+    covered_up_to = latest_covered_step_no(steps)
 
     timeline: list[tuple[datetime, list[LLMMessage]]] = []
     for message in conversation:
@@ -35,10 +36,12 @@ async def build_llm_messages(session: AsyncSession, run: AgentRun) -> list[LLMMe
         timeline.append((message.created_at, [LLMMessage(role=role, content=message.content)]))
     for step in steps:
         if step.type == StepType.llm_call:
+            if step.step_no <= covered_up_to:
+                continue  # folded into a summary step below; don't duplicate it
             timeline.append(
                 (
                     step.created_at,
-                    _llm_call_step_to_messages(step, executions_by_step.get(step.step_no, [])),
+                    llm_call_step_to_messages(step, executions_by_step.get(step.step_no, [])),
                 )
             )
         elif step.type == StepType.summary:
@@ -62,9 +65,7 @@ async def build_llm_messages(session: AsyncSession, run: AgentRun) -> list[LLMMe
     return messages
 
 
-def _llm_call_step_to_messages(
-    step: AgentStep, executions: list[ToolExecution]
-) -> list[LLMMessage]:
+def llm_call_step_to_messages(step: AgentStep, executions: list[ToolExecution]) -> list[LLMMessage]:
     tool_calls_raw = step.payload.get("tool_calls", [])
     tool_calls = [
         ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"]) for tc in tool_calls_raw
@@ -89,7 +90,16 @@ def _llm_call_step_to_messages(
     return result
 
 
-async def _load_messages(session: AsyncSession, run_id: uuid.UUID) -> list[AgentMessage]:
+def latest_covered_step_no(steps: list[AgentStep]) -> int:
+    """Highest llm_call step_no already folded into a summary step, or -1 if none."""
+    covered = -1
+    for step in steps:
+        if step.type == StepType.summary:
+            covered = max(covered, step.payload.get("covers_up_to_step_no", -1))
+    return covered
+
+
+async def load_messages(session: AsyncSession, run_id: uuid.UUID) -> list[AgentMessage]:
     result = await session.execute(
         sa.select(AgentMessage)
         .where(AgentMessage.run_id == run_id)
@@ -98,14 +108,14 @@ async def _load_messages(session: AsyncSession, run_id: uuid.UUID) -> list[Agent
     return list(result.scalars().all())
 
 
-async def _load_steps(session: AsyncSession, run_id: uuid.UUID) -> list[AgentStep]:
+async def load_steps(session: AsyncSession, run_id: uuid.UUID) -> list[AgentStep]:
     result = await session.execute(
         sa.select(AgentStep).where(AgentStep.run_id == run_id).order_by(AgentStep.step_no)
     )
     return list(result.scalars().all())
 
 
-async def _load_tool_executions_by_step(
+async def load_tool_executions_by_step(
     session: AsyncSession, run_id: uuid.UUID
 ) -> dict[int, list[ToolExecution]]:
     result = await session.execute(
