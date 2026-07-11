@@ -2,7 +2,7 @@
 
 แตกจาก `review-open-questions.md` §4 ตามการตัดสินใจใน `decisions.md` — ทุก task เป็น GitHub issue แล้ว (เลข issue ตรงกับลำดับ)
 
-**สถานะ: Phase 0–1 เสร็จแล้ว (#1–#13 ปิดหมด)** — core loop ทำงานจริง ผ่าน real Postgres/Redis/RabbitMQ, มี API ให้คุยกับ agent ได้ครบ (create run → poll → message/cancel), crash-safe ทั้ง tool execution (write-ahead + idempotency) และ run lease (heartbeat + reaper)
+**สถานะ: Phase 0–2 เสร็จแล้ว (#1–#17 ปิดหมด)** — core loop ทำงานจริง ผ่าน real Postgres/Redis/RabbitMQ, มี API ให้คุยกับ agent ได้ครบ (create run → poll → message/cancel), crash-safe ทั้ง tool execution (write-ahead + idempotency) และ run lease (heartbeat + reaper); เรียก tool จริงผ่าน MCP over HTTP ได้แล้ว พร้อม progressive disclosure, result truncation, และ approval flow สำหรับ tool เสี่ยงสูง (M2 สำเร็จ)
 
 ## Phase 0 — Foundation ✅
 | Issue | Task |
@@ -25,7 +25,7 @@
 | [#12](https://github.com/lazymarcus005-maker/marcus/issues/12) | Agent API v1 (create/message/poll/cancel) |
 | [#13](https://github.com/lazymarcus005-maker/marcus/issues/13) | Context compaction: rolling summary (G5) |
 
-## Phase 2 — Tools via MCP (HTTP only)
+## Phase 2 — Tools via MCP (HTTP only) ✅
 | Issue | Task |
 |---|---|
 | [#14](https://github.com/lazymarcus005-maker/marcus/issues/14) | MCP server registry + HTTP MCP adapter |
