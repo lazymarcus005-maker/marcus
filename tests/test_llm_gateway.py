@@ -92,6 +92,24 @@ async def test_complete_retries_on_5xx_then_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_complete_retries_on_proxy_error_then_succeeds(monkeypatch):
+    monkeypatch.setattr("harness.llm.gateway.asyncio.sleep", _no_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise httpx.ProxyError("502 Bad Gateway")
+        return httpx.Response(200, json=_openai_response())
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete([LLMMessage(role="user", content="hi")], max_retries=3)
+
+    assert calls["n"] == 2
+    assert response.content == "hello"
+
+
+@pytest.mark.asyncio
 async def test_complete_raises_transient_error_after_max_retries(monkeypatch):
     monkeypatch.setattr("harness.llm.gateway.asyncio.sleep", _no_sleep)
 

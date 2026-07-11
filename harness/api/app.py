@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from harness.api.routes import health
+from harness.api.routes import health, runs
 from harness.config import get_settings
 
 
@@ -17,6 +17,7 @@ def create_app() -> FastAPI:
     app.state.settings = settings
 
     app.include_router(health.router)
+    app.include_router(runs.router)
 
     return app
 

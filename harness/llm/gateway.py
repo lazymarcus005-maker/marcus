@@ -96,7 +96,13 @@ class LLMGateway:
         while True:
             try:
                 response = await self._client.post("/chat/completions", json=payload)
-            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            except httpx.TransportError as exc:
+                # Base class for every network-layer failure (connect/read/write
+                # timeouts, connection resets, proxy errors, ...) — narrower
+                # tuples here miss real failure modes (e.g. httpx.ProxyError)
+                # and let them escape complete() unwrapped, which breaks the
+                # engine's contract that only LLMError subclasses cross this
+                # boundary.
                 if attempt >= max_retries:
                     raise LLMTransientError(
                         f"LLM request failed after {attempt + 1} attempts: {exc}"

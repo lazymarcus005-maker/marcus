@@ -63,3 +63,17 @@ async def publish_run(
         ),
         routing_key=ROUTING_KEY,
     )
+
+
+async def publish_run_standalone(run_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
+    """Open a connection, publish one message, close. Used by the API layer,
+
+    which doesn't keep a long-lived broker connection around (see
+    harness/api/app.py) — simple and robust for MVP request volumes over a
+    pooled/persistent connection.
+    """
+    connection = await get_connection()
+    async with connection:
+        channel = await connection.channel()
+        await declare_topology(channel)  # idempotent; guards against a cold broker
+        await publish_run(channel, run_id, tenant_id)
