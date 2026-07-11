@@ -1,7 +1,12 @@
+import asyncio
 import itertools
 import uuid
+from typing import TYPE_CHECKING
 
 from harness.llm.types import LLMResponse, ToolCall, Usage
+
+if TYPE_CHECKING:
+    import aio_pika
 
 _call_id_counter = itertools.count(1)
 
@@ -53,3 +58,23 @@ def text_response(content: str, *, model: str = "test-model") -> LLMResponse:
 
 def new_uuid() -> uuid.UUID:
     return uuid.uuid4()
+
+
+async def get_message_with_wait(
+    queue: "aio_pika.abc.AbstractQueue", *, timeout: float = 5, poll_interval: float = 0.05
+) -> "aio_pika.abc.AbstractIncomingMessage":
+    """queue.get(fail=True) is a single non-blocking basic.get RPC, not a wait —
+
+    routing (including dead-lettering after a reject) isn't necessarily
+    synchronous with the call that triggered it, so poll instead of relying
+    on one immediate attempt.
+    """
+
+    async def _poll():
+        while True:
+            message = await queue.get(fail=False)
+            if message is not None:
+                return message
+            await asyncio.sleep(poll_interval)
+
+    return await asyncio.wait_for(_poll(), timeout=timeout)

@@ -112,13 +112,26 @@ class RunRepository:
         )
         return ok
 
-    async def renew_lease(self, run: AgentRun, owner: str, ttl_seconds: int) -> bool:
-        ok = await self._versioned_update(
-            run,
-            {"lease_expires_at": datetime.now(UTC) + timedelta(seconds=ttl_seconds)},
-            extra_where=AgentRun.lease_owner == owner,
+    async def renew_lease_by_id(self, run_id: uuid.UUID, owner: str, ttl_seconds: int) -> bool:
+        """Renew a lease by run_id, independent of the optimistic-locking version.
+
+        Used by the heartbeat task in harness.runtime.lease, which runs
+        concurrently with (and on a separate session/connection from) whatever
+        is actively checkpointing the run. Renewal must not participate in
+        that version fencing — both sides bumping the same version from
+        different tasks would make them spuriously invalidate each other even
+        though nothing is actually wrong. Lease liveness and state-mutation
+        fencing are different concerns; this only ever touches lease_expires_at,
+        gated on still owning the lease.
+        """
+        stmt = (
+            sa.update(AgentRun)
+            .where(AgentRun.id == run_id, AgentRun.lease_owner == owner)
+            .values(lease_expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds))
         )
-        return ok
+        result = cast(CursorResult, await self.session.execute(stmt))
+        await self.session.commit()
+        return result.rowcount == 1
 
     async def release_lease(self, run: AgentRun) -> bool:
         return await self._versioned_update(run, {"lease_owner": None, "lease_expires_at": None})

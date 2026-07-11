@@ -87,7 +87,7 @@ async def test_lease_acquire_renew_release_roundtrip(db_session):
     assert acquired
     assert run.lease_owner == "worker-a"
 
-    renewed = await repo.renew_lease(run, "worker-a", ttl_seconds=30)
+    renewed = await repo.renew_lease_by_id(run.id, "worker-a", ttl_seconds=30)
     assert renewed
 
     released = await repo.release_lease(run)
