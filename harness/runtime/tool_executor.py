@@ -1,11 +1,14 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harness.db.enums import RiskTier, ToolExecutionStatus
-from harness.db.models import AgentRun, ToolExecution
+from harness.config import get_settings
+from harness.db.enums import ApprovalStatus, RiskTier, ToolExecutionStatus
+from harness.db.models import AgentRun, ApprovalRequest, ToolExecution
 from harness.llm.types import ToolCall
+from harness.runtime import guardrails
+from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tools import ExecutionOutcome, Tool
 
 
@@ -37,12 +40,19 @@ class ToolExecutor:
         if existing is not None:
             return await self._resolve_existing(existing, tool)
 
+        if guardrails.requires_approval(tool.risk_tier):
+            gated_outcome = await self._check_approval(run, step_no, call_index, call, tool)
+            if gated_outcome is not None:
+                return gated_outcome
+            # else: approved — fall through to the normal write-ahead execution below
+
         execution = ToolExecution(
             run_id=run.id,
             step_no=step_no,
             call_index=call_index,
             idempotency_key=idempotency_key,
             tool_name=tool.name,
+            mcp_server_id=tool.mcp_server_id,
             risk_tier=tool.risk_tier,
             idempotent=tool.idempotent,
             args=call.arguments,
@@ -52,6 +62,71 @@ class ToolExecutor:
         await self.session.commit()  # write-ahead: durable before the handler runs
 
         return await self._invoke_and_finalize(execution, tool)
+
+    async def _check_approval(
+        self, run: AgentRun, step_no: int, call_index: int, call: ToolCall, tool: Tool
+    ) -> ExecutionOutcome | None:
+        """Approval gate for sensitive_write/destructive tools (issue #17).
+
+        Runs *before* any write-ahead ToolExecution row exists, so a
+        pending/rejected call never looks like a started-then-crashed
+        execution. Returns None when approved (caller proceeds to the normal
+        write-ahead path); otherwise returns the outcome to short-circuit on.
+        """
+        result = await self.session.execute(
+            sa.select(ApprovalRequest).where(
+                ApprovalRequest.run_id == run.id,
+                ApprovalRequest.step_no == step_no,
+                ApprovalRequest.call_index == call_index,
+            )
+        )
+        approval = result.scalar_one_or_none()
+
+        if approval is None:
+            settings = get_settings()
+            approval = ApprovalRequest(
+                tenant_id=run.tenant_id,
+                run_id=run.id,
+                step_no=step_no,
+                call_index=call_index,
+                tool_name=tool.name,
+                risk_tier=tool.risk_tier,
+                args=call.arguments,
+                status=ApprovalStatus.pending,
+                expires_at=datetime.now(UTC) + timedelta(hours=settings.approval_expiry_hours),
+            )
+            self.session.add(approval)
+            await self.session.commit()
+
+        if approval.status == ApprovalStatus.pending:
+            return ExecutionOutcome(observation={}, needs_approval=True)
+
+        if approval.status == ApprovalStatus.approved:
+            return None
+
+        # rejected or expired: terminal — write the failed execution now so
+        # replay short-circuits via _resolve_existing without touching the
+        # approval again.
+        error = f"tool call was {approval.status.value} by approver" + (
+            f": {approval.reason}" if approval.reason else ""
+        )
+        execution = ToolExecution(
+            run_id=run.id,
+            step_no=step_no,
+            call_index=call_index,
+            idempotency_key=f"{run.id}:{step_no}:{call_index}",
+            tool_name=tool.name,
+            mcp_server_id=tool.mcp_server_id,
+            risk_tier=tool.risk_tier,
+            idempotent=tool.idempotent,
+            args=call.arguments,
+            status=ToolExecutionStatus.failed,
+            error=error,
+            finished_at=datetime.now(UTC),
+        )
+        self.session.add(execution)
+        await self.session.commit()
+        return ExecutionOutcome(observation={"error": error})
 
     async def _record_unknown_tool(
         self,
@@ -99,11 +174,15 @@ class ToolExecutor:
 
         execution.status = ToolExecutionStatus.unknown
         execution.finished_at = datetime.now(UTC)
+        # This is crash forensics, not the pre-execution approval gate (that
+        # only ever runs before a ToolExecution row exists — see
+        # _check_approval). Here the handler may already have run against the
+        # real world; the outcome is unrecoverable and needs a human to look,
+        # not another approval prompt.
         fatal = execution.risk_tier in (RiskTier.sensitive_write, RiskTier.destructive)
         execution.error = (
             "crashed mid-execution; outcome unknown and this tool is not safe to "
-            "auto-retry"
-            + (" (requires manual review — approval workflow is issue #17)" if fatal else "")
+            "auto-retry" + (" (requires manual review)" if fatal else "")
         )
         await self.session.commit()
         return ExecutionOutcome(
@@ -123,7 +202,7 @@ class ToolExecutor:
             return ExecutionOutcome(observation={"error": str(exc)})
 
         execution.status = ToolExecutionStatus.succeeded
-        execution.result = result if isinstance(result, dict) else {"value": result}
+        execution.result = truncate_result(result, max_chars=get_settings().tool_result_max_chars)
         execution.finished_at = datetime.now(UTC)
         await self.session.commit()
         return ExecutionOutcome(observation=execution.result)

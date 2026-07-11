@@ -55,3 +55,16 @@ class Channel(enum.StrEnum):
     web = "web"
     slack = "slack"
     schedule = "schedule"
+
+
+class McpHealthStatus(enum.StrEnum):
+    unknown = "unknown"
+    healthy = "healthy"
+    unhealthy = "unhealthy"
+
+
+class ApprovalStatus(enum.StrEnum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    expired = "expired"

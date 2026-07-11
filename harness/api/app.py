@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from harness.api.routes import health, runs
+from harness.api.routes import approvals, health, mcp_servers, runs
 from harness.config import get_settings
 
 
@@ -18,6 +18,8 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(runs.router)
+    app.include_router(mcp_servers.router)
+    app.include_router(approvals.router)
 
     return app
 

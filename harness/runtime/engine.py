@@ -9,12 +9,17 @@ from harness.db.models import AgentRun, AgentStep
 from harness.llm.gateway import LLMError, LLMGateway
 from harness.llm.types import ToolCall
 from harness.llm.usage import record_usage
-from harness.runtime import guardrails
+from harness.mcp.registry import McpRegistry
+from harness.mcp.tools import build_tool as build_mcp_tool
+from harness.runtime import guardrails, native_tools
 from harness.runtime.compaction import maybe_compact
 from harness.runtime.context import build_llm_messages
 from harness.runtime.native_tools import (
     ASK_USER_TOOL_NAME,
     FINISH_TOOL_NAME,
+    LIST_DOMAIN_TOOLS_NAME,
+    LIST_TOOL_DOMAINS_NAME,
+    LOAD_TOOL_NAME,
     build_ask_user_tool,
     build_finish_tool,
 )
@@ -24,6 +29,20 @@ from harness.runtime.tools import Tool
 
 # Control results returned by _process_tool_calls, consumed by _execute_step.
 ControlResult = tuple[str, dict[str, Any]] | None
+
+
+async def _unused_meta_tool_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Placeholder for the Tool objects used only to build LLM-facing specs.
+
+    _process_tool_calls always special-cases these tool names before any
+    dispatch through tools_by_name, so this should never actually run — the
+    real, DB-bound handler is built fresh per call in _process_tool_calls.
+    """
+    raise AssertionError("meta-tool placeholder handler invoked directly")
+
+
+async def _not_loaded_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+    return {"error": "tool is not loaded yet; call load_tool with its name first"}
 
 
 class RunEngine:
@@ -38,7 +57,11 @@ class RunEngine:
     """
 
     def __init__(
-        self, session: AsyncSession, llm: LLMGateway, tools: list[Tool] | None = None
+        self,
+        session: AsyncSession,
+        llm: LLMGateway,
+        tools: list[Tool] | None = None,
+        mcp_registry: McpRegistry | None = None,
     ) -> None:
         self.session = session
         self.repo = RunRepository(session)
@@ -47,6 +70,18 @@ class RunEngine:
         self.tools_by_name = {t.name: t for t in (tools or [])}
         self._finish_tool = build_finish_tool()
         self._ask_user_tool = build_ask_user_tool()
+        self._list_domains_tool = native_tools.build_list_tool_domains_tool(
+            _unused_meta_tool_handler
+        )
+        self._list_domain_tools_tool = native_tools.build_list_domain_tools_tool(
+            _unused_meta_tool_handler
+        )
+        self._load_tool_tool = native_tools.build_load_tool_tool(_unused_meta_tool_handler)
+        # MCP tools (#14) are discovered from the DB, not passed in statically
+        # like `tools` — loaded lazily on first LLM call and cached for the
+        # life of this engine instance (one instance per run, see workers/main.py).
+        self.mcp_registry = mcp_registry or McpRegistry(session)
+        self._mcp_tools_loaded = False
 
     async def run_until_blocked(self, run_id: uuid.UUID) -> AgentRun:
         run = await self.repo.get_with_history(run_id)
@@ -69,6 +104,12 @@ class RunEngine:
             run = await self.repo.checkpoint(run, status=violation.status, error=violation.reason)
             await self.session.commit()
             return run
+
+        # Must happen unconditionally, not just inside _call_llm: on a
+        # crash-recovery replay (existing_step is not None below) the LLM is
+        # never re-called, but _process_tool_calls still needs tools_by_name
+        # populated to execute a persisted MCP tool call.
+        await self._ensure_mcp_tools_loaded(run.tenant_id)
 
         step_no = run.current_step
         existing_step = await self._get_step(run.id, step_no)
@@ -123,6 +164,18 @@ class RunEngine:
 
         control_result = await self._process_tool_calls(run, step_no, tool_calls_payload)
 
+        if control_result is not None and control_result[0] == "waiting_approval":
+            # Unlike every other branch, current_step must NOT advance: on
+            # resume the engine has to replay this exact step_no's persisted
+            # tool_calls (already-executed calls short-circuit via their
+            # idempotency keys, the just-decided one now resolves, and any
+            # calls after it in the batch proceed normally). See issue #17.
+            run = await self.repo.checkpoint(
+                run, status=RunStatus.waiting_approval, tokens_used=tokens_used
+            )
+            await self.session.commit()
+            return run
+
         field_updates: dict[str, Any] = {
             "current_step": step_no + 1,
             "tokens_used": tokens_used,
@@ -168,9 +221,23 @@ class RunEngine:
         """
         await maybe_compact(self.session, self.llm, run)
         messages = await build_llm_messages(self.session, run)
+        # Progressive disclosure (issue #15): an MCP tool's full schema is only
+        # ever sent to the LLM after `load_tool` unlocked it for this run — see
+        # run.active_tool_names. finish/ask_user/the three meta-tools are
+        # always visible.
+        unlocked_tools = (
+            self.tools_by_name[name] for name in run.active_tool_names if name in self.tools_by_name
+        )
         tool_specs = [
             t.to_spec()
-            for t in (self._finish_tool, self._ask_user_tool, *self.tools_by_name.values())
+            for t in (
+                self._finish_tool,
+                self._ask_user_tool,
+                self._list_domains_tool,
+                self._list_domain_tools_tool,
+                self._load_tool_tool,
+                *unlocked_tools,
+            )
         ]
 
         try:
@@ -211,6 +278,20 @@ class RunEngine:
         tokens_used = run.tokens_used + response.usage.total_tokens
         return tool_calls_payload, response.content, tokens_used
 
+    async def _ensure_mcp_tools_loaded(self, tenant_id: uuid.UUID) -> None:
+        """Merge the tenant's enabled MCP tools into tools_by_name, once per
+
+        engine instance (one instance per run — see workers/main.py). Doesn't
+        overwrite a tool of the same name passed in statically at construction.
+        """
+        if self._mcp_tools_loaded:
+            return
+        for server, mcp_tool in await self.mcp_registry.list_tools(tenant_id):
+            self.tools_by_name.setdefault(
+                mcp_tool.name, build_mcp_tool(server, mcp_tool, self.mcp_registry.client)
+            )
+        self._mcp_tools_loaded = True
+
     async def _process_tool_calls(
         self, run: AgentRun, step_no: int, tool_calls_payload: list[dict]
     ) -> ControlResult:
@@ -235,7 +316,48 @@ class RunEngine:
                     return "waiting_user_input", outcome.observation
                 continue
 
+            if call.name == LIST_TOOL_DOMAINS_NAME:
+                await self.tool_executor.execute(
+                    run, step_no, call_index, call, tool=self._build_list_domains_tool(run)
+                )
+                continue
+
+            if call.name == LIST_DOMAIN_TOOLS_NAME:
+                await self.tool_executor.execute(
+                    run, step_no, call_index, call, tool=self._build_list_domain_tools_tool(run)
+                )
+                continue
+
+            if call.name == LOAD_TOOL_NAME:
+                outcome = await self.tool_executor.execute(
+                    run, step_no, call_index, call, tool=self._build_load_tool_tool(run)
+                )
+                loaded_name = outcome.observation.get("name")
+                if loaded_name and loaded_name not in run.active_tool_names:
+                    run = await self.repo.checkpoint(
+                        run, active_tool_names=[*run.active_tool_names, loaded_name]
+                    )
+                continue
+
             tool = self.tools_by_name.get(call.name)
+
+            if (
+                tool is not None
+                and tool.mcp_server_id is not None
+                and call.name not in run.active_tool_names
+            ):
+                # Hallucinated call to an MCP tool that exists but hasn't been
+                # unlocked via load_tool yet (issue #15) — its full schema was
+                # never sent to the LLM, so treat it as not-yet-callable
+                # rather than actually invoking it.
+                guard_tool = Tool(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.parameters,
+                    handler=_not_loaded_handler,
+                )
+                await self.tool_executor.execute(run, step_no, call_index, call, tool=guard_tool)
+                continue
 
             if tool is not None:
                 try:
@@ -246,10 +368,58 @@ class RunEngine:
                     return "failed", {"error": violation.reason}
 
             outcome = await self.tool_executor.execute(run, step_no, call_index, call, tool=tool)
+            if outcome.needs_approval:
+                return "waiting_approval", {}
             if outcome.fatal:
                 return "failed", {"error": outcome.fatal_reason}
 
         return None
+
+    def _build_list_domains_tool(self, run: AgentRun) -> Tool:
+        async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+            servers = await self.mcp_registry.list_servers(run.tenant_id)
+            counts: dict[str, int] = {}
+            for server, _mcp_tool in await self.mcp_registry.list_tools(run.tenant_id):
+                counts[server.name] = counts.get(server.name, 0) + 1
+            return {
+                "domains": [
+                    {"name": s.name, "tool_count": counts.get(s.name, 0)}
+                    for s in servers
+                    if s.enabled
+                ]
+            }
+
+        return native_tools.build_list_tool_domains_tool(handler)
+
+    def _build_list_domain_tools_tool(self, run: AgentRun) -> Tool:
+        async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+            domain = arguments.get("domain")
+            servers = await self.mcp_registry.list_servers(run.tenant_id)
+            if not any(s.name == domain and s.enabled for s in servers):
+                return {"error": f"unknown domain: {domain}"}
+            pairs = await self.mcp_registry.list_tools(run.tenant_id)
+            tools = [
+                {"name": mcp_tool.name, "summary": mcp_tool.description[:140]}
+                for server, mcp_tool in pairs
+                if server.name == domain
+            ]
+            return {"tools": tools}
+
+        return native_tools.build_list_domain_tools_tool(handler)
+
+    def _build_load_tool_tool(self, run: AgentRun) -> Tool:
+        async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+            requested = arguments.get("name")
+            mcp_tool = (
+                await self.mcp_registry.get_tool_by_name(run.tenant_id, requested)
+                if requested
+                else None
+            )
+            if mcp_tool is None or not mcp_tool.enabled:
+                return {"error": f"unknown tool: {requested}"}
+            return {"name": mcp_tool.name, "schema": mcp_tool.parameters}
+
+        return native_tools.build_load_tool_tool(handler)
 
     async def _get_step(self, run_id: uuid.UUID, step_no: int) -> AgentStep | None:
         result = await self.session.execute(

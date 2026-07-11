@@ -1,12 +1,13 @@
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harness.db.enums import RunStatus
-from harness.db.models import AgentRun
-from harness.runtime.repository import RunRepository
+from harness.db.enums import ApprovalStatus, RunStatus
+from harness.db.models import AgentRun, ApprovalRequest
+from harness.runtime.repository import RunRepository, StaleRunError
 
 logger = logging.getLogger(__name__)
 
@@ -43,5 +44,44 @@ async def reap_stale_runs(session: AsyncSession, on_stale: RequeueCallback) -> i
             continue  # lost the race to the original worker's heartbeat or another reaper
         logger.warning("reaped stale run %s (lease owner was %s)", run.id, owner)
         await on_stale(run)
+        reaped += 1
+    return reaped
+
+
+async def reap_expired_approvals(session: AsyncSession) -> int:
+    """Expire pending approvals past their deadline and time out their runs
+
+    (decisions.md Q15 — issue #17). Unlike reap_stale_runs, an expired
+    approval's run goes straight to a terminal status: there's nothing left
+    to resume, so no requeue callback is needed.
+
+    Returns the number of approvals actually expired.
+    """
+    result = await session.execute(
+        sa.select(ApprovalRequest).where(
+            ApprovalRequest.status == ApprovalStatus.pending,
+            ApprovalRequest.expires_at < sa.func.now(),
+        )
+    )
+    expired = list(result.scalars().all())
+
+    repo = RunRepository(session)
+    reaped = 0
+    for approval in expired:
+        approval.status = ApprovalStatus.expired
+        approval.decided_at = datetime.now(UTC)
+        await session.commit()
+
+        run = await repo.get(approval.run_id)
+        if run is None or run.status != RunStatus.waiting_approval:
+            continue  # already moved on (race with a manual decision) — leave it alone
+        try:
+            await repo.checkpoint(
+                run, status=RunStatus.timed_out, error="approval request expired"
+            )
+        except StaleRunError:
+            continue  # lost the race between our check and the checkpoint
+        await session.commit()
+        logger.warning("expired approval %s; timed out run %s", approval.id, run.id)
         reaped += 1
     return reaped

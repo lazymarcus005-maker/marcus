@@ -4,10 +4,19 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harness.db.enums import RunStatus
+from harness.db.enums import RiskTier, RunStatus
 from harness.db.models import AgentRun, ToolExecution
 
 REPEATED_CALL_WINDOW = 3
+APPROVAL_REQUIRED_TIERS = frozenset({RiskTier.sensitive_write, RiskTier.destructive})
+
+
+def requires_approval(risk_tier: RiskTier) -> bool:
+    """Single source of truth for the risk tier at which a human must approve
+
+    a tool call before it executes (issue #17, decisions.md — idea.md §13).
+    """
+    return risk_tier in APPROVAL_REQUIRED_TIERS
 
 
 class GuardrailViolation(Exception):

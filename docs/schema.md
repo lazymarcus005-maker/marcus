@@ -28,6 +28,8 @@ agent_runs
 ├── current_step, max_steps, max_tool_calls, token_budget, timeout_seconds
 ├── tokens_used, tool_calls_used
 ├── active_skill_revision_id (nullable — skills land in a later migration)
+├── active_tool_names (jsonb list[str] — MCP tools unlocked via load_tool for
+│                       progressive disclosure, see decisions.md / issue #15)
 ├── lease_owner, lease_expires_at (crash-recovery lease, see decisions.md D5)
 ├── final_result (jsonb, nullable), error, cancel_requested
 └── created_at, updated_at
@@ -64,11 +66,43 @@ usage_records
 ├── run_id (fk -> agent_runs, nullable)
 ├── model, prompt_tokens, completion_tokens, total_tokens
 └── created_at
+
+mcp_servers
+├── id (uuid, pk)
+├── tenant_id (fk -> tenants)
+├── name (unique per tenant — also the Level-1 "domain" for progressive
+│         tool disclosure, see decisions.md / issue #15)
+├── base_url, auth_header_name (nullable)
+├── auth_header_value_encrypted (bytes, nullable — Fernet, see
+│                                 harness/mcp/crypto.py, decisions.md Q16)
+├── default_risk_tier, enabled
+├── health_status (unknown | healthy | unhealthy), last_health_checked_at,
+│                  last_error
+└── created_at, updated_at
+
+mcp_tools
+├── id (uuid, pk)
+├── mcp_server_id (fk -> mcp_servers, unique with name)
+├── name, description, parameters (jsonb schema)
+├── risk_tier (seeded from the server's default_risk_tier at discovery time,
+│              independently overridable per tool afterward)
+├── enabled (set false, not deleted, when a server no longer reports it)
+└── discovered_at
+
+approval_requests
+├── id (uuid, pk)
+├── tenant_id (fk -> tenants)
+├── run_id (fk -> agent_runs)
+├── step_no, call_index (unique with run_id — same natural key shape as
+│                         tool_executions.idempotency_key)
+├── tool_name, risk_tier, args (jsonb)
+├── status (pending | approved | rejected | expired)
+├── reason, decided_by_user_id (fk -> users, nullable)
+├── requested_at, decided_at (nullable), expires_at
 ```
 
 Not in this migration — added by later issues:
-`approval_requests` (#17), `scheduled_jobs` (#25), `skills` / `skill_revisions`
-/ `skill_usage` (#18), `mcp_servers` / `mcp_tools` (#14).
+`scheduled_jobs` (#25), `skills` / `skill_revisions` / `skill_usage` (#18).
 
 ## Conventions
 
@@ -80,6 +114,10 @@ Not in this migration — added by later issues:
 - `tool_executions.idempotency_key` is written *before* the tool call executes
   (write-ahead), per `decisions.md` D6 (gap G2). Recovery policy is keyed off
   `risk_tier`.
+- `approval_requests` gates `sensitive_write`/`destructive` tool calls
+  (`harness.runtime.guardrails.requires_approval`) *before* any
+  `tool_executions` row for that call exists — see issue #17. A call is only
+  write-ahead-inserted once its approval is `approved`.
 
 ## Local development
 

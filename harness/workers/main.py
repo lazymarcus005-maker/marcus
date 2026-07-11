@@ -13,7 +13,7 @@ from harness.llm.gateway import LLMGateway
 from harness.mq import declare_topology, decode_run_message, get_connection, publish_run
 from harness.runtime.engine import RunEngine
 from harness.runtime.lease import heartbeat_lease
-from harness.runtime.reaper import reap_stale_runs
+from harness.runtime.reaper import reap_expired_approvals, reap_stale_runs
 from harness.runtime.repository import RunRepository
 
 logging.basicConfig(level=logging.INFO)
@@ -99,7 +99,12 @@ async def reaper_loop(sessionmaker: async_sessionmaker, settings: Settings) -> N
                 try:
                     await reap_stale_runs(session, on_stale)
                 except Exception:
-                    logger.exception("reaper iteration failed")
+                    logger.exception("stale-run reaper iteration failed")
+            async with sessionmaker() as session:
+                try:
+                    await reap_expired_approvals(session)
+                except Exception:
+                    logger.exception("expired-approval reaper iteration failed")
 
 
 async def main() -> None:

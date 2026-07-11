@@ -1,7 +1,7 @@
 import asyncio
 import itertools
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from harness.llm.types import LLMResponse, ToolCall, Usage
 
@@ -9,6 +9,35 @@ if TYPE_CHECKING:
     import aio_pika
 
 _call_id_counter = itertools.count(1)
+
+
+class FakeMcpClient:
+    """Fake harness.mcp.client.McpClient — scripted tools/results, no network I/O.
+
+    tools_by_server maps server.name -> list[mcp.types.Tool]; call_results
+    maps tool name -> either a result dict or an Exception instance to raise
+    (call_tool normalizes real McpErrors into {"error": ...} dicts, same as
+    the real client's callers do — see harness/mcp/tools.py).
+    """
+
+    def __init__(
+        self,
+        tools_by_server: dict[str, list] | None = None,
+        call_results: dict[str, Any] | None = None,
+    ) -> None:
+        self.tools_by_server = tools_by_server or {}
+        self.call_results = call_results or {}
+        self.calls: list[tuple[str, str, dict]] = []
+
+    async def list_tools(self, server) -> list:
+        return self.tools_by_server.get(server.name, [])
+
+    async def call_tool(self, server, name: str, arguments: dict) -> dict:
+        self.calls.append((server.name, name, arguments))
+        result = self.call_results.get(name, {"content": "ok", "is_error": False})
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class ScriptedLLMGateway:

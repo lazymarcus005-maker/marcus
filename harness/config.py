@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     approval_expiry_hours: int = 24
     run_lease_ttl_seconds: int = 60
 
+    tool_result_max_chars: int = 4000
+
 
 @lru_cache
 def get_settings() -> Settings:
