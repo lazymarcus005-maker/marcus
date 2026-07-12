@@ -63,8 +63,14 @@ class Settings(BaseSettings):
 
     # Marcus CLI session guardrails.
     cli_max_history_messages: int = 100
+    cli_max_steps: int = 100
+    cli_context_window_tokens: int = 131_072
+    cli_compact_threshold_percent: int = 85
+    cli_compact_target_percent: int = 60
     cli_max_total_tokens: int | None = None
     cli_history_summary_enabled: bool = True
+    cli_default_mode: str = "agent"
+    cli_llm_recovery_timeout_seconds: float = 90.0
 
 
 @lru_cache

@@ -1,3 +1,6 @@
+import asyncio
+import socket
+import sys
 from unittest.mock import patch
 
 import httpx
@@ -5,6 +8,8 @@ import pytest
 
 from harness.config import Settings
 from marcus_code.tools import (
+    BackgroundProcessManager,
+    build_background_process_tools,
     build_edit_file_tool,
     build_fetch_url_tool,
     build_grep_tool,
@@ -182,6 +187,107 @@ async def test_run_cli_times_out(tmp_path):
 
     with pytest.raises(ValueError, match="timed out"):
         await tool.handler({"command": sleep_command})
+
+
+@pytest.mark.asyncio
+async def test_run_cli_timeout_returns_promptly_when_child_inherits_pipes(tmp_path):
+    settings = Settings(tools_run_cli_timeout_seconds=0.05)
+    tool = build_run_cli_tool(tmp_path, settings)
+    command = (
+        'python -c "import subprocess,sys,time; '
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        'time.sleep(30)"'
+    )
+
+    with pytest.raises(ValueError, match="timed out"):
+        await asyncio.wait_for(tool.handler({"command": command}), timeout=5)
+
+
+def _unused_local_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.mark.asyncio
+async def test_background_service_start_wait_read_and_stop(tmp_path):
+    port = _unused_local_port()
+    manager = BackgroundProcessManager(tmp_path)
+    tools = {tool.name: tool for tool in build_background_process_tools(manager)}
+    run_cli = build_run_cli_tool(tmp_path, Settings(tools_run_cli_timeout_seconds=5))
+    command = f'"{sys.executable}" -u -m http.server {port} --bind 127.0.0.1'
+
+    started = await tools["start_process"].handler({"command": command})
+    process_id = started["process_id"]
+    try:
+        ready = await tools["wait_for_http"].handler(
+            {"url": f"http://127.0.0.1:{port}/", "timeout_seconds": 5}
+        )
+        client_result = await run_cli.handler(
+            {
+                "command": (
+                    f'"{sys.executable}" -c "import urllib.request; '
+                    f"print(urllib.request.urlopen('http://127.0.0.1:{port}/').status)\""
+                )
+            }
+        )
+        output = await tools["read_process_output"].handler({"process_id": process_id})
+
+        assert ready == {
+            "url": f"http://127.0.0.1:{port}/",
+            "ready": True,
+            "status": 200,
+        }
+        assert client_result["exit_code"] == 0
+        assert client_result["stdout"].strip() == "200"
+        assert output["status"] == "running"
+    finally:
+        stopped = await tools["stop_process"].handler({"process_id": process_id})
+        await manager.aclose()
+
+    assert stopped["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_http_rejects_non_local_url(tmp_path):
+    manager = BackgroundProcessManager(tmp_path)
+    tools = {tool.name: tool for tool in build_background_process_tools(manager)}
+
+    with pytest.raises(ValueError, match="localhost"):
+        await tools["wait_for_http"].handler({"url": "https://example.com"})
+
+
+@pytest.mark.asyncio
+async def test_process_manager_close_releases_registry(tmp_path):
+    manager = BackgroundProcessManager(tmp_path)
+    await manager.start(f'"{sys.executable}" -c "import time; time.sleep(30)"')
+
+    await manager.aclose()
+
+    assert manager._processes == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_process_accepts_unique_abbreviated_id(tmp_path):
+    manager = BackgroundProcessManager(tmp_path)
+    started = await manager.start(f'"{sys.executable}" -c "import time; time.sleep(30)"')
+    process_id = started["process_id"]
+
+    result = await manager.stop(f"{process_id[:6]}...")
+
+    assert result["process_id"] == process_id
+    assert result["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_process_id_prefix_must_be_at_least_six_characters(tmp_path):
+    manager = BackgroundProcessManager(tmp_path)
+    started = await manager.start(f'"{sys.executable}" -c "import time; time.sleep(30)"')
+    try:
+        with pytest.raises(ValueError, match="unknown process_id"):
+            await manager.stop(f"{started['process_id'][:5]}...")
+    finally:
+        await manager.aclose()
 
 
 class _FakeResponse:

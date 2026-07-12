@@ -3,8 +3,10 @@ from dataclasses import dataclass
 
 from harness.config import Settings
 from harness.llm.gateway import LLMGateway
+from harness.llm.types import LLMMessage
 from marcus_code.config import has_llm_credentials, resolve_settings, save_user_config
 from marcus_code.loop import MarcusLoop
+from marcus_code.modes import AgentMode, mode_help, mode_hint, mode_instructions
 from marcus_code.ui import TerminalUI
 
 EXIT_COMMANDS = {"/exit", "/quit"}
@@ -54,6 +56,61 @@ async def _cmd_usage(ctx: CommandContext, args: str) -> None:
     )
 
 
+async def _cmd_steps(ctx: CommandContext, args: str) -> None:
+    if hasattr(ctx.ui, "print_steps"):
+        ctx.ui.print_steps()
+
+
+async def _cmd_compact(ctx: CommandContext, args: str) -> None:
+    before, after = ctx.loop.compact_history()
+    ctx.ui.print_info(f"Context compacted: {before:,} → {after:,} estimated tokens.")
+
+
+async def _cmd_clear(ctx: CommandContext, args: str) -> None:
+    action = args.strip().lower()
+    if action not in {"", "--all"}:
+        ctx.ui.print_error("usage: /clear or /clear --all")
+        return
+    ctx.loop.clear_history(clear_all=action == "--all")
+    detail = "context and approval preferences" if action == "--all" else "conversation context"
+    ctx.ui.print_info(f"Cleared {detail}.")
+
+
+async def _cmd_status(ctx: CommandContext, args: str) -> None:
+    if hasattr(ctx.ui, "print_status"):
+        ctx.ui.print_status()
+
+
+async def _cmd_mode(ctx: CommandContext, args: str) -> None:
+    value = args.strip().lower()
+    if not value:
+        ctx.ui.print_info(f"Current mode: {ctx.loop.mode.value}\n{mode_help()}")
+        return
+    try:
+        mode = AgentMode(value)
+    except ValueError:
+        choices = ", ".join(item.value for item in AgentMode)
+        ctx.ui.print_error(f"unknown mode: {value!r} (choose: {choices})")
+        return
+    if (
+        mode is AgentMode.yolo
+        and hasattr(ctx.ui, "confirm_yolo_mode")
+        and not ctx.ui.confirm_yolo_mode()
+    ):
+        ctx.ui.print_info("Mode unchanged.")
+        return
+    ctx.loop.mode = mode
+    ctx.loop.state.always_allowed.clear()
+    ctx.loop.state.history.append(
+        LLMMessage(role="system", content=f"Mode changed. {mode_instructions(mode)}")
+    )
+    if hasattr(ctx.ui, "set_mode"):
+        ctx.ui.set_mode(mode.value)
+    ctx.ui.print_info(
+        f"Mode switched to {mode.value!r} for this session.\nHint: {mode_hint(mode)}"
+    )
+
+
 async def _cmd_config(ctx: CommandContext, args: str) -> None:
     action = args.strip().lower()
     if action in ("", "show", "view"):
@@ -89,6 +146,11 @@ COMMANDS: dict[str, CommandHandler] = {
     "/?": _cmd_help,
     "/model": _cmd_model,
     "/usage": _cmd_usage,
+    "/steps": _cmd_steps,
+    "/compact": _cmd_compact,
+    "/clear": _cmd_clear,
+    "/status": _cmd_status,
+    "/mode": _cmd_mode,
     "/config": _cmd_config,
 }
 

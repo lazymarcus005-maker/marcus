@@ -86,6 +86,48 @@ async def test_complete_stream_assembles_tool_call_fragments():
 
 
 @pytest.mark.asyncio
+async def test_complete_stream_retries_on_5xx_then_succeeds(monkeypatch):
+    monkeypatch.setattr("harness.llm.gateway.asyncio.sleep", _no_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(500, text="temporary failure")
+        return httpx.Response(
+            200,
+            text='data: {"choices":[{"delta":{"content":"recovered"}}]}\n\ndata: [DONE]',
+        )
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete_stream([LLMMessage(role="user", content="hello")])
+
+    assert calls["n"] == 2
+    assert response.content == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_retries_malformed_sse_json(monkeypatch):
+    monkeypatch.setattr("harness.llm.gateway.asyncio.sleep", _no_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, text="data: {not-json}\n\ndata: [DONE]")
+        return httpx.Response(
+            200,
+            text='data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]',
+        )
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete_stream([LLMMessage(role="user", content="hello")])
+
+    assert calls["n"] == 2
+    assert response.content == "ok"
+
+
+@pytest.mark.asyncio
 async def test_complete_parses_tool_calls():
     tool_calls = [
         {

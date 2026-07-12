@@ -2,6 +2,7 @@ import pytest
 
 import marcus_code.config as config_module
 from harness.config import Settings
+from harness.llm.types import LLMMessage
 from marcus_code.commands import CommandContext, dispatch
 from marcus_code.config import save_user_config
 from marcus_code.loop import MarcusLoop
@@ -219,3 +220,53 @@ async def test_config_unknown_action_reports_error():
     await dispatch(ctx, "/config bogus")
 
     assert "unknown /config action" in ui.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_mode_command_shows_and_switches_mode():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/mode")
+    await dispatch(ctx, "/mode auto")
+
+    assert ui.info[0].startswith("Current mode: agent")
+    assert all(mode in ui.info[0] for mode in ("ask", "agent", "auto", "yolo"))
+    assert ctx.loop.mode.value == "auto"
+    assert "auto" in ui.info[1]
+    assert "high-risk" in ui.info[1]
+
+
+@pytest.mark.asyncio
+async def test_mode_command_rejects_unknown_mode():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/mode reckless")
+
+    assert "unknown mode" in ui.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_clear_command_clears_context_and_all_clears_approvals():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+    ctx.loop.state.history.append(LLMMessage(role="user", content="old context"))
+    ctx.loop.state.always_allowed.add("run_cli")
+
+    await dispatch(ctx, "/clear")
+    assert not any(message.role == "user" for message in ctx.loop.state.history)
+    assert ctx.loop.state.always_allowed == {"run_cli"}
+
+    await dispatch(ctx, "/clear --all")
+    assert ctx.loop.state.always_allowed == set()
+
+
+@pytest.mark.asyncio
+async def test_compact_command_reports_before_and_after():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/compact")
+
+    assert "estimated tokens" in ui.info[-1]

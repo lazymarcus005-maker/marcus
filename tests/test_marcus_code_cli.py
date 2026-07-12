@@ -5,6 +5,18 @@ from harness.llm.types import LLMResponse, Usage
 from marcus_code import cli
 
 
+@pytest.mark.parametrize("flag", ["-v", "--version"])
+def test_main_prints_version(flag, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["marcus", flag])
+    monkeypatch.setattr(cli, "_version_string", lambda: "Marcus Code 1.2.3")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == "Marcus Code 1.2.3"
+
+
 class _FakeUI:
     instances = []
 
@@ -71,6 +83,63 @@ async def test_amain_prompt_runs_one_turn_and_closes_gateway(patched_cli):
 async def test_amain_repl_exit_closes_gateway(patched_cli):
     await cli._amain()
     assert _FakeGateway.instances[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_amain_cleans_up_background_tools(monkeypatch, tmp_path):
+    class _ClosableTools(list):
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    tools = _ClosableTools()
+    monkeypatch.chdir(tmp_path)
+    _FakeUI.instances.clear()
+    _FakeGateway.instances.clear()
+    monkeypatch.setattr(cli, "TerminalUI", _FakeUI)
+    monkeypatch.setattr(cli, "LLMGateway", _FakeGateway)
+    monkeypatch.setattr(cli, "build_marcus_tools", lambda root, settings: tools)
+    monkeypatch.setattr(cli, "load_project_instructions", lambda root: None)
+    monkeypatch.setattr(cli, "has_llm_credentials", lambda settings: True)
+    monkeypatch.setattr(cli, "resolve_settings", lambda: Settings(llm_api_key="sk-real"))
+
+    await cli._amain("hello")
+
+    assert tools.closed is True
+
+
+@pytest.mark.asyncio
+async def test_amain_cleans_up_background_processes_after_each_turn(monkeypatch, tmp_path):
+    class _ProcessManager:
+        def __init__(self):
+            self.cleanup_calls = 0
+
+        async def aclose(self):
+            self.cleanup_calls += 1
+
+    class _Tools(list):
+        def __init__(self):
+            super().__init__()
+            self.process_manager = _ProcessManager()
+
+        async def aclose(self):
+            pass
+
+    tools = _Tools()
+    monkeypatch.chdir(tmp_path)
+    _FakeUI.instances.clear()
+    _FakeGateway.instances.clear()
+    monkeypatch.setattr(cli, "TerminalUI", _FakeUI)
+    monkeypatch.setattr(cli, "LLMGateway", _FakeGateway)
+    monkeypatch.setattr(cli, "build_marcus_tools", lambda root, settings: tools)
+    monkeypatch.setattr(cli, "load_project_instructions", lambda root: None)
+    monkeypatch.setattr(cli, "has_llm_credentials", lambda settings: True)
+    monkeypatch.setattr(cli, "resolve_settings", lambda: Settings(llm_api_key="sk-real"))
+
+    await cli._amain("hello")
+
+    assert tools.process_manager.cleanup_calls == 1
 
 
 @pytest.mark.asyncio

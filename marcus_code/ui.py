@@ -1,10 +1,18 @@
 import difflib
+import math
 import re
 import sys
+from collections.abc import Callable
 from datetime import datetime
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+import orjson
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import NestedCompleter
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.styles import Style
 from rich.console import Console, Group
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.measure import Measurement
@@ -16,12 +24,17 @@ from rich.text import Text
 from harness.config import Settings
 from harness.runtime.tools import Tool
 from marcus_code.banner import render_banner
-from marcus_code.tools import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME
+from marcus_code.tools import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME
 
 if TYPE_CHECKING:
     from marcus_code.loop import UsageStats
 
 ApprovalDecision = Literal["yes", "no", "always"]
+
+_APPROVAL_PROMPT = (
+    "[#F2B880]Allow this tool call? (y)es / (n)o /[/#F2B880] "
+    "[#F28B82](a)lways for this session[/#F28B82]: "
+)
 
 
 class TerminalUI:
@@ -46,8 +59,43 @@ class TerminalUI:
             except (AttributeError, ValueError):
                 pass
         self.console = Console(legacy_windows=False)
+        self.mode = "agent"
+        self._step_lines: list[str] = []
+        self._last_step_lines: list[str] = []
+        self._tool_count = 0
+        self._live: Live | None = None
+        self._status_provider: Callable[[], dict[str, Any]] | None = None
+        self._interrupt_count = 0
+        self._input_history = InMemoryHistory()
+        self._prompt_session: PromptSession[str] | None = None
+        self._prompt_style = Style.from_dict(
+            {
+                "prompt": "bold #5fd7ff",
+                # prompt_toolkit's default toolbar style is `reverse`, which
+                # turns a dark-terminal toolbar white unless explicitly reset.
+                "bottom-toolbar": "noreverse bg:#1f1f1f #c8c8c8",
+                "bottom-toolbar.text": "noreverse bg:#1f1f1f #c8c8c8",
+            }
+        )
+        self._completer = NestedCompleter.from_nested_dict(
+            {
+                "/help": None,
+                "/?": None,
+                "/model": None,
+                "/usage": None,
+                "/mode": {"ask": None, "agent": None, "auto": None, "yolo": None},
+                "/status": None,
+                "/steps": None,
+                "/compact": None,
+                "/clear": {"--all": None},
+                "/config": {"show": None, "edit": None},
+                "/exit": None,
+                "/quit": None,
+            }
+        )
 
-    def print_banner(self, root, *, model: str, session_name: str) -> None:
+    def print_banner(self, root, *, model: str, session_name: str, mode: str = "agent") -> None:
+        self.mode = mode
         # Text.from_ansi decodes raw ANSI SGR sequences into Rich's own
         # style representation without touching the "[...]" markup parser —
         # unlike passing the string through console.print()/f-strings, this
@@ -63,6 +111,7 @@ class TerminalUI:
             "[dim]AI-powered coding agent   (Harness Recipe via Marcus)[/dim]\n\n"
             f"[bold]Workspace[/bold] : {escape(str(root))}\n"
             f"[bold]Model[/bold]     : {escape(model)}\n"
+            f"[bold]Mode[/bold]      : {escape(mode)}\n"
             f"[bold]Session[/bold]   : {escape(session_name)}"
         )
         body = Group(logo_padded, info)
@@ -89,6 +138,11 @@ class TerminalUI:
             "  /help              Show this help\n"
             "  /model [name]      Show or switch the active model for this session\n"
             "  /usage             Show token usage and timing for this session\n"
+            "  /steps             Show details from the last completed task\n"
+            "  /status            Show session, context, model, and workspace status\n"
+            "  /compact           Compact retained conversation context now\n"
+            "  /clear [--all]     Clear context; --all also clears approvals\n"
+            "  /mode [name]       Show or switch mode (ask, agent, auto, yolo)\n"
             "  /config [edit]     View, or edit, the current LLM config\n"
             "  /exit, /quit       Quit Marcus Code\n"
             "\n"
@@ -215,13 +269,116 @@ class TerminalUI:
             return None
         return api_key, base_url, model
 
-    def prompt_user(self) -> str | None:
+    async def prompt_user(self) -> str | None:
+        # Defensive lifecycle boundary: prompt_toolkit and Rich Live must
+        # never own the terminal concurrently, even after an empty LLM reply.
+        self._stop_live()
         try:
-            return self.console.input("[bold cyan]> [/bold cyan]")
+            if self._prompt_session is None:
+                if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                    result = input(f"{self.mode.upper()} > ")
+                    self._interrupt_count = 0
+                    return result
+                try:
+                    self._prompt_session = PromptSession(history=self._input_history)
+                except Exception as exc:  # noqa: BLE001 - terminal capability fallback
+                    self.print_recovery(
+                        f"Advanced prompt unavailable ({type(exc).__name__}); using basic input."
+                    )
+                    result = input(f"{self.mode.upper()} > ")
+                    self._interrupt_count = 0
+                    return result
+            result = await self._prompt_session.prompt_async(
+                [("class:prompt", f"{self.mode.upper()} > ")],
+                completer=self._completer,
+                complete_while_typing=False,
+                bottom_toolbar=self._bottom_toolbar if self._status_provider else None,
+                refresh_interval=1,
+                style=self._prompt_style,
+            )
+            self._interrupt_count = 0
+            return result
         except EOFError:
             return None
+        except KeyboardInterrupt:
+            return None if self.register_interrupt() else ""
+
+    def _bottom_toolbar(self) -> list[tuple[str, str]]:
+        if self._status_provider is None:
+            return []
+        status = self._status_provider()
+        elapsed = (datetime.now() - status["session_started_at"]).total_seconds()
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        used = status["context_tokens"]
+        limit = max(1, status["context_limit"])
+        ratio = min(1.0, used / limit)
+        filled = round(ratio * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        line_one = (
+            f"Session {hours:02d}:{minutes:02d}:{seconds:02d} │ "
+            f"Context [{bar}] ~{_format_tokens(used)}/{_format_tokens(limit)}"
+        )
+        line_two = (
+            f"Model {status['model']} │ Used {_format_tokens(status['total_tokens'])} tok │ "
+            f"{status['tokens_per_second']:.1f} tok/s │ Mode {status['mode']}"
+        )
+        line_three = f"Workspace {status['workspace']}"
+        return [
+            (
+                "class:bottom-toolbar.text",
+                f"\n{line_one}\n{line_two}\n{line_three}",
+            )
+        ]
+
+    def print_recovery(self, message: str) -> None:
+        self.console.print(f"[yellow]↻ {escape(message)}[/yellow]")
+
+    async def aclose(self) -> None:
+        self._stop_live()
+        if self._prompt_session is not None:
+            await self._prompt_session.app.cancel_and_wait_for_background_tasks()
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.refresh_status()
+
+    def bind_status(self, provider: Callable[[], dict[str, Any]]) -> None:
+        self._status_provider = provider
+
+    def refresh_status(self) -> None:
+        if self._live is not None:
+            self._live.update(self._working_renderable(), refresh=True)
+
+    def print_status(self) -> None:
+        if self._status_provider is not None:
+            self.console.print(self._status_renderable())
+
+    def confirm_yolo_mode(self) -> bool:
+        self.console.print(
+            "[bold red]YOLO mode executes tools without approval.[/bold red] "
+            "Hard safety guardrails remain active."
+        )
+        try:
+            answer = self.console.input('Type "yolo" to confirm: ').strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return False
+        return answer == "yolo"
 
     def print_assistant(self, text: str) -> None:
+        self._pause_live()
+        self.console.print(Markdown(text))
+        self._resume_live()
+
+    def print_final_answer(self, text: str) -> None:
+        had_tool_steps = bool(self._step_lines)
+        self.finish_steps(success=True)
+        if not had_tool_steps:
+            self.console.print(Markdown(text))
+            return
+        self.console.print()
+        self.console.print("[bold cyan]ผลการทำงาน[/bold cyan]")
+        self.console.print()
         self.console.print(Markdown(text))
 
     def print_assistant_delta(self, text: str) -> None:
@@ -229,27 +386,154 @@ class TerminalUI:
 
     def print_tool_call(self, tool_name: str, arguments: dict) -> None:
         summary = _summarize_arguments(arguments)
-        self.console.print(f"[dim]> {escape(tool_name)}({escape(summary)})[/dim]")
+        action = _tool_action(tool_name)
+        self._tool_count += 1
+        self._step_lines.extend([f"→ {action}", f"  {tool_name}({summary})"])
+        self._refresh_steps()
+
+    def print_tool_result(self, tool_name: str, result: dict) -> None:
+        summary = _tool_result_summary(tool_name, result)
+        self._step_lines.append(f"✓ {summary}")
+        for label in ("stdout", "stderr"):
+            output = result.get(label)
+            if not output:
+                continue
+            text = str(output).strip()
+            if not text:
+                continue
+            self._step_lines.extend([label, text[:2000]])
+        self._refresh_steps()
 
     def print_tool_error(self, tool_name: str, error: str) -> None:
-        self.console.print(f"[red]x {escape(tool_name)}: {escape(error)}[/red]")
+        self._step_lines.append(f"x {tool_name}: {error}")
+        self._refresh_steps()
 
     def print_tool_declined(self, tool_name: str) -> None:
-        self.console.print(f"[yellow]x {escape(tool_name)} declined by user[/yellow]")
+        self._step_lines.append(f"x {tool_name} declined by user")
+        self._refresh_steps()
 
     def print_guardrail_stop(self, reason: str) -> None:
+        self.finish_steps(success=False)
         self.console.print(f"[red]stopped: {escape(reason)}[/red]")
 
     def print_interrupted(self) -> None:
+        self.finish_steps(success=False)
         self.console.print("[yellow]interrupted - back to prompt[/yellow]")
 
+    def register_interrupt(self) -> bool:
+        """Return True on the third consecutive Ctrl+C, signaling CLI exit."""
+        self.finish_steps(success=False)
+        self._interrupt_count += 1
+        remaining = 3 - self._interrupt_count
+        if remaining <= 0:
+            self.console.print("[yellow]Ctrl+C pressed 3 times - exiting Marcus.[/yellow]")
+            return True
+        self.console.print(
+            f"[yellow]interrupted - press Ctrl+C {remaining} more "
+            f"time{'s' if remaining != 1 else ''} to exit[/yellow]"
+        )
+        return False
+
+    def begin_turn(self) -> None:
+        self._stop_live()
+        self._step_lines = []
+        self._tool_count = 0
+
+    def finish_steps(self, *, success: bool) -> None:
+        if not self._step_lines:
+            return
+        self._last_step_lines = list(self._step_lines)
+        self._stop_live()
+        if success:
+            self.console.print(
+                f"[green]✓ งานสำเร็จ · {self._tool_count} ขั้นตอน[/green] "
+                "[dim](ใช้ /steps เพื่อดูรายละเอียด)[/dim]"
+            )
+        else:
+            self.console.print(self._steps_renderable())
+        self._step_lines = []
+        self._tool_count = 0
+
+    def print_steps(self) -> None:
+        lines = self._last_step_lines
+        if not lines:
+            self.print_info("No completed task steps in this session yet.")
+            return
+        self.console.print(Panel("\n".join(escape(line) for line in lines), title="Last task steps"))
+
+    def _steps_renderable(self) -> Panel:
+        lines: list[str] = []
+        max_width = max(20, self.console.size.width - 8)
+        for entry in self._step_lines:
+            parts = entry.splitlines() or [""]
+            lines.extend(part[:max_width] for part in parts)
+
+        # Reserve room for the panel border, prompt, approval text, and final
+        # answer. Showing the tail keeps the currently running action visible.
+        max_lines = max(4, self.console.size.height - 10)
+        hidden = max(0, len(lines) - max_lines)
+        if hidden:
+            lines = [f"… {hidden} earlier line(s) hidden; use /steps"] + lines[-(max_lines - 1) :]
+        return Panel(
+            "\n".join(escape(line) for line in lines),
+            title=f"Working · {self._tool_count} step(s)",
+            border_style="cyan",
+        )
+
+    def _status_renderable(self) -> Text:
+        if self._status_provider is None:
+            return Text("")
+        status = self._status_provider()
+        elapsed = (datetime.now() - status["session_started_at"]).total_seconds()
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        used = status["context_tokens"]
+        limit = max(1, status["context_limit"])
+        ratio = min(1.0, used / limit)
+        filled = round(ratio * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        color = "green" if ratio < 0.7 else "yellow" if ratio < 0.85 else "#F2B880" if ratio < 0.95 else "#F28B82"
+        text = Text()
+        text.append(f"Session {hours:02d}:{minutes:02d}:{seconds:02d} │ Context ")
+        text.append(f"[{bar}]", style=color)
+        text.append(f" ~{_format_tokens(used)}/{_format_tokens(limit)}\n")
+        text.append(
+            f"Model {status['model']} │ Used {_format_tokens(status['total_tokens'])} tok │ "
+            f"{status['tokens_per_second']:.1f} tok/s │ Mode {status['mode']}\n"
+        )
+        text.append(f"Workspace {status['workspace']}", style="dim")
+        return text
+
+    def _working_renderable(self) -> Group:
+        return Group(self._steps_renderable(), self._status_renderable())
+
+    def _refresh_steps(self) -> None:
+        renderable = self._working_renderable()
+        if self._live is None:
+            self._live = Live(renderable, console=self.console, refresh_per_second=8, transient=True)
+            self._live.start()
+        else:
+            self._live.update(renderable, refresh=True)
+
+    def _pause_live(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def _resume_live(self) -> None:
+        if self._step_lines:
+            self._refresh_steps()
+
+    def _stop_live(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
     def confirm_tool_call(self, tool: Tool, arguments: dict) -> ApprovalDecision:
+        self._pause_live()
         if tool.name == EDIT_FILE_TOOL_NAME:
             self._print_edit_diff(arguments)
-        else:
-            summary = _summarize_arguments(arguments)
-            self.console.print(f"[bold]{escape(tool.name)}[/bold]({escape(summary)})")
-        if tool.name == RUN_CLI_TOOL_NAME:
+        if tool.name in {RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME}:
             warning = _command_warning(str(arguments.get("command", "")))
             if warning:
                 self.console.print(f"[bold red]WARNING:[/bold red] {escape(warning)}")
@@ -259,19 +543,31 @@ class TerminalUI:
             # Console.input/print — Rich parses "[...]" as markup tags, so
             # e.g. "[y]es" silently vanishes instead of printing.
             answer = (
-                self.console.input(
-                    "[bold]Allow this tool call?[/bold] (y)es / (n)o / (a)lways for this session: "
-                )
+                self.console.input(_APPROVAL_PROMPT)
                 .strip()
                 .lower()
             )
+            self._clear_approval_prompt(answer)
             if answer in ("y", "yes"):
+                self._resume_live()
                 return "yes"
             if answer in ("n", "no"):
+                self._resume_live()
                 return "no"
             if answer in ("a", "always"):
+                self._resume_live()
                 return "always"
             self.console.print("[dim]please answer y, n, or a[/dim]")
+
+    def _clear_approval_prompt(self, answer: str) -> None:
+        if not self.console.is_terminal:
+            return
+        plain_prompt = Text.from_markup(_APPROVAL_PROMPT).plain
+        width = max(1, self.console.size.width)
+        visual_lines = max(1, math.ceil((len(plain_prompt) + len(answer)) / width))
+        for _ in range(visual_lines):
+            self.console.file.write("\x1b[1A\x1b[2K")
+        self.console.file.flush()
 
     def _print_edit_diff(self, arguments: dict) -> None:
         path = arguments.get("path", "<unknown>")
@@ -282,7 +578,6 @@ class TerminalUI:
                 old.splitlines(), new.splitlines(), fromfile=path, tofile=path, lineterm=""
             )
         )
-        self.console.print(f"[bold]edit_file[/bold]({escape(str(path))})")
         if diff:
             self.console.print(Syntax(diff, "diff", theme="ansi_dark", background_color="default"))
 
@@ -295,6 +590,71 @@ def _summarize_arguments(arguments: dict, *, max_len: int = 120) -> str:
             text = text[:max_len] + "..."
         parts.append(f"{key}={text!r}")
     return ", ".join(parts)
+
+
+_TOOL_ACTIONS = {
+    "list_files": "Inspect workspace files",
+    "read_file": "Read file",
+    "grep": "Search source code",
+    "write_file": "Create file",
+    "edit_file": "Update file",
+    "run_cli": "Run command",
+    "start_process": "Start background service",
+    "wait_for_http": "Wait for HTTP service",
+    "read_process_output": "Read service output",
+    "stop_process": "Stop background service",
+    "fetch_url": "Fetch URL",
+    "load_skill": "Load skill instructions",
+}
+
+
+def _tool_action(tool_name: str) -> str:
+    return _TOOL_ACTIONS.get(tool_name, f"Use {tool_name}")
+
+
+def _tool_result_summary(tool_name: str, result: dict) -> str:
+    if result.get("_truncated"):
+        return f"Result captured (truncated from {result.get('_original_length', '?')} characters)"
+    if tool_name == "list_files":
+        return f"Found {len(result.get('files', []))} file(s)"
+    if tool_name == "read_file":
+        return f"Read {result.get('path', 'file')} ({result.get('lines', '?')} lines)"
+    if tool_name == "grep":
+        return f"Found {len(result.get('matches', []))} match(es)"
+    if tool_name in {"write_file", "edit_file"}:
+        return f"Updated {result.get('path', 'file')}"
+    if tool_name == "run_cli":
+        return f"Command finished with exit code {result.get('exit_code', '?')}"
+    if tool_name == "start_process":
+        return (
+            f"Service {result.get('status', 'started')} "
+            f"(process {result.get('process_id', '?')}, PID {result.get('pid', '?')})"
+        )
+    if tool_name == "wait_for_http":
+        return f"HTTP service ready (status {result.get('status', '?')})"
+    if tool_name == "read_process_output":
+        return f"Service status: {result.get('status', 'unknown')}"
+    if tool_name == "stop_process":
+        return f"Service stopped (process {result.get('process_id', '?')})"
+    if tool_name == "fetch_url":
+        return f"Fetched URL (status {result.get('status', '?')})"
+    return "Tool completed"
+
+
+def _is_json(text: str) -> bool:
+    try:
+        orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return False
+    return True
+
+
+def _format_tokens(value: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}m"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
 
 
 def _command_warning(command: str) -> str | None:

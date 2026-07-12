@@ -29,6 +29,7 @@ dependencies = [
     "prometheus-client>=0.21.0",
     "apscheduler>=3.10.4",
     "rich>=13.7.0",
+    "prompt-toolkit>=3.0.43",
 ]
 
 [project.urls]

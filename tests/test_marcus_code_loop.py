@@ -1,9 +1,13 @@
+import asyncio
+
 import pytest
 
 from harness.db.enums import RiskTier
+from harness.llm.gateway import LLMTransientError
 from harness.llm.types import LLMMessage
 from harness.runtime.tools import Tool
 from marcus_code.loop import MarcusLoop
+from marcus_code.modes import AgentMode
 from tests.fakes import ScriptedLLMGateway, text_response, tool_call_response
 
 
@@ -15,6 +19,7 @@ class _FakeUI:
         self.errors: list[tuple[str, str]] = []
         self.declined: list[str] = []
         self.guardrail_stops: list[str] = []
+        self.finished_steps: list[bool] = []
 
     def print_assistant(self, text):
         self.assistant_messages.append(text)
@@ -33,6 +38,9 @@ class _FakeUI:
 
     def print_interrupted(self):
         pass
+
+    def finish_steps(self, *, success):
+        self.finished_steps.append(success)
 
     def confirm_tool_call(self, tool, arguments):
         return next(self._decisions)
@@ -209,3 +217,194 @@ async def test_token_budget_stops_before_next_call():
     loop.usage.total_tokens = 1
     await loop.run_turn("do it")
     assert any("token budget" in stop for stop in ui.guardrail_stops)
+
+
+@pytest.mark.asyncio
+async def test_ask_mode_blocks_write_tool_without_prompting():
+    llm = ScriptedLLMGateway([tool_call_response("mutate", {}), text_response("blocked")])
+    ui = _FakeUI(decisions=[])
+    loop = MarcusLoop(llm, [_sensitive_tool()], ui, mode=AgentMode.ask)
+
+    await loop.run_turn("change it")
+
+    assert ui.errors[0][0] == "mutate"
+    assert "ask mode" in ui.errors[0][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [AgentMode.auto, AgentMode.yolo])
+async def test_autonomous_modes_skip_approval_for_normal_writes(mode):
+    llm = ScriptedLLMGateway([tool_call_response("mutate", {}), text_response("done")])
+    ui = _FakeUI(decisions=[])
+    loop = MarcusLoop(llm, [_sensitive_tool()], ui, mode=mode)
+
+    await loop.run_turn("change it")
+
+    assert ui.assistant_messages == ["done"]
+
+
+def test_compact_history_reduces_retained_context():
+    loop = MarcusLoop(
+        ScriptedLLMGateway([]), [], _FakeUI(), system_prompt="system",
+        context_window_tokens=500, compact_target_percent=50,
+    )
+    loop.state.history.extend(
+        LLMMessage(role="user", content=(f"message-{index} " * 80)) for index in range(12)
+    )
+    before = loop.context_tokens
+
+    reported_before, after = loop.compact_history()
+
+    assert reported_before == before
+    assert after < before
+    assert loop.usage.compactions == 1
+    assert loop.state.history[0].role == "system"
+
+
+def test_clear_history_preserves_system_and_optionally_approvals():
+    loop = MarcusLoop(ScriptedLLMGateway([]), [], _FakeUI(), system_prompt="system")
+    loop.state.history.append(LLMMessage(role="user", content="hello"))
+    loop.state.always_allowed.add("run_cli")
+
+    loop.clear_history()
+    assert [message.role for message in loop.state.history] == ["system"]
+    assert loop.state.always_allowed == {"run_cli"}
+
+    loop.clear_history(clear_all=True)
+    assert loop.state.always_allowed == set()
+
+
+@pytest.mark.asyncio
+async def test_stream_failure_falls_back_to_non_streaming_request():
+    class _RecoveringGateway:
+        async def complete_stream(self, *args, **kwargs):
+            raise LLMTransientError("stream unavailable")
+
+        async def complete(self, *args, **kwargs):
+            return text_response("recovered")
+
+    ui = _FakeUI()
+    ui.print_assistant_delta = lambda text: None
+    loop = MarcusLoop(_RecoveringGateway(), [], ui)
+
+    await loop.run_turn("hello")
+
+    assert ui.assistant_messages == ["recovered"]
+
+
+@pytest.mark.asyncio
+async def test_consecutive_tool_failures_trip_circuit_breaker():
+    async def fail(arguments):
+        raise RuntimeError(f"failure {arguments['attempt']}")
+
+    tool = Tool(
+        name="flaky",
+        description="fails",
+        parameters={"type": "object"},
+        handler=fail,
+        risk_tier=RiskTier.read_only,
+    )
+    llm = ScriptedLLMGateway(
+        [tool_call_response("flaky", {"attempt": index}) for index in range(5)]
+    )
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [tool], ui, max_consecutive_tool_failures=5)
+
+    await loop.run_turn("keep trying")
+
+    assert len(ui.errors) == 5
+    assert any("retry loop" in reason for reason in ui.guardrail_stops)
+
+
+@pytest.mark.asyncio
+async def test_read_only_tool_failure_is_retried_and_recovers():
+    attempts = {"count": 0}
+
+    async def flaky(arguments):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("temporary")
+        return {"ok": True}
+
+    tool = Tool(
+        name="flaky",
+        description="temporarily fails",
+        parameters={"type": "object"},
+        handler=flaky,
+        risk_tier=RiskTier.read_only,
+    )
+    llm = ScriptedLLMGateway([tool_call_response("flaky", {}), text_response("recovered")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [tool], ui)
+
+    await loop.run_turn("try it")
+
+    assert attempts["count"] == 2
+    assert ui.errors == []
+    assert ui.assistant_messages == ["recovered"]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_http_is_not_retried_by_outer_tool_recovery():
+    attempts = {"count": 0}
+
+    async def fail(arguments):
+        attempts["count"] += 1
+        raise RuntimeError("not ready")
+
+    tool = Tool(
+        name="wait_for_http",
+        description="polls internally",
+        parameters={"type": "object"},
+        handler=fail,
+        risk_tier=RiskTier.read_only,
+        idempotent=True,
+    )
+    llm = ScriptedLLMGateway(
+        [tool_call_response("wait_for_http", {}), text_response("handled")]
+    )
+    loop = MarcusLoop(llm, [tool], _FakeUI())
+
+    await loop.run_turn("wait")
+
+    assert attempts["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_final_response_still_finishes_working_steps():
+    ui = _FakeUI()
+    llm = ScriptedLLMGateway([tool_call_response("peek", {}), text_response(None)])
+    loop = MarcusLoop(llm, [_read_only_tool()], ui)
+
+    await loop.run_turn("inspect")
+
+    assert ui.finished_steps[-1] is True
+
+
+@pytest.mark.asyncio
+async def test_llm_recovery_has_an_overall_timeout():
+    class _HangingGateway:
+        async def complete(self, *args, **kwargs):
+            await asyncio.sleep(10)
+
+    ui = _FakeUI()
+    loop = MarcusLoop(_HangingGateway(), [], ui, llm_recovery_timeout_seconds=0.01)
+
+    await loop.run_turn("hello")
+
+    assert any("recovery timed out" in reason for reason in ui.guardrail_stops)
+
+
+@pytest.mark.asyncio
+async def test_context_over_limit_stops_before_llm_call():
+    llm = ScriptedLLMGateway([text_response("must not be used")])
+    ui = _FakeUI()
+    loop = MarcusLoop(
+        llm, [], ui, context_window_tokens=20, compact_threshold_percent=100,
+        history_summary_enabled=False,
+    )
+
+    await loop.run_turn("x" * 500)
+
+    assert llm.calls == []
+    assert any("context window" in reason for reason in ui.guardrail_stops)

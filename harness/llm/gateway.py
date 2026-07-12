@@ -97,6 +97,7 @@ class LLMGateway:
         tools: list[ToolSpec] | None = None,
         model: str | None = None,
         on_delta: Callable[[str], None] | None = None,
+        max_retries: int = 3,
     ) -> LLMResponse:
         """Stream text deltas while assembling a normal LLMResponse.
 
@@ -108,23 +109,54 @@ class LLMGateway:
             "messages": [m.to_openai() for m in messages],
             "temperature": 0.0,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = [t.to_openai() for t in tools]
+        attempt = 0
+        while True:
+            try:
+                return await self._complete_stream_once(payload, model=model, on_delta=on_delta)
+            except (httpx.TransportError, LLMTransientError) as exc:
+                if attempt >= max_retries:
+                    raise LLMTransientError(
+                        f"LLM streaming request failed after {attempt + 1} attempts: {exc}"
+                    ) from exc
+                await asyncio.sleep(_backoff_delay(attempt))
+                attempt += 1
+
+    async def _complete_stream_once(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str | None,
+        on_delta: Callable[[str], None] | None,
+    ) -> LLMResponse:
         content_parts: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         usage = Usage(0, 0, 0)
         finish_reason = "stop"
         async with self._client.stream("POST", "/chat/completions", json=payload) as response:
             if response.status_code != 200:
-                raise LLMError(f"LLM streaming request failed with status {response.status_code}")
+                await response.aread()
+                if response.status_code in RETRYABLE_STATUS_CODES:
+                    raise LLMTransientError(
+                        f"status {response.status_code}: {response.text[:500]}"
+                    )
+                raise LLMError(
+                    f"LLM streaming request failed with status {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
                 raw = line[5:].strip()
                 if raw == "[DONE]":
                     break
-                chunk = orjson.loads(raw)
+                try:
+                    chunk = orjson.loads(raw)
+                except orjson.JSONDecodeError as exc:
+                    raise LLMTransientError("LLM stream returned malformed JSON") from exc
                 choice = (chunk.get("choices") or [{}])[0]
                 finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta") or {}

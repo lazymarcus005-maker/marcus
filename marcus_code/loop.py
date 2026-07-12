@@ -1,17 +1,19 @@
+import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import orjson
 
-from harness.llm.gateway import LLMError, LLMGateway
+from harness.llm.gateway import LLMError, LLMGateway, LLMTransientError
 from harness.llm.types import LLMMessage, ToolCall, Usage
-from harness.runtime.guardrails import REPEATED_CALL_WINDOW, requires_approval
+from harness.runtime.guardrails import REPEATED_CALL_WINDOW
 from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tools import Tool
+from marcus_code.modes import AgentMode, tool_is_allowed, tool_requires_approval
 from marcus_code.ui import TerminalUI
 
-DEFAULT_MAX_STEPS = 25
+DEFAULT_MAX_STEPS = 100
 DEFAULT_RESULT_MAX_CHARS = 4000
 DEFAULT_MAX_HISTORY_MESSAGES = 100
 
@@ -35,6 +37,10 @@ class UsageStats:
     total_tokens: int = 0
     llm_calls: int = 0
     elapsed_seconds: float = 0.0
+    last_prompt_tokens: int = 0
+    last_completion_tokens: int = 0
+    compactions: int = 0
+    last_elapsed_seconds: float = 0.0
 
     def record(self, usage: Usage, duration: float) -> None:
         self.prompt_tokens += usage.prompt_tokens
@@ -42,10 +48,19 @@ class UsageStats:
         self.total_tokens += usage.total_tokens
         self.llm_calls += 1
         self.elapsed_seconds += duration
+        self.last_prompt_tokens = usage.prompt_tokens
+        self.last_completion_tokens = usage.completion_tokens
+        self.last_elapsed_seconds = duration
 
     @property
     def tokens_per_second(self) -> float:
         return self.total_tokens / self.elapsed_seconds if self.elapsed_seconds > 0 else 0.0
+
+    @property
+    def last_tokens_per_second(self) -> float:
+        if self.last_elapsed_seconds <= 0:
+            return 0.0
+        return self.last_completion_tokens / self.last_elapsed_seconds
 
 
 class MarcusLoop:
@@ -70,6 +85,13 @@ class MarcusLoop:
         max_history_messages: int = DEFAULT_MAX_HISTORY_MESSAGES,
         max_total_tokens: int | None = None,
         history_summary_enabled: bool = True,
+        mode: AgentMode = AgentMode.agent,
+        context_window_tokens: int = 131_072,
+        compact_threshold_percent: int = 85,
+        compact_target_percent: int = 60,
+        max_consecutive_tool_failures: int = 5,
+        max_safe_tool_retries: int = 2,
+        llm_recovery_timeout_seconds: float = 90.0,
     ) -> None:
         self.llm = llm
         self.tools_by_name = {t.name: t for t in tools}
@@ -81,6 +103,13 @@ class MarcusLoop:
         self.max_history_messages = max_history_messages
         self.max_total_tokens = max_total_tokens
         self.history_summary_enabled = history_summary_enabled
+        self.mode = mode
+        self.context_window_tokens = context_window_tokens
+        self.compact_threshold_percent = compact_threshold_percent
+        self.compact_target_percent = compact_target_percent
+        self.max_consecutive_tool_failures = max_consecutive_tool_failures
+        self.max_safe_tool_retries = max_safe_tool_retries
+        self.llm_recovery_timeout_seconds = llm_recovery_timeout_seconds
         self.state = SessionState()
         self.usage = UsageStats()
         self.started_at = datetime.now()
@@ -88,11 +117,21 @@ class MarcusLoop:
             self.state.history.append(LLMMessage(role="system", content=system_prompt))
 
     async def run_turn(self, user_input: str) -> None:
+        if hasattr(self.ui, "begin_turn"):
+            self.ui.begin_turn()
         self.state.history.append(LLMMessage(role="user", content=user_input))
         recent_calls: list[tuple[str, dict]] = []
+        consecutive_tool_failures = 0
 
         for _ in range(self.max_steps):
             self._trim_history()
+            if self.context_percent >= self.compact_threshold_percent:
+                self.compact_history()
+            if self.context_tokens >= self.context_window_tokens:
+                self.ui.print_guardrail_stop(
+                    "retained context exceeds the configured context window; use /compact or /clear"
+                )
+                return
             if (
                 self.max_total_tokens is not None
                 and self.usage.total_tokens >= self.max_total_tokens
@@ -103,22 +142,48 @@ class MarcusLoop:
                 return
             try:
                 start = time.perf_counter()
-                if hasattr(self.llm, "complete_stream") and hasattr(
+                use_stream = hasattr(self.llm, "complete_stream") and hasattr(
                     self.ui, "print_assistant_delta"
-                ):
-                    response = await self.llm.complete_stream(
-                        self.state.history,
-                        tools=self.tool_specs,
-                        model=self.model,
-                        on_delta=self.ui.print_assistant_delta,
-                    )
-                else:
-                    response = await self.llm.complete(
-                        self.state.history, tools=self.tool_specs, model=self.model
-                    )
+                )
+                async with asyncio.timeout(self.llm_recovery_timeout_seconds):
+                    if use_stream:
+                        try:
+                            response = await self.llm.complete_stream(
+                                self.state.history,
+                                tools=self.tool_specs,
+                                model=self.model,
+                                # One retry here, then one bounded standard fallback.
+                                max_retries=1,
+                                on_delta=None,
+                            )
+                        except LLMTransientError:
+                            if hasattr(self.ui, "print_recovery"):
+                                self.ui.print_recovery(
+                                    "Streaming failed; recovering with a standard request."
+                                )
+                            response = await self.llm.complete(
+                                self.state.history,
+                                tools=self.tool_specs,
+                                model=self.model,
+                                max_retries=1,
+                            )
+                    else:
+                        response = await self.llm.complete(
+                            self.state.history,
+                            tools=self.tool_specs,
+                            model=self.model,
+                            max_retries=1,
+                        )
                 self.usage.record(response.usage, time.perf_counter() - start)
+                self._update_ui_status()
             except LLMError as exc:
                 self.ui.print_guardrail_stop(f"LLM call failed: {exc}")
+                return
+            except TimeoutError:
+                self.ui.print_guardrail_stop(
+                    "LLM recovery timed out after "
+                    f"{self.llm_recovery_timeout_seconds:g}s; returned control safely"
+                )
                 return
 
             self.state.history.append(
@@ -130,11 +195,16 @@ class MarcusLoop:
             if not response.tool_calls:
                 self._trim_history()
                 if response.content:
-                    if not hasattr(self.llm, "complete_stream"):
+                    if hasattr(self.ui, "print_final_answer"):
+                        self.ui.print_final_answer(response.content)
+                    else:
                         self.ui.print_assistant(response.content)
-                    elif hasattr(self.ui, "print_assistant_delta"):
-                        self.ui.console.print()
+                elif hasattr(self.ui, "finish_steps"):
+                    self.ui.finish_steps(success=True)
                 return
+
+            if response.content:
+                self.ui.print_assistant(response.content)
 
             for call in response.tool_calls:
                 key = (call.name, call.arguments)
@@ -149,6 +219,10 @@ class MarcusLoop:
                     return
 
                 observation = await self._process_tool_call(call)
+                if "error" in observation and "declined" not in str(observation["error"]):
+                    consecutive_tool_failures += 1
+                else:
+                    consecutive_tool_failures = 0
                 self.state.history.append(
                     LLMMessage(
                         role="tool",
@@ -158,6 +232,12 @@ class MarcusLoop:
                     )
                 )
                 self._trim_history()
+                if consecutive_tool_failures >= self.max_consecutive_tool_failures:
+                    self.ui.print_guardrail_stop(
+                        "too many consecutive tool failures "
+                        f"({self.max_consecutive_tool_failures}); stopped to prevent a retry loop"
+                    )
+                    return
 
         self.ui.print_guardrail_stop(f"exceeded max steps ({self.max_steps})")
 
@@ -185,6 +265,53 @@ class MarcusLoop:
             tail = tail[1:]
         self.state.history = system + tail
 
+    @property
+    def context_tokens(self) -> int:
+        """Conservative estimate of retained messages sent on the next request."""
+        serialized = orjson.dumps([message.to_openai() for message in self.state.history])
+        return max(1, (len(serialized) + 3) // 4)
+
+    @property
+    def context_percent(self) -> float:
+        return min(100.0, self.context_tokens * 100 / max(1, self.context_window_tokens))
+
+    def compact_history(self) -> tuple[int, int]:
+        before = self.context_tokens
+        target = self.context_window_tokens * self.compact_target_percent // 100
+        original_limit = self.max_history_messages
+        while self.context_tokens > target and len(self.state.history) > 4:
+            self.max_history_messages = max(4, min(self.max_history_messages - 1, len(self.state.history) - 1))
+            self._trim_history()
+        self.max_history_messages = original_limit
+        after = self.context_tokens
+        if after < before:
+            self.usage.compactions += 1
+        self._update_ui_status()
+        return before, after
+
+    def clear_history(self, *, clear_all: bool = False) -> None:
+        system = next((message for message in self.state.history if message.role == "system"), None)
+        self.state.history = [system] if system is not None else []
+        if clear_all:
+            self.state.always_allowed.clear()
+        self._update_ui_status()
+
+    def status(self, workspace: str) -> dict:
+        return {
+            "session_started_at": self.started_at,
+            "model": self.model or "default",
+            "mode": self.mode.value,
+            "workspace": workspace,
+            "context_tokens": self.context_tokens,
+            "context_limit": self.context_window_tokens,
+            "total_tokens": self.usage.total_tokens,
+            "tokens_per_second": self.usage.last_tokens_per_second,
+        }
+
+    def _update_ui_status(self) -> None:
+        if hasattr(self.ui, "refresh_status"):
+            self.ui.refresh_status()
+
     async def _process_tool_call(self, call: ToolCall) -> dict:
         tool = self.tools_by_name.get(call.name)
         if tool is None:
@@ -194,7 +321,17 @@ class MarcusLoop:
 
         self.ui.print_tool_call(call.name, call.arguments)
 
-        if requires_approval(tool.risk_tier) and call.name not in self.state.always_allowed:
+        if not tool_is_allowed(self.mode, tool.risk_tier):
+            error = f"tool {call.name!r} is not available in {self.mode.value} mode"
+            self.ui.print_tool_error(call.name, error)
+            return {"error": error}
+
+        if tool_requires_approval(
+            self.mode,
+            tool_name=call.name,
+            risk_tier=tool.risk_tier,
+            arguments=call.arguments,
+        ) and call.name not in self.state.always_allowed:
             decision = self.ui.confirm_tool_call(tool, call.arguments)
             if decision == "always":
                 self.state.always_allowed.add(call.name)
@@ -202,10 +339,27 @@ class MarcusLoop:
                 self.ui.print_tool_declined(call.name)
                 return {"error": "user declined this tool call"}
 
-        try:
-            result = await tool.handler(call.arguments)
-        except Exception as exc:  # noqa: BLE001 - tool failures become observations, not crashes
-            self.ui.print_tool_error(call.name, str(exc))
-            return {"error": str(exc)}
+        retryable = (
+            (tool.risk_tier.value == "read_only" or tool.idempotent)
+            and call.name not in {"wait_for_http"}
+        )
+        max_attempts = self.max_safe_tool_retries + 1 if retryable else 1
+        for attempt in range(max_attempts):
+            try:
+                result = await tool.handler(call.arguments)
+                break
+            except Exception as exc:  # noqa: BLE001 - failures become observations
+                if attempt + 1 < max_attempts:
+                    if hasattr(self.ui, "print_recovery"):
+                        self.ui.print_recovery(
+                            f"Tool {call.name} failed; retrying safely "
+                            f"({attempt + 2}/{max_attempts})."
+                        )
+                    continue
+                self.ui.print_tool_error(call.name, str(exc))
+                return {"error": str(exc)}
 
-        return truncate_result(result, max_chars=self.result_max_chars)
+        observation = truncate_result(result, max_chars=self.result_max_chars)
+        if hasattr(self.ui, "print_tool_result"):
+            self.ui.print_tool_result(call.name, observation)
+        return observation
