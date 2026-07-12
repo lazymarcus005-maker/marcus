@@ -18,6 +18,7 @@ from marcus_code.config import (
 )
 from marcus_code.loop import MarcusLoop
 from marcus_code.modes import AgentMode
+from marcus_code.ollama_usage import is_ollama_cloud, load_cached_ollama_email
 from marcus_code.prompt import build_system_prompt
 from marcus_code.skills import build_skill_catalog
 from marcus_code.tools import build_marcus_tools
@@ -89,7 +90,19 @@ async def _amain(prompt: str | None = None, mode: AgentMode | None = None) -> No
         and not ui.confirm_yolo_mode()
     ):
         mode = AgentMode.agent
-    ui.print_banner(root, model=settings.llm_model, session_name=session_name, mode=mode.value)
+    profile_email = (
+        load_cached_ollama_email()
+        if is_ollama_cloud(settings.llm_base_url)
+        else "(not available)"
+    )
+    ui.print_banner(
+        root,
+        model=settings.llm_model,
+        session_name=session_name,
+        mode=mode.value,
+        provider_url=settings.llm_base_url,
+        profile_email=profile_email,
+    )
 
     llm = LLMGateway(settings=settings)
     tools = build_marcus_tools(root, settings)

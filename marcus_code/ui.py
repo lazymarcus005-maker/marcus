@@ -28,6 +28,7 @@ from marcus_code.tools import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME, START_PROC
 
 if TYPE_CHECKING:
     from marcus_code.loop import UsageStats
+    from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
 
 ApprovalDecision = Literal["yes", "no", "always"]
 
@@ -94,7 +95,16 @@ class TerminalUI:
             }
         )
 
-    def print_banner(self, root, *, model: str, session_name: str, mode: str = "agent") -> None:
+    def print_banner(
+        self,
+        root,
+        *,
+        model: str,
+        session_name: str,
+        mode: str = "agent",
+        provider_url: str = "",
+        profile_email: str | None = None,
+    ) -> None:
         self.mode = mode
         # Text.from_ansi decodes raw ANSI SGR sequences into Rich's own
         # style representation without touching the "[...]" markup parser —
@@ -107,11 +117,14 @@ class TerminalUI:
         # true px, so 1 row / 2 columns is the closest analogue); the bottom
         # pad also does the job the old blank Text("") separator did.
         logo_padded = Padding(logo, (1, 2))
+        profile = profile_email or "(run /usage login)"
         info = Text.from_markup(
             "[dim]AI-powered coding agent   (Harness Recipe via Marcus)[/dim]\n\n"
             f"[bold]Workspace[/bold] : {escape(str(root))}\n"
-            f"[bold]Model[/bold]     : {escape(model)}\n"
-            f"[bold]Mode[/bold]      : {escape(mode)}\n"
+            f"[bold]Model[/bold]     : {escape(model.ljust(20))} |  "
+            f"[bold]Provider[/bold] : {escape(provider_url)}\n"
+            f"[bold]Mode[/bold]      : {escape(mode.ljust(20))} |  "
+            f"[bold]Profile[/bold]  : {escape(profile)}\n"
             f"[bold]Session[/bold]   : {escape(session_name)}"
         )
         body = Group(logo_padded, info)
@@ -137,7 +150,7 @@ class TerminalUI:
             "Commands:\n"
             "  /help              Show this help\n"
             "  /model [name]      Show or switch the active model for this session\n"
-            "  /usage             Show token usage and timing for this session\n"
+            "  /usage [login]     Show tokens; Ollama Cloud quota when configured\n"
             "  /steps             Show details from the last completed task\n"
             "  /status            Show session, context, model, and workspace status\n"
             "  /compact           Compact retained conversation context now\n"
@@ -227,6 +240,20 @@ class TerminalUI:
                 f"[bold]Throughput[/bold]        : {stats.tokens_per_second:.1f} tok/s\n"
                 f"[bold]Session time[/bold]      : {elapsed:.0f}s",
                 title="Usage",
+                border_style="cyan",
+            )
+        )
+
+    def print_ollama_cloud_usage(self, usage: "OllamaCloudUsage") -> None:
+        self.console.print(
+            Panel.fit(
+                "\n".join(
+                    (
+                        _format_cloud_usage_line("Session", usage.session),
+                        _format_cloud_usage_line("Weekly", usage.weekly),
+                    )
+                ),
+                title="Ollama Cloud Usage",
                 border_style="cyan",
             )
         )
@@ -655,6 +682,17 @@ def _format_tokens(value: int) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.1f}k"
     return str(value)
+
+
+def _format_cloud_usage_line(label: str, period: "UsagePeriod | None") -> str:
+    if period is None or period.percent is None:
+        return f"{label:<7} [N/A]"
+    percent = min(100.0, max(0.0, period.percent))
+    width = 30
+    filled = round(percent * width / 100)
+    bar = "█" * filled + "░" * (width - filled)
+    reset = f"  reset {period.resets_in}" if period.resets_in else ""
+    return f"{label:<7} [{bar}] {percent:g}%{reset}"
 
 
 def _command_warning(command: str) -> str | None:

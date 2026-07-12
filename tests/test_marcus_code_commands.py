@@ -6,6 +6,7 @@ from harness.llm.types import LLMMessage
 from marcus_code.commands import CommandContext, dispatch
 from marcus_code.config import save_user_config
 from marcus_code.loop import MarcusLoop
+from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
 from tests.fakes import ScriptedLLMGateway, text_response
 
 
@@ -18,6 +19,7 @@ class _FakeUI:
         self.config_shown: list = []
         self._config_edit_result = config_edit_result
         self.config_edit_calls: list[dict] = []
+        self.ollama_usage = []
 
     def print_info(self, message):
         self.info.append(message)
@@ -43,6 +45,9 @@ class _FakeUI:
             }
         )
         return self._config_edit_result
+
+    def print_ollama_cloud_usage(self, usage):
+        self.ollama_usage.append(usage)
 
 
 def _point_user_config_at(monkeypatch, tmp_path):
@@ -131,6 +136,34 @@ async def test_usage_command_reports_loop_usage_stats():
     stats, started_at = ui.usage_calls[0]
     assert stats is ctx.loop.usage
     assert started_at is ctx.loop.started_at
+
+
+@pytest.mark.asyncio
+async def test_usage_command_fetches_ollama_cloud_usage(monkeypatch):
+    expected = OllamaCloudUsage(
+        session=UsagePeriod(14.3, "2 hours"),
+        weekly=UsagePeriod(14.5, "10 hours"),
+    )
+
+    class _Client:
+        has_profile = True
+
+        async def fetch(self, *, interactive=False):
+            assert interactive is False
+            return expected
+
+    monkeypatch.setattr("marcus_code.commands.OllamaCloudUsageClient", _Client)
+    ui = _FakeUI()
+    settings = Settings(
+        llm_api_key="sk-real",
+        llm_base_url="https://ollama.com/v1",
+        llm_model="model",
+    )
+    ctx = _make_ctx(ui, settings=settings)
+
+    await dispatch(ctx, "/usage")
+
+    assert ui.ollama_usage == [expected]
 
 
 @pytest.mark.asyncio

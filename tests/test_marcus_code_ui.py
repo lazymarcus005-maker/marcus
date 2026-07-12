@@ -5,6 +5,7 @@ from io import StringIO
 import pytest
 from rich.console import Console
 
+from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
 from marcus_code.ui import _APPROVAL_PROMPT, TerminalUI
 
 
@@ -297,3 +298,38 @@ async def test_ui_close_cancels_prompt_background_tasks():
     await ui.aclose()
 
     assert session.app.closed is True
+
+
+def test_ollama_cloud_usage_renders_progress_bars():
+    ui, stream = _capturing_ui()
+    ui.print_ollama_cloud_usage(
+        OllamaCloudUsage(
+            session=UsagePeriod(14.3, "2 hours"),
+            weekly=UsagePeriod(14.5, "10 hours"),
+        )
+    )
+
+    output = stream.getvalue()
+    assert "Ollama Cloud Usage" in output
+    assert "Session" in output and "14.3%" in output and "2 hours" in output
+    assert "Weekly" in output and "14.5%" in output and "10 hours" in output
+
+
+def test_banner_shows_provider_next_to_model_and_profile_email(tmp_path):
+    ui, stream = _capturing_ui()
+
+    ui.print_banner(
+        tmp_path,
+        model="gpt-oss:120b",
+        provider_url="https://ollama.com/v1",
+        profile_email="user@example.com",
+        mode="agent",
+        session_name="session",
+    )
+
+    output = stream.getvalue()
+    assert "Model" in output and "gpt-oss:120b" in output
+    assert "Provider" in output and "https://ollama.com/v1" in output
+    assert "Profile" in output and "user@example.com" in output
+    assert "gpt-oss:120b         |  Provider" in output
+    assert "agent                |  Profile" in output

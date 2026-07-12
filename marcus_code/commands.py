@@ -7,6 +7,11 @@ from harness.llm.types import LLMMessage
 from marcus_code.config import has_llm_credentials, resolve_settings, save_user_config
 from marcus_code.loop import MarcusLoop
 from marcus_code.modes import AgentMode, mode_help, mode_hint, mode_instructions
+from marcus_code.ollama_usage import (
+    OllamaCloudUsageClient,
+    OllamaUsageError,
+    is_ollama_cloud,
+)
 from marcus_code.ui import TerminalUI
 
 EXIT_COMMANDS = {"/exit", "/quit"}
@@ -49,11 +54,34 @@ async def _cmd_model(ctx: CommandContext, args: str) -> None:
 
 
 async def _cmd_usage(ctx: CommandContext, args: str) -> None:
+    action = args.strip().lower()
+    if action not in {"", "login"}:
+        ctx.ui.print_error("usage: /usage or /usage login")
+        return
     ctx.ui.print_usage(
         ctx.loop.usage,
         session_started_at=ctx.loop.started_at,
         max_total_tokens=ctx.loop.max_total_tokens,
     )
+    if not is_ollama_cloud(ctx.settings.llm_base_url):
+        return
+
+    client = OllamaCloudUsageClient()
+    # Only the explicit login command may open a visible browser. Plain
+    # /usage must remain non-interactive and use the saved session state.
+    interactive = action == "login"
+    if interactive:
+        ctx.ui.print_info(
+            "Opening Ollama settings in a browser. Log in there if requested; "
+            "Marcus will continue when usage is available."
+        )
+    try:
+        usage = await client.fetch(interactive=interactive)
+    except OllamaUsageError as exc:
+        ctx.ui.print_error(f"Ollama Cloud usage unavailable: {exc}")
+        return
+    if hasattr(ctx.ui, "print_ollama_cloud_usage"):
+        ctx.ui.print_ollama_cloud_usage(usage)
 
 
 async def _cmd_steps(ctx: CommandContext, args: str) -> None:
