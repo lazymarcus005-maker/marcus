@@ -1,9 +1,11 @@
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import orjson
 
 from harness.llm.gateway import LLMError, LLMGateway
-from harness.llm.types import LLMMessage, ToolCall
+from harness.llm.types import LLMMessage, ToolCall, Usage
 from harness.runtime.guardrails import REPEATED_CALL_WINDOW, requires_approval
 from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tools import Tool
@@ -22,6 +24,29 @@ class SessionState:
     always_allowed: set[str] = field(default_factory=set)
 
 
+@dataclass
+class UsageStats:
+    """Cumulative token/timing totals across every LLM call made in this
+    session — backs the /usage command."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    llm_calls: int = 0
+    elapsed_seconds: float = 0.0
+
+    def record(self, usage: Usage, duration: float) -> None:
+        self.prompt_tokens += usage.prompt_tokens
+        self.completion_tokens += usage.completion_tokens
+        self.total_tokens += usage.total_tokens
+        self.llm_calls += 1
+        self.elapsed_seconds += duration
+
+    @property
+    def tokens_per_second(self) -> float:
+        return self.total_tokens / self.elapsed_seconds if self.elapsed_seconds > 0 else 0.0
+
+
 class MarcusLoop:
     """In-process ReAct loop: LLM call -> tool calls (with approval) -> feed
     results back -> repeat, until the model replies with plain text (that's
@@ -37,6 +62,7 @@ class MarcusLoop:
         tools: list[Tool],
         ui: TerminalUI,
         *,
+        model: str | None = None,
         system_prompt: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         result_max_chars: int = DEFAULT_RESULT_MAX_CHARS,
@@ -45,9 +71,12 @@ class MarcusLoop:
         self.tools_by_name = {t.name: t for t in tools}
         self.tool_specs = [t.to_spec() for t in tools]
         self.ui = ui
+        self.model = model
         self.max_steps = max_steps
         self.result_max_chars = result_max_chars
         self.state = SessionState()
+        self.usage = UsageStats()
+        self.started_at = datetime.now()
         if system_prompt:
             self.state.history.append(LLMMessage(role="system", content=system_prompt))
 
@@ -57,7 +86,11 @@ class MarcusLoop:
 
         for _ in range(self.max_steps):
             try:
-                response = await self.llm.complete(self.state.history, tools=self.tool_specs)
+                start = time.perf_counter()
+                response = await self.llm.complete(
+                    self.state.history, tools=self.tool_specs, model=self.model
+                )
+                self.usage.record(response.usage, time.perf_counter() - start)
             except LLMError as exc:
                 self.ui.print_guardrail_stop(f"LLM call failed: {exc}")
                 return
