@@ -167,7 +167,7 @@ async def select_skill_candidate(
         and (scored[0][0] != scored[1][0] or scored[0][1] - scored[1][1] < 0.2)
     ):
         return None
-    active = await registry.get_active_revision_by_skill_name(run.tenant_id, scored[0][1].name)
+    active = await registry.get_active_revision_by_skill_name(run.tenant_id, scored[0][2].name)
     return active
 
 
