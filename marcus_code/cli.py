@@ -1,5 +1,7 @@
+import argparse
 import asyncio
 import contextlib
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from marcus_code.config import (
 )
 from marcus_code.loop import MarcusLoop
 from marcus_code.prompt import build_system_prompt
+from marcus_code.skills import build_skill_catalog
 from marcus_code.tools import build_marcus_tools
 from marcus_code.ui import TerminalUI
 
@@ -22,7 +25,19 @@ def _new_session_name() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
-async def _amain() -> None:
+def _git_summary(root: Path) -> str | None:
+    try:
+        branch = subprocess.run(["git", "branch", "--show-current"], cwd=root, capture_output=True, text=True, timeout=2, check=False).stdout.strip()
+        status = subprocess.run(["git", "status", "--short"], cwd=root, capture_output=True, text=True, timeout=2, check=False).stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if not branch and not status:
+        return None
+    state = "clean" if not status else f"{len(status)} changed path(s)"
+    return f"branch={branch or '<detached/unknown>'}; worktree={state}"
+
+
+async def _amain(prompt: str | None = None) -> None:
     root = Path.cwd()
     ui = TerminalUI()
     settings = resolve_settings()
@@ -48,11 +63,17 @@ async def _amain() -> None:
         tools,
         ui,
         model=settings.llm_model,
-        system_prompt=build_system_prompt(root, project_instructions=project_instructions),
+        system_prompt=build_system_prompt(root, project_instructions=project_instructions, git_summary=_git_summary(root), skill_catalog=build_skill_catalog(root)),
+        max_history_messages=settings.cli_max_history_messages,
+        max_total_tokens=settings.cli_max_total_tokens,
+        history_summary_enabled=settings.cli_history_summary_enabled,
     )
     ctx = CommandContext(ui=ui, loop=loop, settings=settings)
 
     try:
+        if prompt is not None:
+            await loop.run_turn(prompt)
+            return
         while True:
             user_input = ui.prompt_user()
             if user_input is None:
@@ -74,8 +95,11 @@ async def _amain() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="marcus")
+    parser.add_argument("-p", "--prompt", help="run one prompt non-interactively")
+    args = parser.parse_args()
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(_amain())
+        asyncio.run(_amain(args.prompt))
 
 
 if __name__ == "__main__":

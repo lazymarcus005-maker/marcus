@@ -12,7 +12,7 @@ from harness.api.schemas import (
     SkillRevisionUsageStatsResponse,
     SkillUpdateRequest,
 )
-from harness.db.models import Skill, SkillRevision, Tenant
+from harness.db.models import Skill, SkillRevision, Tenant, User
 from harness.db.session import get_session
 from harness.skills.registry import SkillRegistry
 from harness.skills.usage import get_revision_usage_stats
@@ -25,6 +25,16 @@ async def _get_owned_skill(session: AsyncSession, tenant: Tenant, skill_id: uuid
     if skill is None:
         raise HTTPException(status_code=404, detail="skill not found")
     return skill
+
+
+async def _validate_owner(
+    session: AsyncSession, tenant: Tenant, owner_user_id: uuid.UUID | None
+) -> None:
+    if owner_user_id is None:
+        return
+    user = await session.get(User, owner_user_id)
+    if user is None or user.tenant_id != tenant.id:
+        raise HTTPException(status_code=422, detail="owner_user_id must belong to this tenant")
 
 
 async def _get_owned_revision(
@@ -42,6 +52,7 @@ async def create_skill(
     principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> Skill:
+    await _validate_owner(session, principal.tenant, body.owner_user_id)
     skill = await SkillRegistry(session).create_skill(
         tenant_id=principal.tenant.id,
         name=body.name,
@@ -77,6 +88,7 @@ async def update_skill(
     session: AsyncSession = Depends(get_session),
 ) -> Skill:
     skill = await _get_owned_skill(session, principal.tenant, skill_id)
+    await _validate_owner(session, principal.tenant, body.owner_user_id)
     if body.description is not None:
         skill.description = body.description
     if body.owner_user_id is not None:
@@ -93,17 +105,20 @@ async def create_revision(
     principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> SkillRevision:
-    revision = await SkillRegistry(session).create_revision(
-        tenant_id=principal.tenant.id,
-        skill_id=skill_id,
-        instruction=body.instruction,
-        change_reason=body.change_reason,
-        manifest=body.manifest,
-        input_schema=body.input_schema,
-        output_schema=body.output_schema,
-        required_tools=body.required_tools,
-        created_from_run_id=body.created_from_run_id,
-    )
+    try:
+        revision = await SkillRegistry(session).create_revision(
+            tenant_id=principal.tenant.id,
+            skill_id=skill_id,
+            instruction=body.instruction,
+            change_reason=body.change_reason,
+            manifest=body.manifest,
+            input_schema=body.input_schema,
+            output_schema=body.output_schema,
+            required_tools=body.required_tools,
+            created_from_run_id=body.created_from_run_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if revision is None:
         raise HTTPException(status_code=404, detail="skill not found")
     await session.commit()
@@ -164,9 +179,12 @@ async def publish_revision(
     session: AsyncSession = Depends(get_session),
 ) -> Skill:
     await _get_owned_revision(session, principal.tenant, skill_id, revision_id)
-    revision = await SkillRegistry(session).publish_revision(
-        principal.tenant.id, skill_id, revision_id
-    )
+    try:
+        revision = await SkillRegistry(session).publish_revision(
+            principal.tenant.id, skill_id, revision_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if revision is None:
         raise HTTPException(status_code=404, detail="skill revision not found")
     skill = await _get_owned_skill(session, principal.tenant, skill_id)

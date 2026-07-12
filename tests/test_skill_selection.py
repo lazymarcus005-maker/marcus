@@ -46,6 +46,7 @@ async def _publish_skill(
         required_tools=required_tools or [],
     )
     assert revision is not None
+    await registry.approve_revision(tenant.id, skill.id, revision.id)
     await registry.publish_revision(tenant.id, skill.id, revision.id)
     await session.commit()
     return skill, revision

@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import datetime
 from typing import cast
@@ -7,7 +8,15 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.db.enums import StepType, ToolExecutionStatus
-from harness.db.models import AgentMessage, AgentRun, AgentStep, ToolExecution
+from harness.db.models import (
+    AgentMessage,
+    AgentRun,
+    AgentStep,
+    Skill,
+    SkillRevision,
+    SkillUsage,
+    ToolExecution,
+)
 from harness.llm.types import LLMMessage, Role, ToolCall
 from harness.skills.registry import SkillRegistry
 
@@ -95,6 +104,18 @@ async def build_skill_context(session: AsyncSession, run: AgentRun) -> tuple[str
     if not skills:
         return "", active_skill
 
+    # Keep the prompt bounded and put likely matches first. The LLM still
+    # makes the final selection via use_skill; this is only a cheap retrieval
+    # hint based on words in the run goal and skill metadata.
+    goal_words = set(re.findall(r"[a-z0-9_:-]{3,}", run.goal.lower()))
+
+    def relevance(skill: Skill) -> tuple[int, str]:
+        text = f"{skill.name} {skill.description}".lower()
+        matches = len(goal_words & set(re.findall(r"[a-z0-9_:-]{3,}", text)))
+        return (-matches, skill.name)
+
+    skills = sorted(skills, key=relevance)[:20]
+
     catalog_lines = "\n".join(
         f"- {skill.name}: {skill.description or '(no description)'}" for skill in skills
     )
@@ -103,9 +124,53 @@ async def build_skill_context(session: AsyncSession, run: AgentRun) -> tuple[str
         "Published skill catalog:\n"
         f"{catalog_lines}\n"
         "If one of these skills is relevant, call `use_skill` with its exact name "
-        "before proceeding.",
+        "before proceeding. If several are similarly relevant, do not guess: "
+        "ask the user or choose explicitly with `use_skill`.",
         active_skill,
     )
+
+
+async def select_skill_candidate(
+    session: AsyncSession, run: AgentRun
+) -> tuple[Skill, SkillRevision] | None:
+    """Return a clearly dominant skill, otherwise None for LLM selection.
+
+    Automatic selection is intentionally conservative: a candidate needs at
+    least three shared terms and must beat the runner-up by two terms. This
+    makes ambiguous requests fall back to the explicit ``use_skill`` flow.
+    """
+    registry = SkillRegistry(session)
+    skills = await registry.list_published_skills(run.tenant_id)
+    goal_words = set(re.findall(r"[a-z0-9_:-]{3,}", run.goal.lower()))
+    usage_result = await session.execute(
+        sa.select(
+            SkillUsage.revision_id,
+            sa.func.avg(sa.case((SkillUsage.success.is_(True), 1.0), else_=0.0)).label(
+                "success_rate"
+            ),
+        )
+        .where(SkillUsage.tenant_id == run.tenant_id)
+        .group_by(SkillUsage.revision_id)
+    )
+    success_rates = {row.revision_id: float(row.success_rate or 0.0) for row in usage_result}
+    scored: list[tuple[int, float, Skill]] = []
+    for skill in skills:
+        metadata = set(re.findall(r"[a-z0-9_:-]{3,}", f"{skill.name} {skill.description}".lower()))
+        lexical = len(goal_words & metadata)
+        revision = await registry.get_active_revision_by_skill_name(run.tenant_id, skill.name)
+        success_rate = success_rates.get(revision[1].id, 0.0) if revision else 0.0
+        scored.append((lexical, success_rate, skill))
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2].name))
+    if not scored or scored[0][0] < 3:
+        return None
+    if (
+        len(scored) > 1
+        and scored[0][0] - scored[1][0] < 2
+        and (scored[0][0] != scored[1][0] or scored[0][1] - scored[1][1] < 0.2)
+    ):
+        return None
+    active = await registry.get_active_revision_by_skill_name(run.tenant_id, scored[0][1].name)
+    return active
 
 
 def llm_call_step_to_messages(step: AgentStep, executions: list[ToolExecution]) -> list[LLMMessage]:

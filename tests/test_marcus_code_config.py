@@ -1,3 +1,5 @@
+import pytest
+
 import marcus_code.config as config_module
 from marcus_code.config import (
     has_llm_credentials,
@@ -5,6 +7,7 @@ from marcus_code.config import (
     load_user_config,
     resolve_settings,
     save_user_config,
+    validate_base_url,
 )
 
 
@@ -19,6 +22,16 @@ def test_load_user_config_returns_empty_dict_when_missing(tmp_path, monkeypatch)
     _point_user_config_at(monkeypatch, tmp_path)
 
     assert load_user_config() == {}
+
+
+def test_validate_base_url_accepts_http_and_removes_trailing_slash():
+    assert validate_base_url(" https://api.example.com/v1/// ") == "https://api.example.com/v1"
+
+
+@pytest.mark.parametrize("url", ["file:///tmp/x", "localhost:1234", "https://user:pass@example.com/v1"])
+def test_validate_base_url_rejects_unsafe_urls(url):
+    with pytest.raises(ValueError):
+        validate_base_url(url)
 
 
 def test_save_and_load_user_config_round_trips(tmp_path, monkeypatch):

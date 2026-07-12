@@ -270,13 +270,13 @@ class ScheduledJobResponse(BaseModel):
 
 
 class SkillCreateRequest(BaseModel):
-    name: str
-    description: str = ""
+    name: str = Field(min_length=1, max_length=255)
+    description: str = Field(default="", max_length=10_000)
     owner_user_id: uuid.UUID | None = None
 
 
 class SkillUpdateRequest(BaseModel):
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=10_000)
     owner_user_id: uuid.UUID | None = None
 
 
@@ -295,12 +295,12 @@ class SkillResponse(BaseModel):
 
 
 class SkillRevisionCreateRequest(BaseModel):
-    instruction: str
-    change_reason: str
+    instruction: str = Field(min_length=1, max_length=100_000)
+    change_reason: str = Field(min_length=1, max_length=10_000)
     manifest: dict[str, Any] = Field(default_factory=dict)
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
-    required_tools: list[str] = Field(default_factory=list)
+    required_tools: list[str] = Field(default_factory=list, max_length=100)
     created_from_run_id: uuid.UUID | None = None
 
 

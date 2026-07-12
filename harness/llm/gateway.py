@@ -1,5 +1,6 @@
 import asyncio
 import random
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -36,7 +37,7 @@ def _looks_like_tool_unsupported(status_code: int, body: str) -> bool:
 class LLMGateway:
     """OpenAI-compatible chat completions client (decisions.md D2).
 
-    No streaming (decisions.md D7) — every call blocks for the full response.
+    Supports both complete responses and OpenAI-compatible SSE streaming.
     """
 
     def __init__(
@@ -88,6 +89,62 @@ class LLMGateway:
             self._tool_capable = True
 
         return _parse_response(body)
+
+    async def complete_stream(
+        self,
+        messages: list[LLMMessage],
+        *,
+        tools: list[ToolSpec] | None = None,
+        model: str | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> LLMResponse:
+        """Stream text deltas while assembling a normal LLMResponse.
+
+        Tool-call fragments are accumulated and parsed at the end, so callers
+        can use the same ReAct path as ``complete``.
+        """
+        payload: dict[str, Any] = {
+            "model": model or self._settings.llm_model,
+            "messages": [m.to_openai() for m in messages],
+            "temperature": 0.0,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = [t.to_openai() for t in tools]
+        content_parts: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
+        usage = Usage(0, 0, 0)
+        finish_reason = "stop"
+        async with self._client.stream("POST", "/chat/completions", json=payload) as response:
+            if response.status_code != 200:
+                raise LLMError(f"LLM streaming request failed with status {response.status_code}")
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if raw == "[DONE]":
+                    break
+                chunk = orjson.loads(raw)
+                choice = (chunk.get("choices") or [{}])[0]
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta") or {}
+                text = delta.get("content") or ""
+                if text:
+                    content_parts.append(text)
+                    if on_delta:
+                        on_delta(text)
+                for fragment in delta.get("tool_calls") or []:
+                    index = fragment.get("index", 0)
+                    entry = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                    entry["id"] += fragment.get("id") or ""
+                    function = fragment.get("function") or {}
+                    entry["name"] += function.get("name") or ""
+                    entry["arguments"] += function.get("arguments") or ""
+                usage_raw = chunk.get("usage") or {}
+                if usage_raw:
+                    usage = Usage(usage_raw.get("prompt_tokens", 0), usage_raw.get("completion_tokens", 0), usage_raw.get("total_tokens", 0))
+        tool_calls = [ToolCall(id=v["id"], name=v["name"], arguments=orjson.loads(v["arguments"] or "{}")) for v in calls.values()]
+        return LLMResponse("".join(content_parts) or None, tool_calls, finish_reason, usage, model or self._settings.llm_model, {})
 
     async def _post_with_retry(
         self, payload: dict[str, Any], *, max_retries: int

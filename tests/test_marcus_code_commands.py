@@ -27,7 +27,7 @@ class _FakeUI:
     def print_help(self):
         self.help_shown = True
 
-    def print_usage(self, stats, *, session_started_at):
+    def print_usage(self, stats, *, session_started_at, max_total_tokens=None):
         self.usage_calls.append((stats, session_started_at))
 
     def print_config(self, settings):

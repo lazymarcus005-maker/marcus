@@ -2,6 +2,7 @@ import contextlib
 import os
 import tomllib
 from pathlib import Path
+from urllib.parse import urlparse
 
 from harness.config import Settings
 
@@ -40,6 +41,7 @@ def save_user_config(*, api_key: str, base_url: str, model: str) -> Path:
     Best-effort chmod 600 — meaningful on POSIX, a no-op on Windows (see
     docs/marcus-code-handoff.md's Windows-11-dev-machine context).
     """
+    validate_base_url(base_url)
     USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     content = (
         "[llm]\n"
@@ -51,6 +53,14 @@ def save_user_config(*, api_key: str, base_url: str, model: str) -> Path:
     with contextlib.suppress(OSError):
         os.chmod(USER_CONFIG_FILE, 0o600)
     return USER_CONFIG_FILE
+
+
+def validate_base_url(base_url: str) -> str:
+    value = base_url.strip()
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("base URL must be an absolute HTTP(S) URL without credentials")
+    return value.rstrip("/")
 
 
 def _toml_escape(value: str) -> str:

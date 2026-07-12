@@ -1,6 +1,7 @@
 import pytest
 
 from harness.db.enums import RiskTier
+from harness.llm.types import LLMMessage
 from harness.runtime.tools import Tool
 from marcus_code.loop import MarcusLoop
 from tests.fakes import ScriptedLLMGateway, text_response, tool_call_response
@@ -189,3 +190,24 @@ async def test_max_steps_guardrail_stops_the_loop():
     await loop.run_turn("keep going forever")
 
     assert any("max steps" in stop for stop in ui.guardrail_stops)
+
+
+@pytest.mark.asyncio
+async def test_history_is_capped_while_preserving_system_prompt():
+    llm = ScriptedLLMGateway([text_response("done")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [], ui, max_history_messages=3, system_prompt="system")
+    loop.state.history.extend([LLMMessage(role="user", content=f"old-{i}") for i in range(5)])
+    await loop.run_turn("latest")
+    assert loop.state.history[0].role == "system"
+    assert len(loop.state.history) <= 3
+
+
+@pytest.mark.asyncio
+async def test_token_budget_stops_before_next_call():
+    llm = ScriptedLLMGateway([text_response("unused")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [], ui, max_total_tokens=1)
+    loop.usage.total_tokens = 1
+    await loop.run_turn("do it")
+    assert any("token budget" in stop for stop in ui.guardrail_stops)

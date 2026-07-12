@@ -48,8 +48,8 @@ _DB_FIXTURES = {"db_engine", "db_sessionmaker", "db_session"}
 
 
 def pytest_collection_modifyitems(config, items):
-    if os.environ.get("HARNESS_SKIP_DB_TESTS") == "1":
-        skip_db = pytest.mark.skip(reason="HARNESS_SKIP_DB_TESTS=1")
+    if os.environ.get("HARNESS_SKIP_DB_TESTS") == "1" or os.environ.get("HARNESS_RUN_DB_TESTS") != "1":
+        skip_db = pytest.mark.skip(reason="set HARNESS_RUN_DB_TESTS=1 to run PostgreSQL integration tests")
         for item in items:
             if _DB_FIXTURES & set(item.fixturenames):
                 item.add_marker(skip_db)

@@ -47,7 +47,11 @@ async def _cmd_model(ctx: CommandContext, args: str) -> None:
 
 
 async def _cmd_usage(ctx: CommandContext, args: str) -> None:
-    ctx.ui.print_usage(ctx.loop.usage, session_started_at=ctx.loop.started_at)
+    ctx.ui.print_usage(
+        ctx.loop.usage,
+        session_started_at=ctx.loop.started_at,
+        max_total_tokens=ctx.loop.max_total_tokens,
+    )
 
 
 async def _cmd_config(ctx: CommandContext, args: str) -> None:
@@ -69,7 +73,11 @@ async def _cmd_config(ctx: CommandContext, args: str) -> None:
                 ctx.ui.print_error("no API key configured yet — you must enter one")
                 return
             new_key = ctx.settings.llm_api_key
-        save_user_config(api_key=new_key, base_url=base_url, model=model)
+        try:
+            save_user_config(api_key=new_key, base_url=base_url, model=model)
+        except ValueError as exc:
+            ctx.ui.print_error(str(exc))
+            return
         await ctx.replace_llm(resolve_settings())
         ctx.ui.print_info("Config updated.")
         return

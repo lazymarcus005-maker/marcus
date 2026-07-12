@@ -13,6 +13,7 @@ from marcus_code.ui import TerminalUI
 
 DEFAULT_MAX_STEPS = 25
 DEFAULT_RESULT_MAX_CHARS = 4000
+DEFAULT_MAX_HISTORY_MESSAGES = 100
 
 
 @dataclass
@@ -66,6 +67,9 @@ class MarcusLoop:
         system_prompt: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         result_max_chars: int = DEFAULT_RESULT_MAX_CHARS,
+        max_history_messages: int = DEFAULT_MAX_HISTORY_MESSAGES,
+        max_total_tokens: int | None = None,
+        history_summary_enabled: bool = True,
     ) -> None:
         self.llm = llm
         self.tools_by_name = {t.name: t for t in tools}
@@ -74,6 +78,9 @@ class MarcusLoop:
         self.model = model
         self.max_steps = max_steps
         self.result_max_chars = result_max_chars
+        self.max_history_messages = max_history_messages
+        self.max_total_tokens = max_total_tokens
+        self.history_summary_enabled = history_summary_enabled
         self.state = SessionState()
         self.usage = UsageStats()
         self.started_at = datetime.now()
@@ -85,11 +92,21 @@ class MarcusLoop:
         recent_calls: list[tuple[str, dict]] = []
 
         for _ in range(self.max_steps):
+            self._trim_history()
+            if self.max_total_tokens is not None and self.usage.total_tokens >= self.max_total_tokens:
+                self.ui.print_guardrail_stop(f"session token budget exceeded ({self.max_total_tokens})")
+                return
             try:
                 start = time.perf_counter()
-                response = await self.llm.complete(
-                    self.state.history, tools=self.tool_specs, model=self.model
-                )
+                if hasattr(self.llm, "complete_stream") and hasattr(self.ui, "print_assistant_delta"):
+                    response = await self.llm.complete_stream(
+                        self.state.history, tools=self.tool_specs, model=self.model,
+                        on_delta=self.ui.print_assistant_delta,
+                    )
+                else:
+                    response = await self.llm.complete(
+                        self.state.history, tools=self.tool_specs, model=self.model
+                    )
                 self.usage.record(response.usage, time.perf_counter() - start)
             except LLMError as exc:
                 self.ui.print_guardrail_stop(f"LLM call failed: {exc}")
@@ -102,8 +119,12 @@ class MarcusLoop:
             )
 
             if not response.tool_calls:
+                self._trim_history()
                 if response.content:
-                    self.ui.print_assistant(response.content)
+                    if not hasattr(self.llm, "complete_stream"):
+                        self.ui.print_assistant(response.content)
+                    elif hasattr(self.ui, "print_assistant_delta"):
+                        self.ui.console.print()
                 return
 
             for call in response.tool_calls:
@@ -127,8 +148,33 @@ class MarcusLoop:
                         content=orjson.dumps(observation).decode(),
                     )
                 )
+                self._trim_history()
 
         self.ui.print_guardrail_stop(f"exceeded max steps ({self.max_steps})")
+
+    def _trim_history(self) -> None:
+        if len(self.state.history) <= self.max_history_messages:
+            return
+        system = [message for message in self.state.history if message.role == "system"][:1]
+        if self.history_summary_enabled:
+            old = self.state.history[len(system) : -(self.max_history_messages - len(system) - 1)]
+            if old:
+                snippets = []
+                for message in old[-12:]:
+                    text = (message.content or "").replace("\n", " ")
+                    if text:
+                        snippets.append(f"{message.role}: {text[:240]}")
+                if snippets:
+                    system.append(
+                        LLMMessage(
+                            role="system",
+                            content="[Earlier conversation summarized]\n" + "\n".join(snippets),
+                        )
+                    )
+        tail = self.state.history[-(self.max_history_messages - len(system)):]
+        while tail and tail[0].role in {"tool", "assistant"}:
+            tail = tail[1:]
+        self.state.history = system + tail
 
     async def _process_tool_call(self, call: ToolCall) -> dict:
         tool = self.tools_by_name.get(call.name)

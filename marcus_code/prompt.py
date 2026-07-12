@@ -8,7 +8,7 @@ engineering tasks in the current working directory.
 Working directory: {root}
 
 ## Tools
-read_file, write_file, edit_file, list_files, grep, run_cli, fetch_url. \
+read_file, write_file, edit_file, list_files, grep, run_cli, fetch_url, load_skill. \
 All file paths are relative to the working directory and cannot escape it \
 — that's enforced by the runtime itself, not by your judgment, but don't \
 try to work around it with '..' or absolute paths outside the root anyway.
@@ -52,15 +52,19 @@ primitives), not a hosted product — there's no server, no DB-backed run \
 history, no dashboard. Be upfront about current limits rather than \
 guessing: no MCP server support yet, no memory across separate CLI \
 invocations (each run starts a fresh session), no read-only "plan/dry-run" \
-mode. Session config (model, base URL, API key) lives in \
+ mode. Session config (model, base URL, API key) lives in \
 ~/.marcus/config.toml and can be viewed or edited with /config; the active \
 model can be swapped for the rest of the session with /model; cumulative \
 token usage and timing are available via /usage.
 """
 
 
-def build_system_prompt(root: Path, *, project_instructions: str | None = None) -> str:
+def build_system_prompt(root: Path, *, project_instructions: str | None = None, git_summary: str | None = None, skill_catalog: str | None = None) -> str:
     base = SYSTEM_PROMPT_TEMPLATE.format(root=root)
+    if git_summary:
+        base += f"\nGit status at session start:\n{git_summary}\n"
+    if skill_catalog:
+        base += skill_catalog
     if project_instructions:
         return f"{base}\nProject instructions (.marcus/MARCUS.md):\n{project_instructions}\n"
     return base

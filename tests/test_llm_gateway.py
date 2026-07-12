@@ -45,6 +45,47 @@ async def test_complete_parses_basic_response():
 
 
 @pytest.mark.asyncio
+async def test_complete_stream_emits_text_deltas():
+    body = "\n".join(
+        [
+            'data: {"choices":[{"delta":{"content":"hello "}}]}',
+            'data: {"choices":[{"delta":{"content":"world"},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body)
+
+    deltas = []
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete_stream(
+        [LLMMessage(role="user", content="hello")], on_delta=deltas.append
+    )
+    assert response.content == "hello world"
+    assert deltas == ["hello ", "world"]
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_assembles_tool_call_fragments():
+    body = "\n".join(
+        [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"search"}}]}}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"q\\":\\"x\\"}"}}]},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body)
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete_stream([LLMMessage(role="user", content="search")])
+    assert response.tool_calls[0].name == "search"
+    assert response.tool_calls[0].arguments == {"q": "x"}
+
+
+@pytest.mark.asyncio
 async def test_complete_parses_tool_calls():
     tool_calls = [
         {

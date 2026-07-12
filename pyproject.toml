@@ -1,9 +1,13 @@
 [project]
-name = "harness"
+name = "marcus"
 version = "0.1.0"
 description = "Hermes-style AI agent harness with PostgreSQL as source of truth"
 readme = "README.md"
 requires-python = ">=3.12"
+authors = [{ name = "Marcus contributors" }]
+keywords = ["ai", "agent", "cli", "coding-agent"]
+classifiers = ["Programming Language :: Python :: 3", "Programming Language :: Python :: 3.12"]
+
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
@@ -26,6 +30,11 @@ dependencies = [
     "apscheduler>=3.10.4",
     "rich>=13.7.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/lazymarcus005-maker/marcus"
+Repository = "https://github.com/lazymarcus005-maker/marcus"
+Issues = "https://github.com/lazymarcus005-maker/marcus/issues"
 
 [project.scripts]
 marcus = "marcus_code.cli:main"

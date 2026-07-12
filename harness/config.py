@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     tools_run_cli_timeout_seconds: float = 30.0
     tools_run_cli_max_output_bytes: int = 50_000
 
+    # Marcus CLI session guardrails.
+    cli_max_history_messages: int = 100
+    cli_max_total_tokens: int | None = None
+    cli_history_summary_enabled: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -1,7 +1,10 @@
 import asyncio
+import ipaddress
 import re
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -24,6 +27,28 @@ _SKIP_DIR_NAMES = frozenset({".git", "__pycache__", "node_modules", ".venv", "ve
 _MAX_LIST_RESULTS = 200
 _MAX_GREP_MATCHES = 200
 _MAX_GREP_FILE_BYTES = 2_000_000  # skip files larger than this when grepping
+
+_SECRET_FILE_NAMES = {".env", ".env.local", ".env.production", "credentials.json"}
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S
+)
+_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|secret|password|token|authorization)(\s*[:=]\s*)(['\"]?)[^\s'\"]+\3"
+)
+
+
+def _redact_secrets(path: str, content: str) -> tuple[str, int]:
+    name = Path(path).name.lower()
+    redactions = 0
+    if name in _SECRET_FILE_NAMES or name.endswith((".pem", ".key")):
+        redactions += 1
+        return "[REDACTED SENSITIVE FILE CONTENT]", redactions
+    redacted = content
+    redacted, count = _PRIVATE_KEY_PATTERN.subn("[REDACTED PRIVATE KEY]", redacted)
+    redactions += count
+    redacted, count = _CREDENTIAL_PATTERN.subn(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted)
+    redactions += count
+    return redacted, redactions
 
 
 def _resolve_scoped_path(root: Path, relative_path: str) -> Path:
@@ -54,7 +79,8 @@ def build_read_file_tool(root: Path) -> Tool:
         if not resolved.is_file():
             raise ValueError(f"file not found: {path}")
         content = resolved.read_text(encoding="utf-8", errors="replace")
-        return {"path": path, "content": content, "lines": content.count("\n") + 1}
+        safe_content, redactions = _redact_secrets(path, content)
+        return {"path": path, "content": safe_content, "lines": content.count("\n") + 1, "redacted": redactions > 0}
 
     return Tool(
         name=READ_FILE_TOOL_NAME,
@@ -295,18 +321,24 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
 
 def build_fetch_url_tool(settings: Settings) -> Tool:
     async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
-        from urllib.parse import urlparse
-
         url = arguments.get("url")
         if not url:
             raise ValueError("fetch_url requires a 'url' field")
-        if urlparse(url).scheme not in ("http", "https"):
-            raise ValueError("fetch_url only supports http:// and https:// URLs")
+        _validate_public_url(url)
 
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=settings.tools_fetch_url_timeout_seconds
+            follow_redirects=False, timeout=settings.tools_fetch_url_timeout_seconds
         ) as client:
-            response = await client.get(url)
+            for _ in range(5):
+                response = await client.get(url)
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location")
+                    if not location:
+                        break
+                    url = urljoin(url, location)
+                    _validate_public_url(url)
+                    continue
+                break
         response.raise_for_status()
 
         max_bytes = settings.tools_fetch_url_max_bytes
@@ -341,7 +373,27 @@ def build_fetch_url_tool(settings: Settings) -> Tool:
     )
 
 
+def _validate_public_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("fetch_url only supports public http(s) URLs")
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+    except OSError as exc:
+        raise ValueError(f"could not resolve URL host: {parsed.hostname}") from exc
+    if not addresses:
+        raise ValueError("URL host has no addresses")
+    if len(addresses) != 1:
+        raise ValueError("fetch_url refuses hosts with multiple DNS addresses")
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise ValueError("fetch_url refuses loopback, private, link-local, or reserved addresses")
+
+
 def build_marcus_tools(root: Path, settings: Settings) -> list[Tool]:
+    from marcus_code.skills import build_load_skill_tool
+
     return [
         build_read_file_tool(root),
         build_write_file_tool(root),
@@ -350,4 +402,5 @@ def build_marcus_tools(root: Path, settings: Settings) -> list[Tool]:
         build_grep_tool(root),
         build_run_cli_tool(root, settings),
         build_fetch_url_tool(settings),
+        build_load_skill_tool(root),
     ]

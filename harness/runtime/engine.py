@@ -15,7 +15,7 @@ from harness.mcp.tools import build_tool as build_mcp_tool
 from harness.observability import LLM_TOKENS, RUN_DURATION, RUNS_COMPLETED, span
 from harness.runtime import guardrails, native_tools
 from harness.runtime.compaction import maybe_compact
-from harness.runtime.context import build_llm_messages
+from harness.runtime.context import build_llm_messages, select_skill_candidate
 from harness.runtime.native_tools import (
     ASK_USER_TOOL_NAME,
     BUILTIN_DOMAIN_NAME,
@@ -252,6 +252,18 @@ class RunEngine:
         (in which case the run has already been checkpointed to Failed and committed).
         """
         await maybe_compact(self.session, self.llm, run)
+        if run.active_skill_revision_id is None:
+            candidate = await select_skill_candidate(self.session, run)
+            if candidate is not None:
+                _skill, revision = candidate
+                available = [name for name in revision.required_tools if name in self.tools_by_name]
+                if len(available) == len(revision.required_tools):
+                    run = await self.repo.checkpoint(
+                        run,
+                        active_skill_revision_id=revision.id,
+                        active_tool_names=available,
+                    )
+                    await self.session.commit()
         messages = await build_llm_messages(self.session, run)
         # Progressive disclosure (issue #15): an MCP tool's full schema is only
         # ever sent to the LLM after `load_tool` unlocked it for this run — see

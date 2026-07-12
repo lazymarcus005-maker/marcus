@@ -125,6 +125,27 @@ class SkillRegistry:
         if skill is None:
             return None
 
+        if not instruction.strip():
+            raise ValueError("skill instruction must not be empty")
+        if len(instruction) > 100_000:
+            raise ValueError("skill instruction exceeds the 100000 character limit")
+        if len(change_reason.strip()) > 10_000:
+            raise ValueError("skill change_reason exceeds the 10000 character limit")
+        tools = required_tools or []
+        if len(set(tools)) != len(tools):
+            raise ValueError("skill required_tools must not contain duplicates")
+
+        # Serialize version allocation per skill; the unique constraint remains
+        # the final backstop for concurrent writers.
+        locked = await self.session.execute(
+            sa.select(Skill)
+            .where(Skill.id == skill_id, Skill.tenant_id == tenant_id)
+            .with_for_update()
+        )
+        skill = locked.scalar_one_or_none()
+        if skill is None:
+            return None
+
         next_version_result = await self.session.execute(
             sa.select(sa.func.coalesce(sa.func.max(SkillRevision.version), 0) + 1).where(
                 SkillRevision.skill_id == skill_id
@@ -166,9 +187,8 @@ class SkillRegistry:
         revision = await self.get_revision(tenant_id, skill_id, revision_id)
         if revision is None:
             return None
-        if revision.status == SkillStatus.draft:
-            revision.status = SkillStatus.approved
-            await self.session.flush()
+        if revision.status not in (SkillStatus.approved, SkillStatus.published):
+            raise ValueError("skill revision must be approved before publishing")
         if revision.status == SkillStatus.approved:
             revision.status = SkillStatus.published
         skill.active_revision_id = revision.id

@@ -42,6 +42,22 @@ async def test_read_file_missing_file_raises(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_read_file_redacts_sensitive_filename(tmp_path):
+    (tmp_path / ".env").write_text("API_KEY=super-secret", encoding="utf-8")
+    result = await build_read_file_tool(tmp_path).handler({"path": ".env"})
+    assert result["redacted"] is True
+    assert "super-secret" not in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_read_file_redacts_credential_patterns(tmp_path):
+    (tmp_path / "config.txt").write_text("token: abc123\nname: marcus", encoding="utf-8")
+    result = await build_read_file_tool(tmp_path).handler({"path": "config.txt"})
+    assert "abc123" not in result["content"]
+    assert "name: marcus" in result["content"]
+
+
+@pytest.mark.asyncio
 async def test_write_file_creates_file_and_parent_dirs(tmp_path):
     tool = build_write_file_tool(tmp_path)
 
@@ -199,7 +215,7 @@ class _FakeAsyncClient:
 async def test_fetch_url_strips_html_and_returns_text():
     settings = Settings()
     body = b"<html><body><h1>Hi</h1></body></html>"
-    with patch(
+    with patch("marcus_code.tools.socket.getaddrinfo", return_value=[(0, 0, 0, "", ("93.184.216.34", 443))]), patch(
         "marcus_code.tools.httpx.AsyncClient",
         return_value=_FakeAsyncClient(_FakeResponse(content=body, headers={"content-type": "text/html"})),
     ):
@@ -217,3 +233,23 @@ async def test_fetch_url_rejects_non_http_scheme():
 
     with pytest.raises(ValueError, match="http"):
         await tool.handler({"url": "file:///etc/passwd"})
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_rejects_loopback(monkeypatch):
+    monkeypatch.setattr("marcus_code.tools.socket.getaddrinfo", lambda *args, **kwargs: [(0, 0, 0, "", ("127.0.0.1", 80))])
+    with pytest.raises(ValueError, match="refuses"):
+        await build_fetch_url_tool(Settings()).handler({"url": "http://localhost/"})
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_rejects_multiple_dns_addresses(monkeypatch):
+    monkeypatch.setattr(
+        "marcus_code.tools.socket.getaddrinfo",
+        lambda *args, **kwargs: [
+            (0, 0, 0, "", ("93.184.216.34", 80)),
+            (0, 0, 0, "", ("93.184.216.35", 80)),
+        ],
+    )
+    with pytest.raises(ValueError, match="multiple DNS"):
+        await build_fetch_url_tool(Settings()).handler({"url": "http://example.com/"})

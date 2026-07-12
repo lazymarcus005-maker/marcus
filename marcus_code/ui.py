@@ -1,4 +1,5 @@
 import difflib
+import re
 import sys
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal
@@ -15,7 +16,7 @@ from rich.text import Text
 from harness.config import Settings
 from harness.runtime.tools import Tool
 from marcus_code.banner import render_banner
-from marcus_code.tools import EDIT_FILE_TOOL_NAME
+from marcus_code.tools import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME
 
 if TYPE_CHECKING:
     from marcus_code.loop import UsageStats
@@ -146,14 +147,24 @@ class TerminalUI:
             return None
         return (api_key or None, base_url, model)
 
-    def print_usage(self, stats: "UsageStats", *, session_started_at: datetime) -> None:
+    def print_usage(
+        self,
+        stats: "UsageStats",
+        *,
+        session_started_at: datetime,
+        max_total_tokens: int | None = None,
+    ) -> None:
         elapsed = (datetime.now() - session_started_at).total_seconds()
+        budget = "unlimited" if max_total_tokens is None else f"{max_total_tokens:,}"
+        remaining = "unlimited" if max_total_tokens is None else f"{max(0, max_total_tokens - stats.total_tokens):,}"
         self.console.print(
             Panel.fit(
                 f"[bold]LLM calls[/bold]         : {stats.llm_calls}\n"
                 f"[bold]Prompt tokens[/bold]     : {stats.prompt_tokens:,}\n"
                 f"[bold]Completion tokens[/bold] : {stats.completion_tokens:,}\n"
                 f"[bold]Total tokens[/bold]      : {stats.total_tokens:,}\n"
+                f"[bold]Token budget[/bold]      : {budget}\n"
+                f"[bold]Remaining tokens[/bold]  : {remaining}\n"
                 f"[bold]LLM time[/bold]          : {stats.elapsed_seconds:.1f}s\n"
                 f"[bold]Throughput[/bold]        : {stats.tokens_per_second:.1f} tok/s\n"
                 f"[bold]Session time[/bold]      : {elapsed:.0f}s",
@@ -203,6 +214,9 @@ class TerminalUI:
     def print_assistant(self, text: str) -> None:
         self.console.print(Markdown(text))
 
+    def print_assistant_delta(self, text: str) -> None:
+        self.console.print(text, end="")
+
     def print_tool_call(self, tool_name: str, arguments: dict) -> None:
         summary = _summarize_arguments(arguments)
         self.console.print(f"[dim]> {escape(tool_name)}({escape(summary)})[/dim]")
@@ -225,6 +239,10 @@ class TerminalUI:
         else:
             summary = _summarize_arguments(arguments)
             self.console.print(f"[bold]{escape(tool.name)}[/bold]({escape(summary)})")
+        if tool.name == RUN_CLI_TOOL_NAME:
+            warning = _command_warning(str(arguments.get("command", "")))
+            if warning:
+                self.console.print(f"[bold red]WARNING:[/bold red] {escape(warning)}")
 
         while True:
             # Note: avoid literal square brackets in text passed through
@@ -263,3 +281,14 @@ def _summarize_arguments(arguments: dict, *, max_len: int = 120) -> str:
             text = text[:max_len] + "..."
         parts.append(f"{key}={text!r}")
     return ", ".join(parts)
+
+
+def _command_warning(command: str) -> str | None:
+    lowered = command.lower()
+    if re.search(r"rm\s+(-\w*f|--force).*\s-r|rm\s+-r[f\s]|rmdir\s+/s", lowered):
+        return "recursive deletion or forced removal"
+    if re.search(r"git\s+push\b.*--force|git\s+reset\b.*--hard", lowered):
+        return "irreversible or remote Git history rewrite"
+    if re.search(r"\b(drop|truncate)\s+(table|database)\b|delete\s+from\b", lowered):
+        return "destructive database operation"
+    return None

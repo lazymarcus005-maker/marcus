@@ -69,6 +69,11 @@ async def test_skill_publish_and_rollback_change_active_revision(client, tenant_
     skill, first_revision = await _create_skill_with_revision(client, headers)
     skill_id = skill["id"]
 
+    approve_resp = await client.post(
+        f"/v1/skills/{skill_id}/revisions/{first_revision['id']}/approve", headers=headers
+    )
+    assert approve_resp.status_code == 200
+
     publish_resp = await client.post(
         f"/v1/skills/{skill_id}/revisions/{first_revision['id']}/publish", headers=headers
     )
@@ -83,6 +88,11 @@ async def test_skill_publish_and_rollback_change_active_revision(client, tenant_
     )
     assert second_revision_resp.status_code == 201
     second_revision = second_revision_resp.json()
+
+    approve_resp = await client.post(
+        f"/v1/skills/{skill_id}/revisions/{second_revision['id']}/approve", headers=headers
+    )
+    assert approve_resp.status_code == 200
 
     publish_resp = await client.post(
         f"/v1/skills/{skill_id}/revisions/{second_revision['id']}/publish", headers=headers
@@ -115,6 +125,9 @@ async def test_skill_routes_are_scoped_to_tenant(client, tenant_id):
 async def test_published_revision_cannot_be_updated_at_db_layer(client, tenant_id, db_sessionmaker):
     headers = {"X-Tenant-Id": str(tenant_id)}
     skill, revision = await _create_skill_with_revision(client, headers)
+    await client.post(
+        f"/v1/skills/{skill['id']}/revisions/{revision['id']}/approve", headers=headers
+    )
     publish_resp = await client.post(
         f"/v1/skills/{skill['id']}/revisions/{revision['id']}/publish", headers=headers
     )
@@ -133,6 +146,9 @@ async def test_running_run_keeps_skill_revision_snapshot(client, tenant_id, db_s
     headers = {"X-Tenant-Id": str(tenant_id)}
     skill, first_revision = await _create_skill_with_revision(client, headers)
     skill_id = skill["id"]
+    await client.post(
+        f"/v1/skills/{skill_id}/revisions/{first_revision['id']}/approve", headers=headers
+    )
     await client.post(
         f"/v1/skills/{skill_id}/revisions/{first_revision['id']}/publish", headers=headers
     )
@@ -159,6 +175,9 @@ async def test_running_run_keeps_skill_revision_snapshot(client, tenant_id, db_s
         headers=headers,
     )
     second_revision = second_revision_resp.json()
+    await client.post(
+        f"/v1/skills/{skill_id}/revisions/{second_revision['id']}/approve", headers=headers
+    )
     await client.post(
         f"/v1/skills/{skill_id}/revisions/{second_revision['id']}/publish", headers=headers
     )
