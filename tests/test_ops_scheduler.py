@@ -113,7 +113,9 @@ async def test_fire_scheduled_job_creates_run_and_updates_job(db_session):
 async def test_active_run_quota_blocks_create_run(client, db_sessionmaker):
     async with db_sessionmaker() as session:
         tenant, raw = await _admin_key(session)
-        session.add(TenantQuota(tenant_id=tenant.id, daily_token_quota=1_000_000, max_active_runs=1))
+        session.add(
+            TenantQuota(tenant_id=tenant.id, daily_token_quota=1_000_000, max_active_runs=1)
+        )
         repo = RunRepository(session)
         await repo.create_run(tenant_id=tenant.id, goal="already active")
         await session.commit()

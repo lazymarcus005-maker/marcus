@@ -46,7 +46,12 @@ def build_load_skill_tool(root: Path) -> Tool:
             raise ValueError("load_skill requires a 'name' field")
         for skill in discover_local_skills(root):
             if skill.name == requested:
-                return {"name": skill.name, "description": skill.description, "instructions": skill.instructions, "path": skill.path}
+                return {
+                    "name": skill.name,
+                    "description": skill.description,
+                    "instructions": skill.instructions,
+                    "path": skill.path,
+                }
         raise ValueError(f"unknown local skill: {requested}")
 
     return Tool(
@@ -73,5 +78,5 @@ def _parse_skill_markdown(raw: str) -> tuple[str, str, str]:
     for line in raw[4:end].splitlines():
         match = re.match(r"^(name|description):\s*(.+?)\s*$", line)
         if match:
-            values[match.group(1)] = match.group(2).strip().strip('"\'')
+            values[match.group(1)] = match.group(2).strip().strip("\"'")
     return values.get("name", ""), values.get("description", ""), raw[end + 4 :].strip()

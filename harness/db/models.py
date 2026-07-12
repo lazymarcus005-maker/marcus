@@ -343,9 +343,7 @@ class SkillRevision(Base):
     )
     created_at: Mapped[datetime] = _created_at()
 
-    skill: Mapped[Skill] = relationship(
-        back_populates="revisions", foreign_keys=[skill_id]
-    )
+    skill: Mapped[Skill] = relationship(back_populates="revisions", foreign_keys=[skill_id])
     usage_records: Mapped[list["SkillUsage"]] = relationship(
         back_populates="revision", cascade="all, delete-orphan"
     )
@@ -403,9 +401,7 @@ class SlackThreadMapping(Base):
 
     __table_args__ = (
         Index("ix_slack_thread_mappings_tenant_id", "tenant_id"),
-        UniqueConstraint(
-            "channel_id", "thread_ts", name="uq_slack_thread_mappings_channel_thread"
-        ),
+        UniqueConstraint("channel_id", "thread_ts", name="uq_slack_thread_mappings_channel_thread"),
         UniqueConstraint("run_id", name="uq_slack_thread_mappings_run_id"),
     )
 

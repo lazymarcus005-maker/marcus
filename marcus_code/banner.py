@@ -59,7 +59,9 @@ def enable_windows_ansi() -> bool:
             return False
         if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
             return True
-        return bool(kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        return bool(
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        )
     except Exception:  # noqa: BLE001 - any failure here just means "no fancy banner"
         return False
 

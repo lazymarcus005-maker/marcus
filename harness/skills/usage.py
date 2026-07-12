@@ -101,9 +101,9 @@ async def get_revision_usage_stats(
             sa.func.count(SkillUsage.id).label("total_runs"),
             sa.func.count(SkillUsage.id).filter(SkillUsage.success.is_(True)).label("successes"),
             sa.func.avg(SkillUsage.latency_ms).label("avg_latency_ms"),
-            sa.func.avg(
-                sa.cast(SkillUsage.token_usage["tokens_used"].astext, sa.Integer)
-            ).label("avg_tokens"),
+            sa.func.avg(sa.cast(SkillUsage.token_usage["tokens_used"].astext, sa.Integer)).label(
+                "avg_tokens"
+            ),
         ).where(SkillUsage.revision_id == revision_id, SkillUsage.tenant_id == tenant_id)
     )
     row = result.one()

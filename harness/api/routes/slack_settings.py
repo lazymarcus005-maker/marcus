@@ -47,9 +47,7 @@ async def upsert_slack_settings(
 
     if setting is None:
         if not body.bot_token or not body.signing_secret:
-            raise HTTPException(
-                status_code=400, detail="bot_token and signing_secret are required"
-            )
+            raise HTTPException(status_code=400, detail="bot_token and signing_secret are required")
         setting = TenantSlackSetting(
             tenant_id=principal.tenant.id,
             bot_token_encrypted=encrypt(body.bot_token),

@@ -52,9 +52,7 @@ class McpRegistry:
 
     async def get_server(self, tenant_id: uuid.UUID, server_id: uuid.UUID) -> McpServer | None:
         result = await self.session.execute(
-            sa.select(McpServer).where(
-                McpServer.id == server_id, McpServer.tenant_id == tenant_id
-            )
+            sa.select(McpServer).where(McpServer.id == server_id, McpServer.tenant_id == tenant_id)
         )
         return result.scalar_one_or_none()
 

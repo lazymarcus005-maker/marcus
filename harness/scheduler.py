@@ -86,7 +86,9 @@ async def fire_scheduled_job(
 
 async def acquire_scheduler_leader(settings: Settings) -> tuple[redis.Redis, bool]:
     client = redis.from_url(settings.redis_url, decode_responses=True)
-    ok = await client.set("scheduler:leader", SCHEDULER_ID, nx=True, ex=settings.scheduler_lease_ttl_seconds)
+    ok = await client.set(
+        "scheduler:leader", SCHEDULER_ID, nx=True, ex=settings.scheduler_lease_ttl_seconds
+    )
     return client, bool(ok)
 
 

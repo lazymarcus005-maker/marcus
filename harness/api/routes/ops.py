@@ -17,7 +17,9 @@ async def ops_summary(
 ) -> dict:
     active_runs = (
         await session.execute(
-            sa.select(sa.func.count()).select_from(AgentRun).where(
+            sa.select(sa.func.count())
+            .select_from(AgentRun)
+            .where(
                 AgentRun.tenant_id == principal.tenant.id,
                 AgentRun.status.not_in(TERMINAL_RUN_STATUSES),
             )
@@ -25,7 +27,9 @@ async def ops_summary(
     ).scalar_one()
     pending_approvals = (
         await session.execute(
-            sa.select(sa.func.count()).select_from(ApprovalRequest).where(
+            sa.select(sa.func.count())
+            .select_from(ApprovalRequest)
+            .where(
                 ApprovalRequest.tenant_id == principal.tenant.id,
                 ApprovalRequest.status == ApprovalStatus.pending,
             )

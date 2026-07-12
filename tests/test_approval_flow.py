@@ -178,6 +178,8 @@ async def test_replaying_a_pending_call_does_not_create_duplicate_approvals(db_s
     assert outcome.needs_approval is True
 
     result = await db_session.execute(
-        sa.select(sa.func.count()).select_from(ApprovalRequest).where(ApprovalRequest.run_id == run.id)
+        sa.select(sa.func.count())
+        .select_from(ApprovalRequest)
+        .where(ApprovalRequest.run_id == run.id)
     )
     assert result.scalar_one() == 1

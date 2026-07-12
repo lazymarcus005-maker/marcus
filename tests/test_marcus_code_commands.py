@@ -63,7 +63,9 @@ class _ClosableScriptedLLMGateway(ScriptedLLMGateway):
 def _make_ctx(ui=None, *, settings=None, model=None):
     llm = _ClosableScriptedLLMGateway([text_response("ok")])
     loop = MarcusLoop(llm, [], ui or _FakeUI(), model=model)
-    settings = settings or Settings(llm_api_key="sk-real", llm_base_url="https://api.example.com/v1", llm_model="m1")
+    settings = settings or Settings(
+        llm_api_key="sk-real", llm_base_url="https://api.example.com/v1", llm_model="m1"
+    )
     return CommandContext(ui=ui or loop.ui, loop=loop, settings=settings)
 
 
@@ -160,7 +162,9 @@ async def test_config_edit_saves_new_values_and_rebuilds_llm(tmp_path, monkeypat
     save_user_config(api_key="sk-old", base_url="https://old.example.com/v1", model="old-model")
 
     ui = _FakeUI(config_edit_result=("sk-new", "https://new.example.com/v1", "new-model"))
-    settings = Settings(llm_api_key="sk-old", llm_base_url="https://old.example.com/v1", llm_model="old-model")
+    settings = Settings(
+        llm_api_key="sk-old", llm_base_url="https://old.example.com/v1", llm_model="old-model"
+    )
     ctx = _make_ctx(ui, settings=settings)
     old_llm = ctx.loop.llm
 
@@ -182,7 +186,9 @@ async def test_config_edit_blank_api_key_keeps_existing_key(tmp_path, monkeypatc
     monkeypatch.delenv("HARNESS_LLM_MODEL", raising=False)
 
     ui = _FakeUI(config_edit_result=(None, "https://new.example.com/v1", "new-model"))
-    settings = Settings(llm_api_key="sk-keep-me", llm_base_url="https://old.example.com/v1", llm_model="old-model")
+    settings = Settings(
+        llm_api_key="sk-keep-me", llm_base_url="https://old.example.com/v1", llm_model="old-model"
+    )
     ctx = _make_ctx(ui, settings=settings)
 
     await dispatch(ctx, "/config edit")

@@ -93,14 +93,23 @@ class MarcusLoop:
 
         for _ in range(self.max_steps):
             self._trim_history()
-            if self.max_total_tokens is not None and self.usage.total_tokens >= self.max_total_tokens:
-                self.ui.print_guardrail_stop(f"session token budget exceeded ({self.max_total_tokens})")
+            if (
+                self.max_total_tokens is not None
+                and self.usage.total_tokens >= self.max_total_tokens
+            ):
+                self.ui.print_guardrail_stop(
+                    f"session token budget exceeded ({self.max_total_tokens})"
+                )
                 return
             try:
                 start = time.perf_counter()
-                if hasattr(self.llm, "complete_stream") and hasattr(self.ui, "print_assistant_delta"):
+                if hasattr(self.llm, "complete_stream") and hasattr(
+                    self.ui, "print_assistant_delta"
+                ):
                     response = await self.llm.complete_stream(
-                        self.state.history, tools=self.tool_specs, model=self.model,
+                        self.state.history,
+                        tools=self.tool_specs,
+                        model=self.model,
                         on_delta=self.ui.print_assistant_delta,
                     )
                 else:
@@ -171,7 +180,7 @@ class MarcusLoop:
                             content="[Earlier conversation summarized]\n" + "\n".join(snippets),
                         )
                     )
-        tail = self.state.history[-(self.max_history_messages - len(system)):]
+        tail = self.state.history[-(self.max_history_messages - len(system)) :]
         while tail and tail[0].role in {"tool", "assistant"}:
             tail = tail[1:]
         self.state.history = system + tail

@@ -36,7 +36,9 @@ async def require_principal(
 ) -> AuthPrincipal:
     raw_key = x_api_key or _extract_bearer(authorization)
     if raw_key:
-        return await authenticate_api_key(session, raw_key=raw_key, settings=request.app.state.settings)
+        return await authenticate_api_key(
+            session, raw_key=raw_key, settings=request.app.state.settings
+        )
 
     # Bootstrap/development compatibility: before a tenant has created its
     # first API key, existing X-Tenant-Id based tests and local clients can

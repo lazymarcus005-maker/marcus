@@ -234,7 +234,9 @@ async def test_app_mention_creates_run_and_dedupes_event(db_session):
     assert run.created_by_user_id == user.id
 
     mapping = (
-        await db_session.execute(sa.select(SlackThreadMapping).where(SlackThreadMapping.run_id == run.id))
+        await db_session.execute(
+            sa.select(SlackThreadMapping).where(SlackThreadMapping.run_id == run.id)
+        )
     ).scalar_one()
     assert mapping.channel_id == "C123"
     assert mapping.thread_ts == "1710000000.000100"

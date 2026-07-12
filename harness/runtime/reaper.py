@@ -76,9 +76,7 @@ async def reap_expired_approvals(session: AsyncSession) -> int:
         if run is None or run.status != RunStatus.waiting_approval:
             continue  # already moved on (race with a manual decision) — leave it alone
         try:
-            await repo.checkpoint(
-                run, status=RunStatus.timed_out, error="approval request expired"
-            )
+            await repo.checkpoint(run, status=RunStatus.timed_out, error="approval request expired")
         except StaleRunError:
             continue  # lost the race between our check and the checkpoint
         await session.commit()

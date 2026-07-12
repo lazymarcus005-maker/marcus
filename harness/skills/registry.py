@@ -99,7 +99,9 @@ class SkillRegistry:
             return None
         return row.Skill, row.SkillRevision
 
-    async def list_revisions(self, tenant_id: uuid.UUID, skill_id: uuid.UUID) -> list[SkillRevision]:
+    async def list_revisions(
+        self, tenant_id: uuid.UUID, skill_id: uuid.UUID
+    ) -> list[SkillRevision]:
         result = await self.session.execute(
             sa.select(SkillRevision)
             .join(Skill, SkillRevision.skill_id == Skill.id)
