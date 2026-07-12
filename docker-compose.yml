@@ -60,6 +60,7 @@ services:
       HARNESS_DATABASE_URL: postgresql+asyncpg://harness:harness@postgres:5432/harness
       HARNESS_REDIS_URL: redis://redis:6379/0
       HARNESS_RABBITMQ_URL: amqp://harness:harness@rabbitmq:5672/
+      HARNESS_OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
       interval: 5s
@@ -83,6 +84,7 @@ services:
       HARNESS_DATABASE_URL: postgresql+asyncpg://harness:harness@postgres:5432/harness
       HARNESS_REDIS_URL: redis://redis:6379/0
       HARNESS_RABBITMQ_URL: amqp://harness:harness@rabbitmq:5672/
+      HARNESS_OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,6 +94,44 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+
+  scheduler:
+    build:
+      context: .
+      target: worker
+    command: ["python", "-m", "harness.scheduler"]
+    environment:
+      HARNESS_DATABASE_URL: postgresql+asyncpg://harness:harness@postgres:5432/harness
+      HARNESS_REDIS_URL: redis://redis:6379/0
+      HARNESS_RABBITMQ_URL: amqp://harness:harness@rabbitmq:5672/
+      HARNESS_OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.65.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   postgres-data:

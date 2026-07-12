@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    DDL,
     Boolean,
     DateTime,
     ForeignKey,
@@ -11,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -20,10 +22,13 @@ from harness.db.base import Base
 from harness.db.enums import (
     ApprovalStatus,
     Channel,
+    LlmProvider,
     McpHealthStatus,
     MessageRole,
     RiskTier,
     RunStatus,
+    ScheduledJobStatus,
+    SkillStatus,
     StepType,
     ToolExecutionStatus,
     UserRole,
@@ -63,6 +68,29 @@ class User(Base):
     created_at: Mapped[datetime] = _created_at()
 
 
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        Index("ix_api_keys_tenant_id", "tenant_id"),
+        Index("ix_api_keys_prefix", "prefix"),
+        UniqueConstraint("key_hash", name="uq_api_keys_key_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    prefix: Mapped[str] = mapped_column(String(32), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+
 class AgentRun(Base):
     __tablename__ = "agent_runs"
 
@@ -93,7 +121,14 @@ class AgentRun(Base):
     tool_calls_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     active_skill_revision_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey(
+            "skill_revisions.id",
+            name="fk_agent_runs_active_skill_revision_id_skill_revisions",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
     )
     # Names of MCP tools this run has unlocked via the load_tool meta-tool
     # (progressive disclosure — see decisions.md / issue #15). Only tools
@@ -221,6 +256,267 @@ class UsageRecord(Base):
     )
 
 
+class Skill(Base):
+    """Tenant-owned skill catalog entry.
+
+    Revisions hold the immutable executable instructions. This table owns the
+    mutable catalog metadata and the active revision pointer used by new runs.
+    """
+
+    __tablename__ = "skills"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[SkillStatus] = mapped_column(
+        String(20), nullable=False, default=SkillStatus.draft
+    )
+    active_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "skill_revisions.id",
+            name="fk_skills_active_revision_id_skill_revisions",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    revisions: Mapped[list["SkillRevision"]] = relationship(
+        back_populates="skill",
+        cascade="all, delete-orphan",
+        foreign_keys="SkillRevision.skill_id",
+        order_by="SkillRevision.version",
+    )
+    active_revision: Mapped["SkillRevision | None"] = relationship(
+        foreign_keys=[active_revision_id], post_update=True
+    )
+
+    __table_args__ = (
+        Index("ix_skills_tenant_id", "tenant_id"),
+        UniqueConstraint("tenant_id", "name", name="uq_skills_tenant_name"),
+    )
+
+
+class SkillRevision(Base):
+    """Immutable skill revision once published.
+
+    Draft and approved revisions can move through the manual lifecycle, but a
+    published revision is guarded by a database trigger in the migration.
+    """
+
+    __tablename__ = "skill_revisions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("skills.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[SkillStatus] = mapped_column(
+        String(20), nullable=False, default=SkillStatus.draft
+    )
+    instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    manifest: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    input_schema: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    output_schema: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    required_tools: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    change_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_from_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "agent_runs.id",
+            name="fk_skill_revisions_created_from_run_id_agent_runs",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = _created_at()
+
+    skill: Mapped[Skill] = relationship(
+        back_populates="revisions", foreign_keys=[skill_id]
+    )
+    usage_records: Mapped[list["SkillUsage"]] = relationship(
+        back_populates="revision", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_skill_revisions_skill_id", "skill_id"),
+        UniqueConstraint("skill_id", "version", name="uq_skill_revisions_skill_version"),
+    )
+
+
+class SkillUsage(Base):
+    __tablename__ = "skill_usage"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("skill_revisions.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    success: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    token_usage: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    feedback: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+    revision: Mapped[SkillRevision] = relationship(back_populates="usage_records")
+
+    __table_args__ = (
+        Index("ix_skill_usage_tenant_id", "tenant_id"),
+        Index("ix_skill_usage_revision_id", "revision_id"),
+        UniqueConstraint("revision_id", "run_id", name="uq_skill_usage_revision_run"),
+    )
+
+
+class SlackThreadMapping(Base):
+    __tablename__ = "slack_thread_mappings"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    thread_ts: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_slack_thread_mappings_tenant_id", "tenant_id"),
+        UniqueConstraint(
+            "channel_id", "thread_ts", name="uq_slack_thread_mappings_channel_thread"
+        ),
+        UniqueConstraint("run_id", name="uq_slack_thread_mappings_run_id"),
+    )
+
+
+class SlackEvent(Base):
+    __tablename__ = "slack_events"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    event_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        Index("ix_slack_events_tenant_id", "tenant_id"),
+        Index("ix_slack_events_run_id", "run_id"),
+    )
+
+
+class ScheduledJob(Base):
+    __tablename__ = "scheduled_jobs"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    cron_expression: Mapped[str] = mapped_column(String(255), nullable=False)
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    channel: Mapped[Channel] = mapped_column(String(20), nullable=False, default=Channel.schedule)
+    channel_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    status: Mapped[ScheduledJobStatus] = mapped_column(
+        String(20), nullable=False, default=ScheduledJobStatus.idle
+    )
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_scheduled_jobs_tenant_enabled", "tenant_id", "enabled"),
+        UniqueConstraint("tenant_id", "name", name="uq_scheduled_jobs_tenant_name"),
+    )
+
+
+class TenantQuota(Base):
+    __tablename__ = "tenant_quotas"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    daily_token_quota: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_active_runs: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+event.listen(
+    SkillRevision.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION reject_published_skill_revision_update()
+        RETURNS trigger AS $$
+        BEGIN
+            IF OLD.status = 'published' THEN
+                RAISE EXCEPTION 'published skill revisions are immutable';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    ),
+)
+event.listen(
+    SkillRevision.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_reject_published_skill_revision_update
+        BEFORE UPDATE ON skill_revisions
+        FOR EACH ROW
+        EXECUTE FUNCTION reject_published_skill_revision_update();
+        """
+    ),
+)
+event.listen(
+    SkillRevision.__table__,
+    "before_drop",
+    DDL("DROP TRIGGER IF EXISTS trg_reject_published_skill_revision_update ON skill_revisions"),
+)
+event.listen(
+    SkillRevision.__table__,
+    "before_drop",
+    DDL("DROP FUNCTION IF EXISTS reject_published_skill_revision_update()"),
+)
+
+
 class McpServer(Base):
     """A registered MCP-over-HTTP server. Also the Level-1 "domain" for
     progressive tool disclosure (issue #15) — one server, one domain.
@@ -336,4 +632,44 @@ class ApprovalRequest(Base):
         UniqueConstraint(
             "run_id", "step_no", "call_index", name="uq_approval_requests_run_step_call"
         ),
+    )
+
+
+class TenantLlmSetting(Base):
+    """Per-tenant LLM provider configuration, overriding the process-wide
+    env-var defaults (harness.config.Settings) for that tenant's runs.
+    """
+
+    __tablename__ = "tenant_llm_settings"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    provider: Mapped[LlmProvider] = mapped_column(String(20), nullable=False)
+    base_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Fernet-encrypted (harness.mcp.crypto), never stored or returned in plaintext.
+    api_key_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class TenantSlackSetting(Base):
+    """Per-tenant Slack app credentials, overriding the process-wide env-var
+    defaults (harness.config.Settings) for that tenant's Slack integration.
+    """
+
+    __tablename__ = "tenant_slack_settings"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    # Both Fernet-encrypted (harness.mcp.crypto), never stored or returned in plaintext.
+    bot_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    signing_secret_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

@@ -1,8 +1,9 @@
 import uuid
-from typing import Any
+from typing import Any, cast
 
 import aio_pika
 import orjson
+from opentelemetry.propagate import inject
 
 from harness.config import get_settings
 
@@ -56,10 +57,13 @@ async def publish_run(
     exchange = await channel.declare_exchange(
         EXCHANGE_NAME, aio_pika.ExchangeType.DIRECT, durable=True
     )
+    headers: dict[str, str] = {}
+    inject(headers)
     await exchange.publish(
         aio_pika.Message(
             body=encode_run_message(run_id, tenant_id),
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            headers=cast(dict[str, Any], headers),
         ),
         routing_key=ROUTING_KEY,
     )

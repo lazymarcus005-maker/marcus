@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from harness.config import get_settings
 from harness.db.enums import Channel, MessageRole, RunStatus, StepType
 from harness.db.models import AgentMessage, AgentRun, AgentStep
+from harness.observability import RUNS_STARTED
 from harness.runtime.state_machine import assert_valid_transition
 
 
@@ -49,6 +50,7 @@ class RunRepository:
         )
         self.session.add(run)
         await self.session.flush()
+        RUNS_STARTED.labels(channel=channel.value).inc()
         return run
 
     async def get(self, run_id: uuid.UUID) -> AgentRun | None:

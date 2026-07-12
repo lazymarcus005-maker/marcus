@@ -108,6 +108,35 @@ async def test_calling_unloaded_mcp_tool_is_rejected_without_invoking_handler(db
 
 
 @pytest.mark.asyncio
+async def test_builtin_domain_is_listed_and_tools_loadable(db_session):
+    client = FakeMcpClient(tools_by_server={})
+    run, tenant = await _make_run(db_session)
+    registry = await _register_search_domain(db_session, tenant, client)
+
+    llm = ScriptedLLMGateway(
+        [
+            tool_call_response("list_tool_domains", {}),
+            tool_call_response("load_tool", {"name": "read_file"}),
+            tool_call_response("finish", {"result": "done"}),
+        ]
+    )
+    engine = RunEngine(db_session, llm, mcp_registry=registry)
+
+    final = await engine.run_until_blocked(run.id)
+
+    assert final.status == RunStatus.completed
+    assert "read_file" in final.active_tool_names
+
+    domains_result = llm.calls[1]["messages"][-1].content
+    assert "builtin" in domains_result
+
+    tools_before_load = {t.name for t in llm.calls[1]["tools"]}
+    tools_after_load = {t.name for t in llm.calls[2]["tools"]}
+    assert "read_file" not in tools_before_load
+    assert "read_file" in tools_after_load
+
+
+@pytest.mark.asyncio
 async def test_list_domain_tools_rejects_unknown_domain(db_session):
     client = FakeMcpClient(tools_by_server={})
     run, tenant = await _make_run(db_session)

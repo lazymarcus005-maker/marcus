@@ -4,28 +4,35 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harness.db.enums import MessageRole, RunStatus, StepType
+from harness.config import get_settings
+from harness.db.enums import TERMINAL_RUN_STATUSES, MessageRole, RunStatus, StepType
 from harness.db.models import AgentRun, AgentStep
 from harness.llm.gateway import LLMError, LLMGateway
 from harness.llm.types import ToolCall
 from harness.llm.usage import record_usage
 from harness.mcp.registry import McpRegistry
 from harness.mcp.tools import build_tool as build_mcp_tool
+from harness.observability import LLM_TOKENS, RUN_DURATION, RUNS_COMPLETED, span
 from harness.runtime import guardrails, native_tools
 from harness.runtime.compaction import maybe_compact
 from harness.runtime.context import build_llm_messages
 from harness.runtime.native_tools import (
     ASK_USER_TOOL_NAME,
+    BUILTIN_DOMAIN_NAME,
     FINISH_TOOL_NAME,
     LIST_DOMAIN_TOOLS_NAME,
     LIST_TOOL_DOMAINS_NAME,
     LOAD_TOOL_NAME,
+    USE_SKILL_NAME,
     build_ask_user_tool,
+    build_builtin_tools,
     build_finish_tool,
 )
 from harness.runtime.repository import RunRepository
 from harness.runtime.tool_executor import ToolExecutor
 from harness.runtime.tools import Tool
+from harness.skills.registry import SkillRegistry
+from harness.skills.usage import record_skill_usage_for_run
 
 # Control results returned by _process_tool_calls, consumed by _execute_step.
 ControlResult = tuple[str, dict[str, Any]] | None
@@ -68,6 +75,13 @@ class RunEngine:
         self.llm = llm
         self.tool_executor = ToolExecutor(session)
         self.tools_by_name = {t.name: t for t in (tools or [])}
+        # Built-in capability tools (fetch_url/read_file/write_file/run_cli)
+        # are always available, exposed as the synthetic "builtin" domain via
+        # the same progressive-disclosure flow as MCP servers (see
+        # _build_list_domains_tool/_build_load_tool_tool below). setdefault
+        # so tests passing an explicit `tools=` with the same name still win.
+        for builtin_tool in build_builtin_tools(get_settings()):
+            self.tools_by_name.setdefault(builtin_tool.name, builtin_tool)
         self._finish_tool = build_finish_tool()
         self._ask_user_tool = build_ask_user_tool()
         self._list_domains_tool = native_tools.build_list_tool_domains_tool(
@@ -77,31 +91,45 @@ class RunEngine:
             _unused_meta_tool_handler
         )
         self._load_tool_tool = native_tools.build_load_tool_tool(_unused_meta_tool_handler)
+        self._use_skill_tool = native_tools.build_use_skill_tool(_unused_meta_tool_handler)
         # MCP tools (#14) are discovered from the DB, not passed in statically
         # like `tools` — loaded lazily on first LLM call and cached for the
         # life of this engine instance (one instance per run, see workers/main.py).
         self.mcp_registry = mcp_registry or McpRegistry(session)
+        self.skill_registry = SkillRegistry(session)
         self._mcp_tools_loaded = False
 
     async def run_until_blocked(self, run_id: uuid.UUID) -> AgentRun:
-        run = await self.repo.get_with_history(run_id)
-        if run is None:
-            raise ValueError(f"run {run_id} not found")
+        with span("agent.run", run_id=str(run_id)):
+            run = await self.repo.get_with_history(run_id)
+            if run is None:
+                raise ValueError(f"run {run_id} not found")
 
-        if run.status == RunStatus.pending:
-            run = await self.repo.checkpoint(run, status=RunStatus.running)
-            await self.session.commit()
+            if run.status == RunStatus.pending:
+                run = await self.repo.checkpoint(run, status=RunStatus.running)
+                await self.session.commit()
 
-        while run.status == RunStatus.running:
-            run = await self._execute_step(run)
+            while run.status == RunStatus.running:
+                run = await self._execute_step(run)
 
-        return run
+            if run.status in TERMINAL_RUN_STATUSES:
+                status = RunStatus(run.status)
+                RUNS_COMPLETED.labels(status=status.value).inc()
+                RUN_DURATION.labels(status=status.value).observe(
+                    max(0.0, (run.updated_at - run.created_at).total_seconds())
+                )
+            return run
 
     async def _execute_step(self, run: AgentRun) -> AgentRun:
+        with span("agent.step", run_id=str(run.id), tenant_id=str(run.tenant_id), step_no=run.current_step):
+            return await self._execute_step_inner(run)
+
+    async def _execute_step_inner(self, run: AgentRun) -> AgentRun:
         try:
             guardrails.check_before_step(run)
         except guardrails.GuardrailViolation as violation:
             run = await self.repo.checkpoint(run, status=violation.status, error=violation.reason)
+            await record_skill_usage_for_run(self.session, run)
             await self.session.commit()
             return run
 
@@ -134,6 +162,7 @@ class RunEngine:
                 tokens_used=tokens_used,
                 current_step=step_no + 1,
             )
+            await record_skill_usage_for_run(self.session, run)
             await self.session.commit()
             return run
 
@@ -159,6 +188,7 @@ class RunEngine:
                 current_step=step_no + 1,
                 tokens_used=tokens_used,
             )
+            await record_skill_usage_for_run(self.session, run)
             await self.session.commit()
             return run
 
@@ -192,6 +222,7 @@ class RunEngine:
             run = await self.repo.checkpoint(
                 run, status=RunStatus.completed, final_result=args, **field_updates
             )
+            await record_skill_usage_for_run(self.session, run)
         elif kind == "waiting_user_input":
             await self.repo.add_message(
                 run.id, MessageRole.assistant, args.get("question", "(no question provided)")
@@ -206,6 +237,7 @@ class RunEngine:
                 error=args.get("error", "unknown error"),
                 **field_updates,
             )
+            await record_skill_usage_for_run(self.session, run)
         else:
             raise AssertionError(f"unhandled control result kind: {kind}")
 
@@ -236,16 +268,23 @@ class RunEngine:
                 self._list_domains_tool,
                 self._list_domain_tools_tool,
                 self._load_tool_tool,
+                self._use_skill_tool,
                 *unlocked_tools,
             )
         ]
 
-        try:
-            response = await self.llm.complete(messages, tools=tool_specs)
-        except LLMError as exc:
-            await self.repo.checkpoint(run, status=RunStatus.failed, error=str(exc))
-            await self.session.commit()
-            return None
+        with span("agent.llm_call", run_id=str(run.id), tenant_id=str(run.tenant_id), step_no=step_no):
+            try:
+                response = await self.llm.complete(messages, tools=tool_specs)
+            except LLMError as exc:
+                run = await self.repo.checkpoint(run, status=RunStatus.failed, error=str(exc))
+                await record_skill_usage_for_run(self.session, run)
+                await self.session.commit()
+                return None
+        LLM_TOKENS.labels(model=response.model, kind="prompt").inc(response.usage.prompt_tokens)
+        LLM_TOKENS.labels(model=response.model, kind="completion").inc(
+            response.usage.completion_tokens
+        )
 
         tool_calls_payload = [
             {"id": c.id, "name": c.name, "arguments": c.arguments} for c in response.tool_calls
@@ -339,6 +378,24 @@ class RunEngine:
                     )
                 continue
 
+            if call.name == USE_SKILL_NAME:
+                outcome = await self.tool_executor.execute(
+                    run, step_no, call_index, call, tool=self._build_use_skill_tool(run)
+                )
+                revision_id = outcome.observation.get("revision_id")
+                required_tools = outcome.observation.get("required_tools", [])
+                if revision_id and "error" not in outcome.observation:
+                    active_tool_names = list(run.active_tool_names)
+                    for tool_name in required_tools:
+                        if tool_name not in active_tool_names:
+                            active_tool_names.append(tool_name)
+                    run = await self.repo.checkpoint(
+                        run,
+                        active_skill_revision_id=uuid.UUID(revision_id),
+                        active_tool_names=active_tool_names,
+                    )
+                continue
+
             tool = self.tools_by_name.get(call.name)
 
             if (
@@ -375,25 +432,35 @@ class RunEngine:
 
         return None
 
+    def _builtin_tools(self) -> list[Tool]:
+        return [t for t in self.tools_by_name.values() if t.mcp_server_id is None]
+
     def _build_list_domains_tool(self, run: AgentRun) -> Tool:
         async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
             servers = await self.mcp_registry.list_servers(run.tenant_id)
             counts: dict[str, int] = {}
             for server, _mcp_tool in await self.mcp_registry.list_tools(run.tenant_id):
                 counts[server.name] = counts.get(server.name, 0) + 1
-            return {
-                "domains": [
-                    {"name": s.name, "tool_count": counts.get(s.name, 0)}
-                    for s in servers
-                    if s.enabled
-                ]
-            }
+            domains = [
+                {"name": s.name, "tool_count": counts.get(s.name, 0)}
+                for s in servers
+                if s.enabled
+            ]
+            builtin_tools = self._builtin_tools()
+            if builtin_tools:
+                domains.append({"name": BUILTIN_DOMAIN_NAME, "tool_count": len(builtin_tools)})
+            return {"domains": domains}
 
         return native_tools.build_list_tool_domains_tool(handler)
 
     def _build_list_domain_tools_tool(self, run: AgentRun) -> Tool:
         async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
             domain = arguments.get("domain")
+            if domain == BUILTIN_DOMAIN_NAME:
+                tools = [
+                    {"name": t.name, "summary": t.description[:140]} for t in self._builtin_tools()
+                ]
+                return {"tools": tools}
             servers = await self.mcp_registry.list_servers(run.tenant_id)
             if not any(s.name == domain and s.enabled for s in servers):
                 return {"error": f"unknown domain: {domain}"}
@@ -410,16 +477,50 @@ class RunEngine:
     def _build_load_tool_tool(self, run: AgentRun) -> Tool:
         async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
             requested = arguments.get("name")
-            mcp_tool = (
-                await self.mcp_registry.get_tool_by_name(run.tenant_id, requested)
+            if not requested:
+                return {"error": f"unknown tool: {requested}"}
+            mcp_tool = await self.mcp_registry.get_tool_by_name(run.tenant_id, requested)
+            if mcp_tool is not None and mcp_tool.enabled:
+                return {"name": mcp_tool.name, "schema": mcp_tool.parameters}
+            builtin_tool = self.tools_by_name.get(requested)
+            if builtin_tool is not None and builtin_tool.mcp_server_id is None:
+                return {"name": builtin_tool.name, "schema": builtin_tool.parameters}
+            return {"error": f"unknown tool: {requested}"}
+
+        return native_tools.build_load_tool_tool(handler)
+
+    def _build_use_skill_tool(self, run: AgentRun) -> Tool:
+        async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+            requested = arguments.get("name")
+            active = (
+                await self.skill_registry.get_active_revision_by_skill_name(
+                    run.tenant_id, requested
+                )
                 if requested
                 else None
             )
-            if mcp_tool is None or not mcp_tool.enabled:
-                return {"error": f"unknown tool: {requested}"}
-            return {"name": mcp_tool.name, "schema": mcp_tool.parameters}
+            if active is None:
+                return {"error": f"unknown published skill: {requested}"}
 
-        return native_tools.build_load_tool_tool(handler)
+            skill, revision = active
+            missing_tools = [
+                name for name in revision.required_tools if name not in self.tools_by_name
+            ]
+            if missing_tools:
+                return {
+                    "error": "skill required tools are unavailable",
+                    "missing_tools": missing_tools,
+                }
+
+            return {
+                "name": skill.name,
+                "revision_id": str(revision.id),
+                "version": revision.version,
+                "instruction": revision.instruction,
+                "required_tools": revision.required_tools,
+            }
+
+        return native_tools.build_use_skill_tool(handler)
 
     async def _get_step(self, run_id: uuid.UUID, step_no: int) -> AgentStep | None:
         result = await self.session.execute(

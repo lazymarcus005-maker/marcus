@@ -5,6 +5,7 @@ from sqlalchemy import text
 
 from harness.config import get_settings
 from harness.db.session import get_sessionmaker
+from harness.observability import metrics_response
 
 router = APIRouter(tags=["health"])
 
@@ -46,3 +47,8 @@ async def readyz() -> dict:
 
     healthy = all(v == "ok" for v in checks.values())
     return {"status": "ok" if healthy else "degraded", "checks": checks}
+
+
+@router.get("/metrics")
+async def metrics():
+    return metrics_response()

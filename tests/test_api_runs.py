@@ -42,7 +42,7 @@ async def tenant_id(db_sessionmaker):
 @pytest.mark.asyncio
 async def test_create_run_requires_tenant_header(client):
     response = await client.post("/v1/runs", json={"goal": "do something"})
-    assert response.status_code == 422  # missing required header
+    assert response.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -171,6 +171,8 @@ async def test_get_run_steps_returns_empty_lists_for_new_run(client, tenant_id):
     resp = await client.get(f"/v1/runs/{run_id}/steps", headers=headers)
     assert resp.status_code == 200
     body = resp.json()
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["content"] == "goal"
     assert body["steps"] == []
     assert body["tool_executions"] == []
 

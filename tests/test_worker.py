@@ -6,11 +6,12 @@ import pytest
 import pytest_asyncio
 
 from harness.config import get_settings
-from harness.db.enums import MessageRole, RunStatus
-from harness.db.models import Tenant
+from harness.db.enums import LlmProvider, MessageRole, RunStatus
+from harness.db.models import Tenant, TenantLlmSetting
+from harness.mcp.crypto import encrypt
 from harness.mq import declare_topology, publish_run
 from harness.runtime.repository import RunRepository
-from harness.workers.main import process_message
+from harness.workers.main import _resolve_llm_gateway, process_message
 from tests.fakes import ScriptedLLMGateway, get_message_with_wait, tool_call_response
 
 RABBITMQ_URL = os.environ.get("HARNESS_TEST_RABBITMQ_URL", "amqp://harness:harness@localhost:5672/")
@@ -100,3 +101,50 @@ async def test_process_message_drops_message_for_missing_run(db_sessionmaker, ch
     settings = get_settings()
 
     await process_message(message, db_sessionmaker, llm, settings)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_resolve_llm_gateway_falls_back_to_default_when_unconfigured(db_session):
+    tenant = Tenant(name=f"t-{uuid.uuid4()}")
+    db_session.add(tenant)
+    await db_session.flush()
+    default_llm = ScriptedLLMGateway([])
+    settings = get_settings()
+
+    gateway, owns = await _resolve_llm_gateway(
+        db_session, tenant_id=tenant.id, default_llm=default_llm, settings=settings
+    )
+
+    assert gateway is default_llm
+    assert owns is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_llm_gateway_uses_tenant_provider_when_configured(db_session):
+    tenant = Tenant(name=f"t-{uuid.uuid4()}")
+    db_session.add(tenant)
+    await db_session.flush()
+    db_session.add(
+        TenantLlmSetting(
+            tenant_id=tenant.id,
+            provider=LlmProvider.openai,
+            base_url="https://api.openai.com/v1",
+            model="gpt-4o-mini",
+            api_key_encrypted=encrypt("sk-tenant-secret"),
+        )
+    )
+    await db_session.commit()
+    default_llm = ScriptedLLMGateway([])
+    settings = get_settings()
+
+    gateway, owns = await _resolve_llm_gateway(
+        db_session, tenant_id=tenant.id, default_llm=default_llm, settings=settings
+    )
+    try:
+        assert owns is True
+        assert gateway is not default_llm
+        assert gateway._settings.llm_base_url == "https://api.openai.com/v1"
+        assert gateway._settings.llm_model == "gpt-4o-mini"
+        assert gateway._settings.llm_api_key == "sk-tenant-secret"
+    finally:
+        await gateway.aclose()

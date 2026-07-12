@@ -20,6 +20,18 @@ def _headers(server: McpServer) -> dict[str, str]:
     return {server.auth_header_name: crypto.decrypt(server.auth_header_value_encrypted)}
 
 
+def _describe(exc: BaseException) -> str:
+    """Flatten a (possibly nested) ExceptionGroup into its leaf messages.
+
+    A failed sibling task inside the transport's task group (e.g. a non-2xx
+    HTTP response) is usually far more informative than the CancelledError
+    another sibling sees as a side effect of that failure — this recovers it.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return "; ".join(_describe(sub) for sub in exc.exceptions)
+    return str(exc)
+
+
 class McpClient:
     """Connect-per-call MCP-over-HTTP client (decisions.md Q10 — simplest first;
 
@@ -68,9 +80,29 @@ class _McpSessionContext:
             session = await self._stack.enter_async_context(ClientSession(read_stream, write_stream))
             await session.initialize()
             return session
-        except Exception as exc:  # noqa: BLE001 - normalized into McpError for callers
-            await self._stack.aclose()
-            raise McpError(f"failed to connect to MCP server {self._server.name!r}: {exc}") from exc
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            # Must catch BaseException, not just Exception: the transport's
+            # own task group cancels sibling tasks (e.g. the read loop
+            # waiting in session.initialize()) whenever one of them fails
+            # (e.g. a non-2xx response in the write/POST task) — per anyio's
+            # structured concurrency, that surfaces here as a plain
+            # asyncio.CancelledError, not the real underlying error, but it's
+            # not genuine external cancellation (nothing outside this method
+            # is cancelling us), so it's safe — and necessary — to treat it
+            # like any other connect failure rather than let it escape bare.
+            detail = str(exc)
+            try:
+                await self._stack.aclose()
+            except Exception as cleanup_exc:
+                # Tearing down a task group that had a failed subtask (e.g.
+                # the transport's read loop raising on a non-2xx response)
+                # re-raises that failure as its own ExceptionGroup here —
+                # usually the real cause, and more useful than `exc` (often
+                # just a CancelledError a sibling task saw as a side effect).
+                detail = _describe(cleanup_exc)
+            raise McpError(f"failed to connect to MCP server {self._server.name!r}: {detail}") from exc
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self._stack.aclose()

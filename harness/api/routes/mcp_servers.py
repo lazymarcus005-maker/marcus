@@ -4,7 +4,7 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harness.api.deps import require_tenant
+from harness.api.deps import AuthPrincipal, require_admin
 from harness.api.schemas import (
     McpServerCreateRequest,
     McpServerRefreshResponse,
@@ -32,11 +32,11 @@ async def _get_owned_server(session: AsyncSession, tenant: Tenant, server_id: uu
 @router.post("", response_model=McpServerResponse, status_code=201)
 async def register_server(
     body: McpServerCreateRequest,
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> McpServer:
     server = await McpRegistry(session).register(
-        tenant_id=tenant.id,
+        tenant_id=principal.tenant.id,
         name=body.name,
         base_url=body.base_url,
         auth_header_name=body.auth_header_name,
@@ -49,20 +49,20 @@ async def register_server(
 
 @router.get("", response_model=list[McpServerResponse])
 async def list_servers(
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> list[McpServer]:
-    return await McpRegistry(session).list_servers(tenant.id)
+    return await McpRegistry(session).list_servers(principal.tenant.id)
 
 
 @router.patch("/{server_id}", response_model=McpServerResponse)
 async def update_server(
     server_id: uuid.UUID,
     body: McpServerUpdateRequest,
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> McpServer:
-    server = await _get_owned_server(session, tenant, server_id)
+    server = await _get_owned_server(session, principal.tenant, server_id)
 
     if body.base_url is not None:
         server.base_url = body.base_url
@@ -83,10 +83,10 @@ async def update_server(
 @router.post("/{server_id}/refresh", response_model=McpServerRefreshResponse)
 async def refresh_server_tools(
     server_id: uuid.UUID,
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> McpServerRefreshResponse:
-    server = await _get_owned_server(session, tenant, server_id)
+    server = await _get_owned_server(session, principal.tenant, server_id)
     registry = McpRegistry(session)
     try:
         tool_count = await registry.refresh_tools(server)
@@ -100,10 +100,10 @@ async def refresh_server_tools(
 @router.get("/{server_id}/tools", response_model=list[McpToolResponse])
 async def list_server_tools(
     server_id: uuid.UUID,
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> list[McpTool]:
-    await _get_owned_server(session, tenant, server_id)
+    await _get_owned_server(session, principal.tenant, server_id)
     result = await session.execute(
         sa.select(McpTool).where(McpTool.mcp_server_id == server_id).order_by(McpTool.name)
     )
@@ -115,10 +115,10 @@ async def update_server_tool(
     server_id: uuid.UUID,
     tool_id: uuid.UUID,
     body: McpToolUpdateRequest,
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> McpTool:
-    await _get_owned_server(session, tenant, server_id)
+    await _get_owned_server(session, principal.tenant, server_id)
     result = await session.execute(
         sa.select(McpTool).where(McpTool.id == tool_id, McpTool.mcp_server_id == server_id)
     )

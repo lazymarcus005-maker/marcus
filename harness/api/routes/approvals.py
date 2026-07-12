@@ -5,10 +5,10 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harness.api.deps import require_tenant
+from harness.api.deps import AuthPrincipal, require_admin
 from harness.api.schemas import ApprovalDecisionRequest, ApprovalRequestResponse
 from harness.db.enums import ApprovalStatus, RunStatus
-from harness.db.models import AgentRun, ApprovalRequest, Tenant
+from harness.db.models import AgentRun, ApprovalRequest
 from harness.db.session import get_session
 from harness.mq import publish_run_standalone
 from harness.runtime.repository import RunRepository
@@ -18,11 +18,11 @@ router = APIRouter(tags=["approvals"])
 
 @router.get("/v1/approvals", response_model=list[ApprovalRequestResponse])
 async def list_approvals(
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
     status: ApprovalStatus | None = None,
 ) -> list[ApprovalRequest]:
-    conditions = [ApprovalRequest.tenant_id == tenant.id]
+    conditions = [ApprovalRequest.tenant_id == principal.tenant.id]
     if status is not None:
         conditions.append(ApprovalRequest.status == status)
     result = await session.execute(
@@ -34,12 +34,12 @@ async def list_approvals(
 @router.get("/v1/runs/{run_id}/approvals", response_model=list[ApprovalRequestResponse])
 async def list_run_approvals(
     run_id: uuid.UUID,
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> list[ApprovalRequest]:
     result = await session.execute(
         sa.select(ApprovalRequest)
-        .where(ApprovalRequest.run_id == run_id, ApprovalRequest.tenant_id == tenant.id)
+        .where(ApprovalRequest.run_id == run_id, ApprovalRequest.tenant_id == principal.tenant.id)
         .order_by(ApprovalRequest.step_no, ApprovalRequest.call_index)
     )
     return list(result.scalars().all())
@@ -49,7 +49,7 @@ async def list_run_approvals(
 async def decide_approval(
     approval_id: uuid.UUID,
     body: ApprovalDecisionRequest,
-    tenant: Tenant = Depends(require_tenant),
+    principal: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> ApprovalRequest:
     if body.decision not in (ApprovalStatus.approved, ApprovalStatus.rejected):
@@ -57,7 +57,7 @@ async def decide_approval(
 
     result = await session.execute(
         sa.select(ApprovalRequest).where(
-            ApprovalRequest.id == approval_id, ApprovalRequest.tenant_id == tenant.id
+            ApprovalRequest.id == approval_id, ApprovalRequest.tenant_id == principal.tenant.id
         )
     )
     approval = result.scalar_one_or_none()
@@ -68,9 +68,18 @@ async def decide_approval(
             status_code=409, detail=f"approval request already {approval.status}"
         )
 
+    if principal.user is not None:
+        if body.decided_by_user_id is not None and body.decided_by_user_id != principal.user.id:
+            raise HTTPException(
+                status_code=400,
+                detail="decided_by_user_id must match the authenticated user",
+            )
+        approval.decided_by_user_id = principal.user.id
+    else:
+        approval.decided_by_user_id = body.decided_by_user_id
+
     approval.status = body.decision
     approval.reason = body.reason
-    approval.decided_by_user_id = body.decided_by_user_id
     approval.decided_at = datetime.now(UTC)
     await session.flush()
 

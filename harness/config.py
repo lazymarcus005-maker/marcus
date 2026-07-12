@@ -29,6 +29,38 @@ class Settings(BaseSettings):
 
     tool_result_max_chars: int = 4000
 
+    slack_signing_secret: str = ""
+    slack_bot_token: str = ""
+    slack_tenant_id: str | None = None
+    web_base_url: str = "http://localhost:8000"
+
+    api_key_rate_limit_per_minute: int = 120
+
+    otel_enabled: bool = True
+    otel_service_name: str = "harness"
+    otel_exporter_otlp_endpoint: str | None = None
+    json_logs: bool = True
+
+    scheduler_lease_ttl_seconds: int = 30
+    scheduler_poll_seconds: int = 30
+
+    tenant_daily_token_quota_default: int = 2_000_000
+    tenant_max_active_runs_default: int = 25
+
+    # Built-in tools (harness/runtime/native_tools.py): fetch_url, read_file,
+    # write_file, run_cli. read_file/write_file/run_cli are sandboxed to this
+    # directory and cannot escape it.
+    tools_fs_root: str = "./data/tools-fs"
+    tools_fetch_url_timeout_seconds: float = 15.0
+    tools_fetch_url_max_bytes: int = 200_000
+    tools_read_file_max_bytes: int = 200_000
+    # run_cli is DESTRUCTIVE risk tier — every call requires human approval —
+    # but arbitrary shell execution is still meaningful blast radius. Set to
+    # false to remove the tool entirely for deployments that don't want it.
+    tools_run_cli_enabled: bool = True
+    tools_run_cli_timeout_seconds: float = 30.0
+    tools_run_cli_max_output_bytes: int = 50_000
+
 
 @lru_cache
 def get_settings() -> Settings:

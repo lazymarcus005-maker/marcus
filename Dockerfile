@@ -1,3 +1,11 @@
+FROM node:22-alpine AS web-build
+
+WORKDIR /web
+COPY web/package*.json ./
+RUN npm install
+COPY web ./
+RUN npm run build
+
 FROM python:3.12-slim AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
@@ -11,6 +19,7 @@ RUN uv sync --frozen --no-install-project --no-dev
 COPY harness ./harness
 COPY migrations ./migrations
 COPY alembic.ini ./
+COPY --from=web-build /web/dist ./web/dist
 
 RUN uv sync --frozen --no-dev
 

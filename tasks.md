@@ -2,7 +2,7 @@
 
 แตกจาก `review-open-questions.md` §4 ตามการตัดสินใจใน `decisions.md` — ทุก task เป็น GitHub issue แล้ว (เลข issue ตรงกับลำดับ)
 
-**สถานะ: Phase 0–2 เสร็จแล้ว (#1–#17 ปิดหมด)** — core loop ทำงานจริง ผ่าน real Postgres/Redis/RabbitMQ, มี API ให้คุยกับ agent ได้ครบ (create run → poll → message/cancel), crash-safe ทั้ง tool execution (write-ahead + idempotency) และ run lease (heartbeat + reaper); เรียก tool จริงผ่าน MCP over HTTP ได้แล้ว พร้อม progressive disclosure, result truncation, และ approval flow สำหรับ tool เสี่ยงสูง (M2 สำเร็จ)
+**สถานะ: Phase 0–5 เสร็จแล้ว (#1–#26 ปิดหมด)** — core loop ทำงานจริง ผ่าน real Postgres/Redis/RabbitMQ, มี API ให้คุยกับ agent ได้ครบ (create run → poll → message/cancel), crash-safe ทั้ง tool execution (write-ahead + idempotency) และ run lease (heartbeat + reaper); เรียก tool จริงผ่าน MCP over HTTP ได้แล้ว พร้อม progressive disclosure, result truncation, approval flow สำหรับ tool เสี่ยงสูง, skill lifecycle/selection/usage logging, Slack integration, API key auth/RBAC, Web UI, observability, scheduler, quotas, และ runbook
 
 ## Phase 0 — Foundation ✅
 | Issue | Task |
@@ -36,23 +36,23 @@
 ## Phase 3 — Skills (manual lifecycle, self-learning เลื่อน)
 | Issue | Task |
 |---|---|
-| [#18](https://github.com/lazymarcus005-maker/marcus/issues/18) | Skill registry: immutable revisions + publish/rollback |
-| [#19](https://github.com/lazymarcus005-maker/marcus/issues/19) | Skill selection & injection (use_skill meta-tool) |
-| [#20](https://github.com/lazymarcus005-maker/marcus/issues/20) | Skill usage + outcome logging (เตรียม self-learning) |
+| [#18](https://github.com/lazymarcus005-maker/marcus/issues/18) | Skill registry: immutable revisions + publish/rollback ✅ |
+| [#19](https://github.com/lazymarcus005-maker/marcus/issues/19) | Skill selection & injection (use_skill meta-tool) ✅ |
+| [#20](https://github.com/lazymarcus005-maker/marcus/issues/20) | Skill usage + outcome logging (เตรียม self-learning) ✅ |
 
 ## Phase 4 — Channels & UI (Slack + Web, ไม่มี streaming)
 | Issue | Task |
 |---|---|
-| [#21](https://github.com/lazymarcus005-maker/marcus/issues/21) | Slack integration: Events webhook + thread mapping |
-| [#22](https://github.com/lazymarcus005-maker/marcus/issues/22) | Web UI: runs, conversation, approvals |
-| [#23](https://github.com/lazymarcus005-maker/marcus/issues/23) | AuthN/AuthZ: API keys ต่อ tenant |
+| [#21](https://github.com/lazymarcus005-maker/marcus/issues/21) | Slack integration: Events webhook + thread mapping ✅ |
+| [#22](https://github.com/lazymarcus005-maker/marcus/issues/22) | Web UI: runs, conversation, approvals ✅ |
+| [#23](https://github.com/lazymarcus005-maker/marcus/issues/23) | AuthN/AuthZ: API keys ต่อ tenant ✅ |
 
 ## Phase 5 — Ops
 | Issue | Task |
 |---|---|
-| [#24](https://github.com/lazymarcus005-maker/marcus/issues/24) | Observability: OTel tracing + metrics |
-| [#25](https://github.com/lazymarcus005-maker/marcus/issues/25) | Scheduler: APScheduler + scheduled_jobs |
-| [#26](https://github.com/lazymarcus005-maker/marcus/issues/26) | Ops hardening: reapers, quotas, runbook |
+| [#24](https://github.com/lazymarcus005-maker/marcus/issues/24) | Observability: OTel tracing + metrics ✅ |
+| [#25](https://github.com/lazymarcus005-maker/marcus/issues/25) | Scheduler: APScheduler + scheduled_jobs ✅ |
+| [#26](https://github.com/lazymarcus005-maker/marcus/issues/26) | Ops hardening: reapers, quotas, runbook ✅ |
 
 ## ลำดับ dependency หลัก
 

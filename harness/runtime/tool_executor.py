@@ -7,6 +7,7 @@ from harness.config import get_settings
 from harness.db.enums import ApprovalStatus, RiskTier, ToolExecutionStatus
 from harness.db.models import AgentRun, ApprovalRequest, ToolExecution
 from harness.llm.types import ToolCall
+from harness.observability import TOOL_CALLS, span
 from harness.runtime import guardrails
 from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tools import ExecutionOutcome, Tool
@@ -29,6 +30,31 @@ class ToolExecutor:
         self.session = session
 
     async def execute(
+        self, run: AgentRun, step_no: int, call_index: int, call: ToolCall, tool: Tool | None
+    ) -> ExecutionOutcome:
+        with span(
+            "agent.tool_call",
+            run_id=str(run.id),
+            tenant_id=str(run.tenant_id),
+            step_no=step_no,
+            tool_name=call.name,
+        ):
+            outcome = await self._execute_inner(run, step_no, call_index, call, tool)
+            TOOL_CALLS.labels(
+                tool=call.name,
+                status=(
+                    "approval"
+                    if outcome.needs_approval
+                    else "fatal"
+                    if outcome.fatal
+                    else "error"
+                    if "error" in outcome.observation
+                    else "ok"
+                ),
+            ).inc()
+            return outcome
+
+    async def _execute_inner(
         self, run: AgentRun, step_no: int, call_index: int, call: ToolCall, tool: Tool | None
     ) -> ExecutionOutcome:
         idempotency_key = f"{run.id}:{step_no}:{call_index}"

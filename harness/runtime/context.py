@@ -9,12 +9,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from harness.db.enums import StepType, ToolExecutionStatus
 from harness.db.models import AgentMessage, AgentRun, AgentStep, ToolExecution
 from harness.llm.types import LLMMessage, Role, ToolCall
+from harness.skills.registry import SkillRegistry
 
 SYSTEM_PROMPT_TEMPLATE = (
     "You are an autonomous agent working towards a goal on behalf of a user.\n\n"
     "Goal: {goal}\n\n"
     "Call the `finish` tool once the goal is achieved, passing your result. "
     "Call `ask_user` if you need clarification before continuing."
+    "{skill_catalog}"
+    "{active_skill}"
 )
 
 
@@ -59,10 +62,50 @@ async def build_llm_messages(session: AsyncSession, run: AgentRun) -> list[LLMMe
 
     timeline.sort(key=lambda item: item[0])
 
-    messages = [LLMMessage(role="system", content=SYSTEM_PROMPT_TEMPLATE.format(goal=run.goal))]
+    skill_catalog, active_skill = await build_skill_context(session, run)
+    messages = [
+        LLMMessage(
+            role="system",
+            content=SYSTEM_PROMPT_TEMPLATE.format(
+                goal=run.goal,
+                skill_catalog=skill_catalog,
+                active_skill=active_skill,
+            ),
+        )
+    ]
     for _, chunk in timeline:
         messages.extend(chunk)
     return messages
+
+
+async def build_skill_context(session: AsyncSession, run: AgentRun) -> tuple[str, str]:
+    registry = SkillRegistry(session)
+    active_skill = ""
+    if run.active_skill_revision_id is not None:
+        active = await registry.get_revision_by_id(run.tenant_id, run.active_skill_revision_id)
+        if active is not None:
+            skill, revision = active
+            active_skill = (
+                "\n\n"
+                f"Active skill: {skill.name} v{revision.version}\n"
+                f"{revision.instruction}"
+            )
+
+    skills = await registry.list_published_skills(run.tenant_id)
+    if not skills:
+        return "", active_skill
+
+    catalog_lines = "\n".join(
+        f"- {skill.name}: {skill.description or '(no description)'}" for skill in skills
+    )
+    return (
+        "\n\n"
+        "Published skill catalog:\n"
+        f"{catalog_lines}\n"
+        "If one of these skills is relevant, call `use_skill` with its exact name "
+        "before proceeding.",
+        active_skill,
+    )
 
 
 def llm_call_step_to_messages(step: AgentStep, executions: list[ToolExecution]) -> list[LLMMessage]:
