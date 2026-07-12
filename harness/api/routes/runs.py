@@ -130,7 +130,9 @@ async def get_run_steps(
         sa.select(AgentStep).where(AgentStep.run_id == run_id).order_by(AgentStep.step_no)
     )
     messages_result = await session.execute(
-        sa.select(AgentMessage).where(AgentMessage.run_id == run_id).order_by(AgentMessage.created_at)
+        sa.select(AgentMessage)
+        .where(AgentMessage.run_id == run_id)
+        .order_by(AgentMessage.created_at)
     )
     executions_result = await session.execute(
         sa.select(ToolExecution)
@@ -220,4 +222,3 @@ async def post_run_feedback(
 
     await session.commit()
     return SkillUsageResponse.model_validate(usage)
-

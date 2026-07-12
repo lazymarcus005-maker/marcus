@@ -28,7 +28,9 @@ def test_validate_base_url_accepts_http_and_removes_trailing_slash():
     assert validate_base_url(" https://api.example.com/v1/// ") == "https://api.example.com/v1"
 
 
-@pytest.mark.parametrize("url", ["file:///tmp/x", "localhost:1234", "https://user:pass@example.com/v1"])
+@pytest.mark.parametrize(
+    "url", ["file:///tmp/x", "localhost:1234", "https://user:pass@example.com/v1"]
+)
 def test_validate_base_url_rejects_unsafe_urls(url):
     with pytest.raises(ValueError):
         validate_base_url(url)
@@ -37,7 +39,9 @@ def test_validate_base_url_rejects_unsafe_urls(url):
 def test_save_and_load_user_config_round_trips(tmp_path, monkeypatch):
     _point_user_config_at(monkeypatch, tmp_path)
 
-    path = save_user_config(api_key="sk-secret", base_url="https://api.openai.com/v1", model="gpt-4o-mini")
+    path = save_user_config(
+        api_key="sk-secret", base_url="https://api.openai.com/v1", model="gpt-4o-mini"
+    )
 
     assert path.is_file()
     loaded = load_user_config()
@@ -69,7 +73,9 @@ def test_resolve_settings_applies_file_config_when_no_env_var(tmp_path, monkeypa
     _point_user_config_at(monkeypatch, tmp_path)
     monkeypatch.delenv("HARNESS_LLM_API_KEY", raising=False)
     monkeypatch.delenv("HARNESS_LLM_MODEL", raising=False)
-    save_user_config(api_key="sk-from-file", base_url="https://api.openai.com/v1", model="gpt-4o-mini")
+    save_user_config(
+        api_key="sk-from-file", base_url="https://api.openai.com/v1", model="gpt-4o-mini"
+    )
 
     settings = resolve_settings()
 
@@ -80,7 +86,9 @@ def test_resolve_settings_applies_file_config_when_no_env_var(tmp_path, monkeypa
 
 def test_resolve_settings_env_var_wins_over_file(tmp_path, monkeypatch):
     _point_user_config_at(monkeypatch, tmp_path)
-    save_user_config(api_key="sk-from-file", base_url="https://api.openai.com/v1", model="gpt-4o-mini")
+    save_user_config(
+        api_key="sk-from-file", base_url="https://api.openai.com/v1", model="gpt-4o-mini"
+    )
     monkeypatch.setenv("HARNESS_LLM_API_KEY", "sk-from-env")
 
     settings = resolve_settings()

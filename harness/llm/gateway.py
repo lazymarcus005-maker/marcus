@@ -142,9 +142,23 @@ class LLMGateway:
                     entry["arguments"] += function.get("arguments") or ""
                 usage_raw = chunk.get("usage") or {}
                 if usage_raw:
-                    usage = Usage(usage_raw.get("prompt_tokens", 0), usage_raw.get("completion_tokens", 0), usage_raw.get("total_tokens", 0))
-        tool_calls = [ToolCall(id=v["id"], name=v["name"], arguments=orjson.loads(v["arguments"] or "{}")) for v in calls.values()]
-        return LLMResponse("".join(content_parts) or None, tool_calls, finish_reason, usage, model or self._settings.llm_model, {})
+                    usage = Usage(
+                        usage_raw.get("prompt_tokens", 0),
+                        usage_raw.get("completion_tokens", 0),
+                        usage_raw.get("total_tokens", 0),
+                    )
+        tool_calls = [
+            ToolCall(id=v["id"], name=v["name"], arguments=orjson.loads(v["arguments"] or "{}"))
+            for v in calls.values()
+        ]
+        return LLMResponse(
+            "".join(content_parts) or None,
+            tool_calls,
+            finish_reason,
+            usage,
+            model or self._settings.llm_model,
+            {},
+        )
 
     async def _post_with_retry(
         self, payload: dict[str, Any], *, max_retries: int

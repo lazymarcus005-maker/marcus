@@ -113,7 +113,9 @@ class MetricsMiddleware:
 
 
 REQUESTS = Counter("harness_http_requests_total", "HTTP requests", ["method", "path", "status"])
-REQUEST_DURATION = Histogram("harness_http_request_duration_seconds", "HTTP request duration", ["method", "path"])
+REQUEST_DURATION = Histogram(
+    "harness_http_request_duration_seconds", "HTTP request duration", ["method", "path"]
+)
 
 
 def metrics_response() -> Response:

@@ -43,7 +43,10 @@ def _read_only_tool(name="peek", result=None):
         return result if result is not None else {"ok": True}
 
     return Tool(
-        name=name, description="d", parameters={"type": "object", "properties": {}}, handler=handler,
+        name=name,
+        description="d",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
         risk_tier=RiskTier.read_only,
     )
 
@@ -55,7 +58,10 @@ def _sensitive_tool(name="mutate", *, raises=None):
         return {"done": True}
 
     return Tool(
-        name=name, description="d", parameters={"type": "object", "properties": {}}, handler=handler,
+        name=name,
+        description="d",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
         risk_tier=RiskTier.sensitive_write,
     )
 
@@ -73,9 +79,7 @@ async def test_plain_text_reply_ends_turn_immediately():
 
 @pytest.mark.asyncio
 async def test_read_only_tool_executes_without_approval_prompt():
-    llm = ScriptedLLMGateway(
-        [tool_call_response("peek", {}), text_response("done")]
-    )
+    llm = ScriptedLLMGateway([tool_call_response("peek", {}), text_response("done")])
     ui = _FakeUI(decisions=[])  # no decisions consumed — would raise StopIteration if asked
     loop = MarcusLoop(llm, [_read_only_tool()], ui)
 
@@ -87,9 +91,7 @@ async def test_read_only_tool_executes_without_approval_prompt():
 
 @pytest.mark.asyncio
 async def test_sensitive_tool_approved_executes():
-    llm = ScriptedLLMGateway(
-        [tool_call_response("mutate", {"x": 1}), text_response("done")]
-    )
+    llm = ScriptedLLMGateway([tool_call_response("mutate", {"x": 1}), text_response("done")])
     ui = _FakeUI(decisions=["yes"])
     loop = MarcusLoop(llm, [_sensitive_tool()], ui)
 
@@ -137,9 +139,7 @@ async def test_always_decision_skips_future_prompts_for_that_tool():
 
 @pytest.mark.asyncio
 async def test_tool_handler_exception_becomes_error_observation_not_crash():
-    llm = ScriptedLLMGateway(
-        [tool_call_response("mutate", {}), text_response("handled the error")]
-    )
+    llm = ScriptedLLMGateway([tool_call_response("mutate", {}), text_response("handled the error")])
     ui = _FakeUI(decisions=["yes"])
     loop = MarcusLoop(llm, [_sensitive_tool(raises=ValueError("boom"))], ui)
 
@@ -151,9 +151,7 @@ async def test_tool_handler_exception_becomes_error_observation_not_crash():
 
 @pytest.mark.asyncio
 async def test_unknown_tool_call_returns_error_without_crashing():
-    llm = ScriptedLLMGateway(
-        [tool_call_response("does_not_exist", {}), text_response("done")]
-    )
+    llm = ScriptedLLMGateway([tool_call_response("does_not_exist", {}), text_response("done")])
     ui = _FakeUI()
     loop = MarcusLoop(llm, [], ui)
 

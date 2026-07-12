@@ -58,7 +58,12 @@ def save_user_config(*, api_key: str, base_url: str, model: str) -> Path:
 def validate_base_url(base_url: str) -> str:
     value = base_url.strip()
     parsed = urlparse(value)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+    ):
         raise ValueError("base URL must be an absolute HTTP(S) URL without credentials")
     return value.rstrip("/")
 
@@ -97,7 +102,10 @@ def has_llm_credentials(settings: Settings) -> bool:
     """True once an API key has been configured from any source (env, .env,
     or ~/.marcus/config.toml) — as opposed to harness.config.Settings'
     built-in placeholder default."""
-    return bool(settings.llm_api_key) and settings.llm_api_key != Settings.model_fields["llm_api_key"].default
+    return (
+        bool(settings.llm_api_key)
+        and settings.llm_api_key != Settings.model_fields["llm_api_key"].default
+    )
 
 
 def load_project_instructions(root: Path) -> str | None:

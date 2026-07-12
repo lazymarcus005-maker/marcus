@@ -22,7 +22,9 @@ from harness.mcp.registry import McpRegistry
 router = APIRouter(prefix="/v1/mcp-servers", tags=["mcp-servers"])
 
 
-async def _get_owned_server(session: AsyncSession, tenant: Tenant, server_id: uuid.UUID) -> McpServer:
+async def _get_owned_server(
+    session: AsyncSession, tenant: Tenant, server_id: uuid.UUID
+) -> McpServer:
     server = await McpRegistry(session).get_server(tenant.id, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="mcp server not found")

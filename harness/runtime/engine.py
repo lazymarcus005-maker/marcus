@@ -121,7 +121,9 @@ class RunEngine:
             return run
 
     async def _execute_step(self, run: AgentRun) -> AgentRun:
-        with span("agent.step", run_id=str(run.id), tenant_id=str(run.tenant_id), step_no=run.current_step):
+        with span(
+            "agent.step", run_id=str(run.id), tenant_id=str(run.tenant_id), step_no=run.current_step
+        ):
             return await self._execute_step_inner(run)
 
     async def _execute_step_inner(self, run: AgentRun) -> AgentRun:
@@ -285,7 +287,9 @@ class RunEngine:
             )
         ]
 
-        with span("agent.llm_call", run_id=str(run.id), tenant_id=str(run.tenant_id), step_no=step_no):
+        with span(
+            "agent.llm_call", run_id=str(run.id), tenant_id=str(run.tenant_id), step_no=step_no
+        ):
             try:
                 response = await self.llm.complete(messages, tools=tool_specs)
             except LLMError as exc:
@@ -454,9 +458,7 @@ class RunEngine:
             for server, _mcp_tool in await self.mcp_registry.list_tools(run.tenant_id):
                 counts[server.name] = counts.get(server.name, 0) + 1
             domains = [
-                {"name": s.name, "tool_count": counts.get(s.name, 0)}
-                for s in servers
-                if s.enabled
+                {"name": s.name, "tool_count": counts.get(s.name, 0)} for s in servers if s.enabled
             ]
             builtin_tools = self._builtin_tools()
             if builtin_tools:

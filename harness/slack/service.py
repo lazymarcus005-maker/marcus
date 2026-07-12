@@ -186,7 +186,9 @@ async def handle_slack_event_callback(
     # delivery will either block behind this INSERT and then fail once we
     # commit, or proceed only if we roll back — either way at most one
     # request can create a run for this event_id.
-    claimed = await record_slack_event(session, event_id=event_id, payload=payload, tenant_id=tenant.id)
+    claimed = await record_slack_event(
+        session, event_id=event_id, payload=payload, tenant_id=tenant.id
+    )
     if not claimed:
         await session.commit()
         return {"ok": True, "deduped": True}
@@ -206,7 +208,11 @@ async def handle_slack_event_callback(
             tenant_id=tenant.id,
             goal=text,
             channel=Channel.slack,
-            channel_metadata={"channel_id": channel_id, "thread_ts": thread_ts, "event_ts": event_ts},
+            channel_metadata={
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "event_ts": event_ts,
+            },
             created_by_user_id=slack_user.id,
         )
         await repo.add_message(run.id, MessageRole.user, text)
@@ -306,7 +312,9 @@ async def post_run_update_to_slack(
 
     slack = client
     if slack is None:
-        bot_token = await resolve_slack_bot_token(session, tenant_id=run.tenant_id, settings=settings)
+        bot_token = await resolve_slack_bot_token(
+            session, tenant_id=run.tenant_id, settings=settings
+        )
         slack = SlackClient(bot_token=bot_token)
     try:
         await slack.post_message(channel=mapping.channel_id, thread_ts=mapping.thread_ts, text=text)

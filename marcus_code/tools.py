@@ -22,7 +22,18 @@ RUN_CLI_TOOL_NAME = "run_cli"
 FETCH_URL_TOOL_NAME = "fetch_url"
 
 # Directories never walked by list_files/grep — noise, not user code.
-_SKIP_DIR_NAMES = frozenset({".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", ".ruff_cache", ".pytest_cache"})
+_SKIP_DIR_NAMES = frozenset(
+    {
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+    }
+)
 
 _MAX_LIST_RESULTS = 200
 _MAX_GREP_MATCHES = 200
@@ -46,7 +57,9 @@ def _redact_secrets(path: str, content: str) -> tuple[str, int]:
     redacted = content
     redacted, count = _PRIVATE_KEY_PATTERN.subn("[REDACTED PRIVATE KEY]", redacted)
     redactions += count
-    redacted, count = _CREDENTIAL_PATTERN.subn(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted)
+    redacted, count = _CREDENTIAL_PATTERN.subn(
+        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted
+    )
     redactions += count
     return redacted, redactions
 
@@ -80,14 +93,21 @@ def build_read_file_tool(root: Path) -> Tool:
             raise ValueError(f"file not found: {path}")
         content = resolved.read_text(encoding="utf-8", errors="replace")
         safe_content, redactions = _redact_secrets(path, content)
-        return {"path": path, "content": safe_content, "lines": content.count("\n") + 1, "redacted": redactions > 0}
+        return {
+            "path": path,
+            "content": safe_content,
+            "lines": content.count("\n") + 1,
+            "redacted": redactions > 0,
+        }
 
     return Tool(
         name=READ_FILE_TOOL_NAME,
         description="Read a text file's full contents. Path is relative to the working directory.",
         parameters={
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "Path relative to the working directory."}},
+            "properties": {
+                "path": {"type": "string", "description": "Path relative to the working directory."}
+            },
             "required": ["path"],
         },
         handler=handler,
@@ -117,7 +137,10 @@ def build_write_file_tool(root: Path) -> Tool:
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path relative to the working directory."},
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the working directory.",
+                },
                 "content": {"type": "string", "description": "Full file content to write."},
             },
             "required": ["path", "content"],
@@ -163,8 +186,14 @@ def build_edit_file_tool(root: Path) -> Tool:
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path relative to the working directory."},
-                "old_string": {"type": "string", "description": "Exact text to replace, must be unique in the file."},
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the working directory.",
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact text to replace, must be unique in the file.",
+                },
                 "new_string": {"type": "string", "description": "Replacement text."},
             },
             "required": ["path", "old_string", "new_string"],
@@ -260,7 +289,10 @@ def build_grep_tool(root: Path) -> Tool:
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Regular expression to search for."},
-                "glob": {"type": "string", "description": "Glob to restrict which files are searched, default '**/*'."},
+                "glob": {
+                    "type": "string",
+                    "description": "Glob to restrict which files are searched, default '**/*'.",
+                },
             },
             "required": ["pattern"],
         },
@@ -311,7 +343,9 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
         ),
         parameters={
             "type": "object",
-            "properties": {"command": {"type": "string", "description": "The shell command to run."}},
+            "properties": {
+                "command": {"type": "string", "description": "The shell command to run."}
+            },
             "required": ["command"],
         },
         handler=handler,
@@ -364,7 +398,9 @@ def build_fetch_url_tool(settings: Settings) -> Tool:
         ),
         parameters={
             "type": "object",
-            "properties": {"url": {"type": "string", "description": "The absolute http(s) URL to fetch."}},
+            "properties": {
+                "url": {"type": "string", "description": "The absolute http(s) URL to fetch."}
+            },
             "required": ["url"],
         },
         handler=handler,
@@ -378,7 +414,14 @@ def _validate_public_url(url: str) -> None:
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("fetch_url only supports public http(s) URLs")
     try:
-        addresses = {info[4][0] for info in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+        addresses = {
+            info[4][0]
+            for info in socket.getaddrinfo(
+                parsed.hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        }
     except OSError as exc:
         raise ValueError(f"could not resolve URL host: {parsed.hostname}") from exc
     if not addresses:
@@ -388,7 +431,9 @@ def _validate_public_url(url: str) -> None:
     for address in addresses:
         ip = ipaddress.ip_address(address)
         if not ip.is_global:
-            raise ValueError("fetch_url refuses loopback, private, link-local, or reserved addresses")
+            raise ValueError(
+                "fetch_url refuses loopback, private, link-local, or reserved addresses"
+            )
 
 
 def build_marcus_tools(root: Path, settings: Settings) -> list[Tool]:

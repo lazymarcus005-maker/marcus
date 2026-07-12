@@ -59,7 +59,13 @@ token usage and timing are available via /usage.
 """
 
 
-def build_system_prompt(root: Path, *, project_instructions: str | None = None, git_summary: str | None = None, skill_catalog: str | None = None) -> str:
+def build_system_prompt(
+    root: Path,
+    *,
+    project_instructions: str | None = None,
+    git_summary: str | None = None,
+    skill_catalog: str | None = None,
+) -> str:
     base = SYSTEM_PROMPT_TEMPLATE.format(root=root)
     if git_summary:
         base += f"\nGit status at session start:\n{git_summary}\n"

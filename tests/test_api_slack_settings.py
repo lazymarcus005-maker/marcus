@@ -76,7 +76,9 @@ async def test_put_slack_settings_creates_and_hides_secrets(client, db_sessionma
 
 
 @pytest.mark.asyncio
-async def test_put_slack_settings_without_both_fields_requires_them_on_create(client, db_sessionmaker):
+async def test_put_slack_settings_without_both_fields_requires_them_on_create(
+    client, db_sessionmaker
+):
     async with db_sessionmaker() as session:
         _tenant, raw = await _admin_key(session)
 
@@ -116,7 +118,9 @@ async def test_slack_settings_require_admin(client, db_sessionmaker):
         member = User(tenant_id=tenant.id, display_name="member", role=UserRole.member)
         session.add(member)
         await session.flush()
-        _key, raw = await create_api_key(session, tenant_id=tenant.id, user_id=member.id, name="member")
+        _key, raw = await create_api_key(
+            session, tenant_id=tenant.id, user_id=member.id, name="member"
+        )
         await session.commit()
 
     resp = await client.get("/v1/slack-settings", headers={"X-API-Key": raw})

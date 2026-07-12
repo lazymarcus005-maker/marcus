@@ -97,7 +97,9 @@ async def _process_message_inner(
 
         if not acquired:
             logger.info(
-                "run %s already leased by another worker; skipping", run_id, extra={"run_id": run_id}
+                "run %s already leased by another worker; skipping",
+                run_id,
+                extra={"run_id": run_id},
             )
             return
 

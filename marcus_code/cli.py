@@ -27,8 +27,22 @@ def _new_session_name() -> str:
 
 def _git_summary(root: Path) -> str | None:
     try:
-        branch = subprocess.run(["git", "branch", "--show-current"], cwd=root, capture_output=True, text=True, timeout=2, check=False).stdout.strip()
-        status = subprocess.run(["git", "status", "--short"], cwd=root, capture_output=True, text=True, timeout=2, check=False).stdout.splitlines()
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        ).stdout.splitlines()
     except (OSError, subprocess.TimeoutExpired):
         return None
     if not branch and not status:
@@ -63,7 +77,12 @@ async def _amain(prompt: str | None = None) -> None:
         tools,
         ui,
         model=settings.llm_model,
-        system_prompt=build_system_prompt(root, project_instructions=project_instructions, git_summary=_git_summary(root), skill_catalog=build_skill_catalog(root)),
+        system_prompt=build_system_prompt(
+            root,
+            project_instructions=project_instructions,
+            git_summary=_git_summary(root),
+            skill_catalog=build_skill_catalog(root),
+        ),
         max_history_messages=settings.cli_max_history_messages,
         max_total_tokens=settings.cli_max_total_tokens,
         history_summary_enabled=settings.cli_history_summary_enabled,

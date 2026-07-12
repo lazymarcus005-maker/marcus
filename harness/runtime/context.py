@@ -95,9 +95,7 @@ async def build_skill_context(session: AsyncSession, run: AgentRun) -> tuple[str
         if active is not None:
             skill, revision = active
             active_skill = (
-                "\n\n"
-                f"Active skill: {skill.name} v{revision.version}\n"
-                f"{revision.instruction}"
+                f"\n\nActive skill: {skill.name} v{revision.version}\n{revision.instruction}"
             )
 
     skills = await registry.list_published_skills(run.tenant_id)

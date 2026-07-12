@@ -64,9 +64,7 @@ async def decide_approval(
     if approval is None:
         raise HTTPException(status_code=404, detail="approval request not found")
     if approval.status != ApprovalStatus.pending:
-        raise HTTPException(
-            status_code=409, detail=f"approval request already {approval.status}"
-        )
+        raise HTTPException(status_code=409, detail=f"approval request already {approval.status}")
 
     if principal.user is not None:
         if body.decided_by_user_id is not None and body.decided_by_user_id != principal.user.id:

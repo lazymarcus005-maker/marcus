@@ -103,5 +103,9 @@ async def test_amain_first_time_setup_saves_config(monkeypatch, tmp_path):
 
     await cli._amain("setup")
 
-    assert saved == {"api_key": "sk-new", "base_url": "https://api.example.com/v1", "model": "model-new"}
+    assert saved == {
+        "api_key": "sk-new",
+        "base_url": "https://api.example.com/v1",
+        "model": "model-new",
+    }
     assert _FakeGateway.instances[0].closed is True

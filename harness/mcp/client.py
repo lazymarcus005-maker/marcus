@@ -77,7 +77,9 @@ class _McpSessionContext:
             read_stream, write_stream, _ = await self._stack.enter_async_context(
                 streamablehttp_client(self._server.base_url, headers=_headers(self._server))
             )
-            session = await self._stack.enter_async_context(ClientSession(read_stream, write_stream))
+            session = await self._stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
             await session.initialize()
             return session
         except (KeyboardInterrupt, SystemExit):
@@ -102,7 +104,9 @@ class _McpSessionContext:
                 # usually the real cause, and more useful than `exc` (often
                 # just a CancelledError a sibling task saw as a side effect).
                 detail = _describe(cleanup_exc)
-            raise McpError(f"failed to connect to MCP server {self._server.name!r}: {detail}") from exc
+            raise McpError(
+                f"failed to connect to MCP server {self._server.name!r}: {detail}"
+            ) from exc
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self._stack.aclose()
@@ -116,7 +120,10 @@ def _normalize_result(result: CallToolResult) -> dict:
     """
     text_parts = [block.text for block in result.content if isinstance(block, TextContent)]
     other_blocks = [block.type for block in result.content if not isinstance(block, TextContent)]
-    normalized: dict[str, Any] = {"content": "\n".join(text_parts), "is_error": bool(result.isError)}
+    normalized: dict[str, Any] = {
+        "content": "\n".join(text_parts),
+        "is_error": bool(result.isError),
+    }
     if other_blocks:
         normalized["non_text_content_types"] = other_blocks
     if result.structuredContent is not None:

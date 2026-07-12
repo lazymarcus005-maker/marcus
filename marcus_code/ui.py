@@ -156,7 +156,11 @@ class TerminalUI:
     ) -> None:
         elapsed = (datetime.now() - session_started_at).total_seconds()
         budget = "unlimited" if max_total_tokens is None else f"{max_total_tokens:,}"
-        remaining = "unlimited" if max_total_tokens is None else f"{max(0, max_total_tokens - stats.total_tokens):,}"
+        remaining = (
+            "unlimited"
+            if max_total_tokens is None
+            else f"{max(0, max_total_tokens - stats.total_tokens):,}"
+        )
         self.console.print(
             Panel.fit(
                 f"[bold]LLM calls[/bold]         : {stats.llm_calls}\n"
@@ -173,7 +177,9 @@ class TerminalUI:
             )
         )
 
-    def run_first_time_setup(self, *, default_base_url: str, default_model: str) -> tuple[str, str, str] | None:
+    def run_first_time_setup(
+        self, *, default_base_url: str, default_model: str
+    ) -> tuple[str, str, str] | None:
         """Prompt for LLM credentials on first run. Returns (api_key, base_url,
         model) to be saved to ~/.marcus/config.toml, or None if the user
         cancelled (Ctrl+C/EOF/blank key) — the caller proceeds without saving
@@ -192,14 +198,18 @@ class TerminalUI:
             # Note: avoid literal square brackets in Console.input/print text
             # — Rich parses "[...]" as markup, so "[default]" silently
             # vanishes instead of printing (see the (y)/(n)/(a) prompt below).
-            base_url = self.console.input(
-                f"LLM base URL (default: {escape(default_base_url)}): "
-            ).strip() or default_base_url
+            base_url = (
+                self.console.input(f"LLM base URL (default: {escape(default_base_url)}): ").strip()
+                or default_base_url
+            )
             api_key = self.console.input("LLM API key: ").strip()
             if not api_key:
                 self.console.print("[yellow]no API key entered — skipping setup[/yellow]")
                 return None
-            model = self.console.input(f"LLM model (default: {escape(default_model)}): ").strip() or default_model
+            model = (
+                self.console.input(f"LLM model (default: {escape(default_model)}): ").strip()
+                or default_model
+            )
         except (KeyboardInterrupt, EOFError):
             self.console.print("\n[yellow]setup cancelled[/yellow]")
             return None
@@ -248,9 +258,13 @@ class TerminalUI:
             # Note: avoid literal square brackets in text passed through
             # Console.input/print — Rich parses "[...]" as markup tags, so
             # e.g. "[y]es" silently vanishes instead of printing.
-            answer = self.console.input(
-                "[bold]Allow this tool call?[/bold] (y)es / (n)o / (a)lways for this session: "
-            ).strip().lower()
+            answer = (
+                self.console.input(
+                    "[bold]Allow this tool call?[/bold] (y)es / (n)o / (a)lways for this session: "
+                )
+                .strip()
+                .lower()
+            )
             if answer in ("y", "yes"):
                 return "yes"
             if answer in ("n", "no"):

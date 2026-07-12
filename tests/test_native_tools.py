@@ -47,7 +47,9 @@ async def test_fetch_url_strips_html_and_returns_text():
     body = b"<html><head><style>.x{}</style></head><body><h1>Hi</h1><p>World</p></body></html>"
     with patch(
         "harness.runtime.native_tools.httpx.AsyncClient",
-        return_value=_FakeAsyncClient(_FakeResponse(content=body, headers={"content-type": "text/html"})),
+        return_value=_FakeAsyncClient(
+            _FakeResponse(content=body, headers={"content-type": "text/html"})
+        ),
     ):
         tool = build_fetch_url_tool(settings)
         result = await tool.handler({"url": "https://example.com/page"})
@@ -72,7 +74,9 @@ async def test_fetch_url_truncates_large_content():
     settings = Settings(tools_fetch_url_max_bytes=10)
     with patch(
         "harness.runtime.native_tools.httpx.AsyncClient",
-        return_value=_FakeAsyncClient(_FakeResponse(content=b"0123456789ABCDEF", headers={"content-type": "text/plain"})),
+        return_value=_FakeAsyncClient(
+            _FakeResponse(content=b"0123456789ABCDEF", headers={"content-type": "text/plain"})
+        ),
     ):
         tool = build_fetch_url_tool(settings)
         result = await tool.handler({"url": "https://example.com/page"})
@@ -159,7 +163,7 @@ async def test_run_cli_times_out(tmp_path):
         tools_fs_root=str(tmp_path), tools_run_cli_enabled=True, tools_run_cli_timeout_seconds=0.01
     )
     tool = build_run_cli_tool(settings)
-    sleep_command = "python -c \"import time; time.sleep(2)\""
+    sleep_command = 'python -c "import time; time.sleep(2)"'
 
     with pytest.raises(ValueError, match="timed out"):
         await tool.handler({"command": sleep_command})
