@@ -7,8 +7,8 @@ from httpx import ASGITransport, AsyncClient
 from harness.api.app import create_app
 from harness.auth import create_api_key
 from harness.db.enums import UserRole
-from harness.db.session import get_session
 from harness.db.models import Tenant, User
+from harness.db.session import get_session
 
 
 @pytest.fixture
