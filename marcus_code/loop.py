@@ -9,8 +9,10 @@ from harness.llm.gateway import LLMError, LLMGateway, LLMTransientError
 from harness.llm.types import LLMMessage, ToolCall, Usage
 from harness.runtime.guardrails import REPEATED_CALL_WINDOW
 from harness.runtime.result_pipeline import truncate_result
+from harness.runtime.tool_validation import ToolArgumentError, normalize_and_validate_arguments
 from harness.runtime.tools import Tool
 from marcus_code.modes import AgentMode, tool_is_allowed, tool_requires_approval
+from marcus_code.task_contract import derive_task_contract, is_verification_evidence
 from marcus_code.ui import TerminalUI
 
 DEFAULT_MAX_STEPS = 100
@@ -92,6 +94,8 @@ class MarcusLoop:
         max_consecutive_tool_failures: int = 5,
         max_safe_tool_retries: int = 2,
         llm_recovery_timeout_seconds: float = 90.0,
+        max_tool_calls_per_step: int = 1,
+        max_argument_repairs: int = 1,
     ) -> None:
         self.llm = llm
         self.tools_by_name = {t.name: t for t in tools}
@@ -110,6 +114,8 @@ class MarcusLoop:
         self.max_consecutive_tool_failures = max_consecutive_tool_failures
         self.max_safe_tool_retries = max_safe_tool_retries
         self.llm_recovery_timeout_seconds = llm_recovery_timeout_seconds
+        self.max_tool_calls_per_step = max_tool_calls_per_step
+        self.max_argument_repairs = max_argument_repairs
         self.state = SessionState()
         self.usage = UsageStats()
         self.started_at = datetime.now()
@@ -122,6 +128,12 @@ class MarcusLoop:
         self.state.history.append(LLMMessage(role="user", content=user_input))
         recent_calls: list[tuple[str, dict]] = []
         consecutive_tool_failures = 0
+        argument_failures: dict[str, int] = {}
+        contract = derive_task_contract(user_input)
+        plan_shown = False
+        verification_succeeded = False
+        finalization_repairs = 0
+        outcome_fingerprints: list[tuple[str, str]] = []
 
         for _ in range(self.max_steps):
             self._trim_history()
@@ -193,6 +205,24 @@ class MarcusLoop:
             )
 
             if not response.tool_calls:
+                if contract.requires_verification and not verification_succeeded:
+                    if finalization_repairs < 1:
+                        finalization_repairs += 1
+                        self.state.history.append(
+                            LLMMessage(
+                                role="system",
+                                content=(
+                                    "Finalization denied by runtime: this task explicitly requires "
+                                    "verification, but no successful build/test/HTTP evidence exists. "
+                                    "Run one appropriate verification tool, then summarize its result."
+                                ),
+                            )
+                        )
+                        continue
+                    self.ui.print_guardrail_stop(
+                        "final answer blocked: requested verification has no successful evidence"
+                    )
+                    return
                 self._trim_history()
                 if response.content:
                     if hasattr(self.ui, "print_final_answer"):
@@ -205,8 +235,33 @@ class MarcusLoop:
 
             if response.content:
                 self.ui.print_assistant(response.content)
+                plan_shown = True
+            elif contract.requires_plan and not plan_shown:
+                self.ui.print_assistant("Plan: inspect the current state, make the change, then verify it.")
+                plan_shown = True
 
-            for call in response.tool_calls:
+            for call_index, call in enumerate(response.tool_calls):
+                if call_index >= self.max_tool_calls_per_step:
+                    error = (
+                        "only one tool call is allowed per reasoning step; "
+                        "inspect its result before choosing the next action"
+                    )
+                    self.ui.print_tool_error(call.name, error)
+                    observation = {
+                        "status": "error",
+                        "error": error,
+                        "code": "POLICY_DENIED",
+                        "retryable": True,
+                    }
+                    self.state.history.append(
+                        LLMMessage(
+                            role="tool",
+                            tool_call_id=call.id,
+                            name=call.name,
+                            content=orjson.dumps(observation).decode(),
+                        )
+                    )
+                    continue
                 key = (call.name, call.arguments)
                 recent_calls.append(key)
                 if len(recent_calls) >= REPEATED_CALL_WINDOW and all(
@@ -219,6 +274,36 @@ class MarcusLoop:
                     return
 
                 observation = await self._process_tool_call(call)
+                if is_verification_evidence(call.name, call.arguments, observation):
+                    verification_succeeded = True
+                fingerprint = (
+                    call.name,
+                    str(observation.get("code") or orjson.dumps(observation, option=orjson.OPT_SORT_KEYS).decode()),
+                )
+                outcome_fingerprints.append(fingerprint)
+                if len(outcome_fingerprints) >= 3 and all(
+                    item == fingerprint for item in outcome_fingerprints[-3:]
+                ):
+                    self.ui.print_guardrail_stop(
+                        f"no progress after 3 calls to {call.name!r}; stopped to prevent a loop"
+                    )
+                    return
+                if observation.get("code") == "INVALID_ARGUMENT":
+                    argument_failures[call.name] = argument_failures.get(call.name, 0) + 1
+                    if argument_failures[call.name] > self.max_argument_repairs:
+                        self.state.history.append(
+                            LLMMessage(
+                                role="tool",
+                                tool_call_id=call.id,
+                                name=call.name,
+                                content=orjson.dumps(observation).decode(),
+                            )
+                        )
+                        self.ui.print_guardrail_stop(
+                            f"argument repair budget exhausted for {call.name!r} "
+                            f"({self.max_argument_repairs})"
+                        )
+                        return
                 if "error" in observation and "declined" not in str(observation["error"]):
                     consecutive_tool_failures += 1
                 else:
@@ -318,6 +403,12 @@ class MarcusLoop:
             error = f"unknown tool: {call.name}"
             self.ui.print_tool_error(call.name, error)
             return {"error": error}
+
+        try:
+            call.arguments = normalize_and_validate_arguments(tool.parameters, call.arguments)
+        except ToolArgumentError as exc:
+            self.ui.print_tool_error(call.name, str(exc))
+            return {"error": str(exc), "code": exc.code, "retryable": True}
 
         self.ui.print_tool_call(call.name, call.arguments)
 

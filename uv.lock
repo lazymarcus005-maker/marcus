@@ -843,7 +843,6 @@ dependencies = [
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "opentelemetry-sdk" },
     { name = "orjson" },
-    { name = "playwright" },
     { name = "prometheus-client" },
     { name = "prompt-toolkit" },
     { name = "pydantic" },
@@ -861,6 +860,9 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+]
+ollama-usage = [
+    { name = "playwright" },
 ]
 
 [package.dev-dependencies]
@@ -888,7 +890,7 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-fastapi", specifier = ">=0.50b0" },
     { name = "opentelemetry-sdk", specifier = ">=1.29.0" },
     { name = "orjson", specifier = ">=3.10.7" },
-    { name = "playwright", specifier = ">=1.49.0" },
+    { name = "playwright", marker = "extra == 'ollama-usage'", specifier = ">=1.49.0" },
     { name = "prometheus-client", specifier = ">=0.21.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.43" },
     { name = "pydantic", specifier = ">=2.9.0" },
@@ -902,7 +904,7 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.35" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["ollama-usage", "dev"]
 
 [package.metadata.requires-dev]
 dev = [

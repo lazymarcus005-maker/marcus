@@ -76,3 +76,37 @@ async def check_repeated_calls(
             f"tool {tool_name!r} called with identical arguments {window} times in a row",
             status=RunStatus.failed,
         )
+
+
+async def check_no_progress(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    *,
+    window: int = REPEATED_CALL_WINDOW,
+) -> None:
+    """Stop cosmetic argument changes that keep producing the same outcome."""
+    result = await session.execute(
+        sa.select(
+            ToolExecution.tool_name,
+            ToolExecution.status,
+            ToolExecution.error,
+            ToolExecution.result,
+        )
+        .where(ToolExecution.run_id == run_id)
+        .order_by(ToolExecution.started_at.desc())
+        .limit(window)
+    )
+    rows = result.all()
+    if len(rows) < window:
+        return
+
+    def signature(row) -> tuple:
+        error_code = (row.error or "").partition(":")[0]
+        return row.tool_name, row.status, error_code, row.result
+
+    first = signature(rows[0])
+    if all(signature(row) == first for row in rows[1:]):
+        raise GuardrailViolation(
+            f"no progress after {window} calls to {rows[0].tool_name!r}",
+            status=RunStatus.failed,
+        )

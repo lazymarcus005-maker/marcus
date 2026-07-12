@@ -63,6 +63,7 @@ class Usage:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    source: Literal["provider", "estimated"] = "provider"
 
 
 @dataclass

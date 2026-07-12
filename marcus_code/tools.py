@@ -1,11 +1,7 @@
 import asyncio
-import contextlib
 import ipaddress
-import os
 import re
-import signal
 import socket
-import subprocess
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -17,7 +13,15 @@ import httpx
 
 from harness.config import Settings
 from harness.db.enums import RiskTier
+from harness.runtime.command_policy import inspect_shell_command
+from harness.runtime.file_writes import atomic_write_text
 from harness.runtime.native_tools import _strip_html
+from harness.runtime.processes import (
+    close_process_transport,
+    process_group_kwargs,
+    terminate_process_tree,
+)
+from harness.runtime.redaction import redact_secrets
 from harness.runtime.tools import Tool
 
 READ_FILE_TOOL_NAME = "read_file"
@@ -50,31 +54,6 @@ _MAX_LIST_RESULTS = 200
 _MAX_GREP_MATCHES = 200
 _MAX_GREP_FILE_BYTES = 2_000_000  # skip files larger than this when grepping
 
-_SECRET_FILE_NAMES = {".env", ".env.local", ".env.production", "credentials.json"}
-_PRIVATE_KEY_PATTERN = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S
-)
-_CREDENTIAL_PATTERN = re.compile(
-    r"(?i)(api[_-]?key|secret|password|token|authorization)(\s*[:=]\s*)(['\"]?)[^\s'\"]+\3"
-)
-
-
-def _redact_secrets(path: str, content: str) -> tuple[str, int]:
-    name = Path(path).name.lower()
-    redactions = 0
-    if name in _SECRET_FILE_NAMES or name.endswith((".pem", ".key")):
-        redactions += 1
-        return "[REDACTED SENSITIVE FILE CONTENT]", redactions
-    redacted = content
-    redacted, count = _PRIVATE_KEY_PATTERN.subn("[REDACTED PRIVATE KEY]", redacted)
-    redactions += count
-    redacted, count = _CREDENTIAL_PATTERN.subn(
-        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted
-    )
-    redactions += count
-    return redacted, redactions
-
-
 def _resolve_scoped_path(root: Path, relative_path: str) -> Path:
     """Resolve relative_path under root, refusing any path that escapes it.
 
@@ -103,7 +82,7 @@ def build_read_file_tool(root: Path) -> Tool:
         if not resolved.is_file():
             raise ValueError(f"file not found: {path}")
         content = resolved.read_text(encoding="utf-8", errors="replace")
-        safe_content, redactions = _redact_secrets(path, content)
+        safe_content, redactions = redact_secrets(path, content)
         return {
             "path": path,
             "content": safe_content,
@@ -134,9 +113,7 @@ def build_write_file_tool(root: Path) -> Tool:
         if not path or content is None:
             raise ValueError("write_file requires 'path' and 'content' fields")
         resolved = _resolve_scoped_path(root, path)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
-        return {"path": path, "bytes_written": len(content.encode("utf-8"))}
+        return {"path": path, **atomic_write_text(resolved, content)}
 
     return Tool(
         name=WRITE_FILE_TOOL_NAME,
@@ -183,8 +160,12 @@ def build_edit_file_tool(root: Path) -> Tool:
             )
 
         updated = original.replace(old_string, new_string, 1)
-        resolved.write_text(updated, encoding="utf-8")
-        return {"path": path, "old_string": old_string, "new_string": new_string}
+        return {
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+            **atomic_write_text(resolved, updated),
+        }
 
     return Tool(
         name=EDIT_FILE_TOOL_NAME,
@@ -318,27 +299,23 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
         command = arguments.get("command")
         if not command:
             raise ValueError("run_cli requires a 'command' field")
+        metadata = inspect_shell_command(command)
 
         cwd = root.resolve()
-        process_group_args = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-            if os.name == "nt"
-            else {"start_new_session": True}
-        )
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **process_group_args,
+            **process_group_kwargs(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=settings.tools_run_cli_timeout_seconds
             )
         except TimeoutError as exc:
-            await _terminate_process_tree(proc, drain_pipes=True)
-            _close_process_transport(proc)
+            await terminate_process_tree(proc, drain_pipes=True)
+            close_process_transport(proc)
             raise ValueError(
                 f"command timed out after {settings.tools_run_cli_timeout_seconds}s"
             ) from exc
@@ -350,8 +327,9 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
             "exit_code": proc.returncode,
             "stdout": stdout[:max_bytes].decode("utf-8", errors="replace"),
             "stderr": stderr[:max_bytes].decode("utf-8", errors="replace"),
+            **metadata.as_dict(),
         }
-        _close_process_transport(proc)
+        close_process_transport(proc)
         return result
 
     return Tool(
@@ -370,41 +348,6 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
         handler=handler,
         risk_tier=RiskTier.destructive,
     )
-
-
-async def _terminate_process_tree(
-    proc: asyncio.subprocess.Process, *, drain_pipes: bool = False
-) -> None:
-    """Terminate the shell and all descendants without hanging on inherited pipes."""
-    if proc.returncode is not None:
-        return
-    if os.name == "nt":
-        killer = await asyncio.create_subprocess_exec(
-            "taskkill", "/PID", str(proc.pid), "/T", "/F",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await killer.communicate()
-        _close_process_transport(killer)
-    else:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-    try:
-        if drain_pipes:
-            await asyncio.wait_for(proc.communicate(), timeout=2)
-        else:
-            await asyncio.wait_for(proc.wait(), timeout=2)
-    except TimeoutError:
-        proc.kill()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(proc.wait(), timeout=2)
-
-
-def _close_process_transport(proc: asyncio.subprocess.Process) -> None:
-    """Release asyncio's platform transport before the event loop is closed."""
-    transport = getattr(proc, "_transport", None)
-    if transport is not None:
-        transport.close()
 
 
 @dataclass
@@ -426,17 +369,13 @@ class BackgroundProcessManager:
         self._processes: dict[str, _ManagedProcess] = {}
 
     async def start(self, command: str) -> dict[str, Any]:
-        process_group_args = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-            if os.name == "nt"
-            else {"start_new_session": True}
-        )
+        metadata = inspect_shell_command(command)
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=str(self.root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **process_group_args,
+            **process_group_kwargs(),
         )
         process_id = uuid.uuid4().hex[:12]
         managed = _ManagedProcess(command=command, process=proc)
@@ -453,6 +392,7 @@ class BackgroundProcessManager:
             "command": command,
             "cwd": str(self.root),
             "status": self._status(proc),
+            **metadata.as_dict(),
         }
 
     async def _capture(
@@ -484,9 +424,9 @@ class BackgroundProcessManager:
 
     async def stop(self, process_id: str) -> dict[str, Any]:
         canonical_id, managed = self._get(process_id)
-        await _terminate_process_tree(managed.process)
+        await terminate_process_tree(managed.process)
         await asyncio.gather(*managed.reader_tasks, return_exceptions=True)
-        _close_process_transport(managed.process)
+        close_process_transport(managed.process)
         return {
             "process_id": canonical_id,
             "status": "stopped",

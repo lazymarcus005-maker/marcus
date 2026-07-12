@@ -75,6 +75,26 @@ def test_saved_login_is_detected_from_storage_state(tmp_path):
     assert client.has_profile is True
 
 
+def test_logout_removes_saved_session_cache_and_browser_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr("marcus_code.ollama_usage.Path.home", lambda: tmp_path)
+    marcus_home = tmp_path / ".marcus"
+    profile = marcus_home / "browser-profile"
+    profile.mkdir(parents=True)
+    (profile / "cookie-db").write_text("secret", encoding="utf-8")
+    state = marcus_home / "state.json"
+    cache = marcus_home / "cache.json"
+    state.write_text("{}", encoding="utf-8")
+    cache.write_text("{}", encoding="utf-8")
+    client = OllamaCloudUsageClient(profile, state)
+
+    removed = client.logout(cache_file=cache)
+
+    assert removed == 3
+    assert not profile.exists()
+    assert not state.exists()
+    assert not cache.exists()
+
+
 @pytest.mark.asyncio
 async def test_plain_usage_fetches_with_saved_cookies_without_browser(tmp_path, monkeypatch):
     state_file = tmp_path / "storage-state.json"

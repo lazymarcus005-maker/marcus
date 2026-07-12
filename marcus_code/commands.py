@@ -55,8 +55,8 @@ async def _cmd_model(ctx: CommandContext, args: str) -> None:
 
 async def _cmd_usage(ctx: CommandContext, args: str) -> None:
     action = args.strip().lower()
-    if action not in {"", "login"}:
-        ctx.ui.print_error("usage: /usage or /usage login")
+    if action not in {"", "login", "logout"}:
+        ctx.ui.print_error("usage: /usage, /usage login, or /usage logout")
         return
     ctx.ui.print_usage(
         ctx.loop.usage,
@@ -67,6 +67,14 @@ async def _cmd_usage(ctx: CommandContext, args: str) -> None:
         return
 
     client = OllamaCloudUsageClient()
+    if action == "logout":
+        try:
+            removed = client.logout()
+        except OllamaUsageError as exc:
+            ctx.ui.print_error(f"Ollama Cloud logout failed: {exc}")
+            return
+        ctx.ui.print_info(f"Ollama Cloud login data cleared ({removed} item(s)).")
+        return
     # Only the explicit login command may open a visible browser. Plain
     # /usage must remain non-interactive and use the saved session state.
     interactive = action == "login"

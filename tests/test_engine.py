@@ -39,6 +39,18 @@ def _search_tool() -> Tool:
     )
 
 
+def _failing_tool() -> Tool:
+    async def handler(arguments: dict) -> dict:
+        raise RuntimeError("backend unavailable")
+
+    return Tool(
+        name="failing_tool",
+        description="Always fails.",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+    )
+
+
 @pytest.mark.asyncio
 async def test_engine_runs_tool_then_finishes(db_session):
     run = await _make_run(db_session)
@@ -54,7 +66,10 @@ async def test_engine_runs_tool_then_finishes(db_session):
     final = await engine.run_until_blocked(run.id)
 
     assert final.status == RunStatus.completed
-    assert final.final_result == {"result": "found root cause", "summary": "done"}
+    assert final.final_result["result"] == "found root cause"
+    assert final.final_result["summary"] == "done"
+    assert final.final_result["status"] == "ok"
+    assert final.final_result["evidence_id"]
     assert final.current_step == 2
 
     steps = (
@@ -133,8 +148,28 @@ async def test_engine_finish_without_result_is_rejected_then_retried(db_session)
     final = await engine.run_until_blocked(run.id)
 
     assert final.status == RunStatus.completed
-    assert final.final_result == {"result": "corrected"}
+    assert final.final_result["result"] == "corrected"
+    assert final.final_result["status"] == "ok"
     assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_engine_blocks_success_after_unresolved_tool_failure(db_session):
+    run = await _make_run(db_session)
+    llm = ScriptedLLMGateway(
+        [
+            tool_call_response("failing_tool", {}),
+            tool_call_response("finish", {"result": "done"}),
+            tool_call_response("finish", {"result": "backend unavailable", "outcome": "failed"}),
+        ]
+    )
+    engine = RunEngine(db_session, llm, tools=[_failing_tool()])
+
+    final = await engine.run_until_blocked(run.id)
+
+    assert final.status == RunStatus.completed
+    assert final.final_result["outcome"] == "failed"
+    assert len(llm.calls) == 3
 
 
 @pytest.mark.asyncio

@@ -167,6 +167,26 @@ async def test_usage_command_fetches_ollama_cloud_usage(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_usage_logout_clears_saved_ollama_session(monkeypatch):
+    class _Client:
+        def logout(self):
+            return 3
+
+    monkeypatch.setattr("marcus_code.commands.OllamaCloudUsageClient", _Client)
+    ui = _FakeUI()
+    settings = Settings(
+        llm_api_key="sk-real",
+        llm_base_url="https://ollama.com/v1",
+        llm_model="model",
+    )
+    ctx = _make_ctx(ui, settings=settings)
+
+    await dispatch(ctx, "/usage logout")
+
+    assert any("login data cleared" in message for message in ui.info)
+
+
+@pytest.mark.asyncio
 async def test_config_command_with_no_args_shows_current_settings():
     ui = _FakeUI()
     ctx = _make_ctx(ui)

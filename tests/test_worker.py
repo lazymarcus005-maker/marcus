@@ -54,7 +54,9 @@ async def test_process_message_runs_to_completion_and_releases_lease(db_sessionm
         repo = RunRepository(session)
         final = await repo.get(run_id)
         assert final.status == RunStatus.completed
-        assert final.final_result == {"result": "disk usage is 42%"}
+        assert final.final_result["result"] == "disk usage is 42%"
+        assert final.final_result["status"] == "ok"
+        assert final.final_result["evidence_id"]
         assert final.lease_owner is None
 
 

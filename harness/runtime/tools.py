@@ -1,3 +1,4 @@
+import enum
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -7,6 +8,46 @@ from harness.db.enums import RiskTier
 from harness.llm.types import ToolSpec
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[Any]]
+
+
+class ToolErrorCode(enum.StrEnum):
+    invalid_argument = "INVALID_ARGUMENT"
+    unknown_tool = "UNKNOWN_TOOL"
+    approval_denied = "APPROVAL_DENIED"
+    execution_failed = "EXECUTION_FAILED"
+    outcome_unknown = "OUTCOME_UNKNOWN"
+    policy_denied = "POLICY_DENIED"
+
+
+class ToolRuntimeError(RuntimeError):
+    def __init__(
+        self, message: str, *, code: ToolErrorCode, retryable: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+def error_observation(
+    message: str,
+    *,
+    code: ToolErrorCode | str,
+    retryable: bool,
+    evidence_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    observation: dict[str, Any] = {
+        "status": "error",
+        "error": message,
+        "code": str(code),
+        "retryable": retryable,
+    }
+    if evidence_id is not None:
+        observation["evidence_id"] = str(evidence_id)
+    return observation
+
+
+def success_observation(result: dict[str, Any], *, evidence_id: uuid.UUID) -> dict[str, Any]:
+    return {**result, "status": "ok", "evidence_id": str(evidence_id)}
 
 
 @dataclass

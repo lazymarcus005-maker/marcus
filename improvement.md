@@ -11,6 +11,32 @@ worker, LLM gateway, tool execution, MCP, skills, context compaction และ t
 - ฟื้นตัวได้เมื่อ provider หรือ tool มีปัญหา แต่ไม่ retry จนเกิด loop
 - ตรวจสอบย้อนหลังได้ว่า “ระบบสรุปว่าสำเร็จจากหลักฐานอะไร”
 
+## Implementation status (2026-07-12)
+
+ส่วน correctness baseline ที่ลงมือแล้วในรอบนี้:
+
+- JSON Schema validation และ conservative type coercion ก่อน approval/handler ทั้ง server และ CLI
+- typed `INVALID_ARGUMENT` observation ที่บันทึกลง durable tool execution
+- shared process-tree termination และ bounded pipe cleanup สำหรับ CLI/server บน Windows/POSIX
+- production configuration แบบ fail-closed: ห้าม default secrets และ legacy auth ใน production
+- shared secret redaction สำหรับ `.env`, credentials, private keys และ inline tokens ก่อนเข้า model context
+- server compaction อิง context-window แยกจาก cumulative token budget และบันทึก usage ของ summary call
+- conservative finish gate: ห้ามรายงาน `succeeded` เมื่อ tool ล่าสุดยัง failed/unknown;
+  สามารถรายงาน failure อย่างตรงไปตรงมาด้วย `outcome='failed'`
+- typed tool outcome (`status`, `code`, `retryable`, `evidence_id`) และ error taxonomy กลาง
+- weak-model controls: หนึ่ง tool call ต่อ reasoning step และ argument-repair budget ที่มีขอบเขต
+- collision-safe MCP names (`domain__tool` เมื่อชื่อซ้ำ) และไม่นับ MCP error เป็น success evidence
+- provider usage fallback แบบ conservative พร้อม `source='estimated'` เมื่อ provider ไม่ส่ง usage
+- Playwright เป็น optional `ollama-usage` extra และ `/usage logout` ลบ cookie/cache/profile
+- deterministic task contract สำหรับ plan/verification และ CLI finalization gate
+- no-progress fingerprint จับ cosmetic retry ที่ได้ error/result เดิมทั้ง CLI/server
+- shared command policy บล็อก environment/secret dumps พร้อม category และ command hash
+- atomic file writes พร้อม pre-image/post-image SHA-256 สำหรับ audit และ crash safety
+
+รายการที่ยังเป็น roadmap (เช่น task-contract/evidence gate แบบเต็ม, MCP namespacing,
+encrypted browser state และ deterministic evaluation corpus) ระบุไว้ตาม phase ด้านล่าง
+และไม่ควรถูกนับว่า implement แล้วเพียงเพราะมีในเอกสารนี้
+
 เอกสารนี้ไม่เสนอ multi-agent ในระยะใกล้ เพราะ single-agent runtime ยังลดความเสี่ยงและ
 ต้นทุนได้อีกมาก การเพิ่ม agent หลายตัวก่อนแก้ control plane จะเพิ่มทั้ง hallucination,
 token cost และ failure surface
@@ -642,4 +668,3 @@ untrusted_content_policy = "data_only"
 
 แนวทางนี้ทำให้โมเดลระดับล่าง–กลางใช้งานได้ดีขึ้นโดยไม่ต้องหวังว่า prompt จะควบคุม
 พฤติกรรมได้ทุกครั้ง และยังลดค่าใช้จ่ายเพราะจำนวน repair/retry/verification ที่ไม่จำเป็นลดลง
-

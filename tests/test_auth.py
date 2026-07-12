@@ -61,6 +61,24 @@ async def test_missing_api_key_returns_401_once_keys_exist(client, db_sessionmak
 
 
 @pytest.mark.asyncio
+async def test_legacy_tenant_header_can_be_disabled(client, app, db_sessionmaker):
+    app.state.settings.legacy_auth_enabled = False
+    async with db_sessionmaker() as session:
+        tenant = Tenant(name=f"t-{uuid.uuid4()}")
+        session.add(tenant)
+        await session.commit()
+
+    resp = await client.post(
+        "/v1/runs",
+        json={"goal": "do something"},
+        headers={"X-Tenant-Id": str(tenant.id)},
+    )
+
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "missing API key"
+
+
+@pytest.mark.asyncio
 async def test_api_key_scopes_runs_to_own_tenant(client, db_sessionmaker):
     async with db_sessionmaker() as session:
         tenant_a, _user_a, key_a = await _tenant_user_key(session)

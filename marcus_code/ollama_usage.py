@@ -148,6 +148,23 @@ class OllamaCloudUsageClient:
     def has_profile(self) -> bool:
         return self.storage_state_file.is_file()
 
+    def logout(self, *, cache_file: Path = OLLAMA_PROFILE_CACHE_FILE) -> int:
+        """Delete saved browser credentials and cached identity for Ollama Cloud."""
+        removed = 0
+        for path in (self.storage_state_file, cache_file):
+            if path.is_file():
+                path.unlink()
+                removed += 1
+
+        profile = self.profile_dir.resolve()
+        marcus_home = (Path.home() / ".marcus").resolve()
+        if profile.is_dir():
+            if profile == marcus_home or marcus_home not in profile.parents:
+                raise OllamaUsageError("refusing to remove browser profile outside ~/.marcus")
+            shutil.rmtree(profile)
+            removed += 1
+        return removed
+
     async def fetch(self, *, interactive: bool = False) -> OllamaCloudUsage:
         if not interactive:
             return await self._fetch_via_http()
@@ -157,7 +174,7 @@ class OllamaCloudUsageClient:
             from playwright.async_api import async_playwright
         except ImportError as exc:
             raise OllamaUsageError(
-                "Playwright is not installed; reinstall Marcus to enable Ollama usage."
+                "Playwright is not installed; install Marcus with the ollama-usage extra."
             ) from exc
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)

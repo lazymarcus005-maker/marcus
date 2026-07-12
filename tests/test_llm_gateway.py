@@ -45,6 +45,20 @@ async def test_complete_parses_basic_response():
 
 
 @pytest.mark.asyncio
+async def test_complete_estimates_usage_when_provider_omits_it():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _openai_response(content="answer")
+        body.pop("usage")
+        return httpx.Response(200, json=body)
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete([LLMMessage(role="user", content="hello")])
+
+    assert response.usage.total_tokens > 0
+    assert response.usage.source == "estimated"
+
+
+@pytest.mark.asyncio
 async def test_complete_stream_emits_text_deltas():
     body = "\n".join(
         [

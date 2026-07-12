@@ -128,6 +128,8 @@ async def _amain(prompt: str | None = None, mode: AgentMode | None = None) -> No
         compact_threshold_percent=settings.cli_compact_threshold_percent,
         compact_target_percent=settings.cli_compact_target_percent,
         llm_recovery_timeout_seconds=settings.cli_llm_recovery_timeout_seconds,
+        max_tool_calls_per_step=settings.cli_max_tool_calls_per_step,
+        max_argument_repairs=settings.cli_max_argument_repairs,
     )
     if hasattr(ui, "bind_status"):
         ui.bind_status(lambda: loop.status(str(root)))

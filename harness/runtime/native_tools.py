@@ -8,6 +8,14 @@ import httpx
 
 from harness.config import Settings
 from harness.db.enums import RiskTier
+from harness.runtime.command_policy import inspect_shell_command
+from harness.runtime.file_writes import atomic_write_text
+from harness.runtime.processes import (
+    close_process_transport,
+    process_group_kwargs,
+    terminate_process_tree,
+)
+from harness.runtime.redaction import redact_secrets
 from harness.runtime.tools import Tool, ToolHandler
 
 FINISH_TOOL_NAME = "finish"
@@ -30,6 +38,11 @@ FINISH_TOOL_SCHEMA = {
     "properties": {
         "result": {"description": "The final result or answer for the goal."},
         "summary": {"type": "string", "description": "Brief summary of what was done."},
+        "outcome": {
+            "type": "string",
+            "enum": ["succeeded", "failed"],
+            "description": "Whether the requested goal actually succeeded. Defaults to succeeded.",
+        },
     },
     "required": ["result"],
 }
@@ -329,10 +342,13 @@ def build_read_file_tool(settings: Settings) -> Tool:
 
         max_bytes = settings.tools_read_file_max_bytes
         data = resolved.read_bytes()
+        content = data[:max_bytes].decode("utf-8", errors="replace")
+        safe_content, redactions = redact_secrets(path, content)
         return {
             "path": path,
-            "content": data[:max_bytes].decode("utf-8", errors="replace"),
+            "content": safe_content,
             "truncated": len(data) > max_bytes,
+            "redacted": redactions > 0,
         }
 
     return Tool(
@@ -355,9 +371,7 @@ def build_write_file_tool(settings: Settings) -> Tool:
         if not path or content is None:
             raise ValueError("write_file requires 'path' and 'content' fields")
         resolved = _resolve_sandboxed_path(settings.tools_fs_root, path)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
-        return {"path": path, "bytes_written": len(content.encode("utf-8"))}
+        return {"path": path, **atomic_write_text(resolved, content)}
 
     return Tool(
         name=WRITE_FILE_TOOL_NAME,
@@ -379,6 +393,7 @@ def build_run_cli_tool(settings: Settings) -> Tool:
         command = arguments.get("command")
         if not command:
             raise ValueError("run_cli requires a 'command' field")
+        metadata = inspect_shell_command(command)
 
         cwd = Path(settings.tools_fs_root).resolve()
         cwd.mkdir(parents=True, exist_ok=True)
@@ -388,26 +403,30 @@ def build_run_cli_tool(settings: Settings) -> Tool:
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_group_kwargs(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=settings.tools_run_cli_timeout_seconds
             )
         except TimeoutError as exc:
-            proc.kill()
-            await proc.wait()
+            await terminate_process_tree(proc, drain_pipes=True)
+            close_process_transport(proc)
             raise ValueError(
                 f"command timed out after {settings.tools_run_cli_timeout_seconds}s"
             ) from exc
 
         max_bytes = settings.tools_run_cli_max_output_bytes
-        return {
+        result = {
             "command": command,
             "cwd": str(cwd),
             "exit_code": proc.returncode,
             "stdout": stdout[:max_bytes].decode("utf-8", errors="replace"),
             "stderr": stderr[:max_bytes].decode("utf-8", errors="replace"),
+            **metadata.as_dict(),
         }
+        close_process_transport(proc)
+        return result
 
     return Tool(
         name=RUN_CLI_TOOL_NAME,

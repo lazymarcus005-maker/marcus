@@ -40,6 +40,9 @@ async def require_principal(
             session, raw_key=raw_key, settings=request.app.state.settings
         )
 
+    if not request.app.state.settings.legacy_auth_enabled:
+        raise HTTPException(status_code=401, detail="missing API key")
+
     # Bootstrap/development compatibility: before a tenant has created its
     # first API key, existing X-Tenant-Id based tests and local clients can
     # still operate against that tenant. Once that tenant creates a key,

@@ -5,13 +5,21 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.config import get_settings
-from harness.db.enums import TERMINAL_RUN_STATUSES, MessageRole, RunStatus, StepType
-from harness.db.models import AgentRun, AgentStep
+from harness.db.enums import (
+    TERMINAL_RUN_STATUSES,
+    MessageRole,
+    RiskTier,
+    RunStatus,
+    StepType,
+    ToolExecutionStatus,
+)
+from harness.db.models import AgentRun, AgentStep, ToolExecution
 from harness.llm.gateway import LLMError, LLMGateway
 from harness.llm.types import ToolCall
 from harness.llm.usage import record_usage
 from harness.mcp.registry import McpRegistry
 from harness.mcp.tools import build_tool as build_mcp_tool
+from harness.mcp.tools import canonical_tool_name
 from harness.observability import LLM_TOKENS, RUN_DURATION, RUNS_COMPLETED, span
 from harness.runtime import guardrails, native_tools
 from harness.runtime.compaction import maybe_compact
@@ -30,7 +38,7 @@ from harness.runtime.native_tools import (
 )
 from harness.runtime.repository import RunRepository
 from harness.runtime.tool_executor import ToolExecutor
-from harness.runtime.tools import Tool
+from harness.runtime.tools import Tool, ToolErrorCode, ToolRuntimeError
 from harness.skills.registry import SkillRegistry
 from harness.skills.usage import record_skill_usage_for_run
 
@@ -71,6 +79,7 @@ class RunEngine:
         mcp_registry: McpRegistry | None = None,
     ) -> None:
         self.session = session
+        self.settings = get_settings()
         self.repo = RunRepository(session)
         self.llm = llm
         self.tool_executor = ToolExecutor(session)
@@ -80,7 +89,7 @@ class RunEngine:
         # the same progressive-disclosure flow as MCP servers (see
         # _build_list_domains_tool/_build_load_tool_tool below). setdefault
         # so tests passing an explicit `tools=` with the same name still win.
-        for builtin_tool in build_builtin_tools(get_settings()):
+        for builtin_tool in build_builtin_tools(self.settings):
             self.tools_by_name.setdefault(builtin_tool.name, builtin_tool)
         self._finish_tool = build_finish_tool()
         self._ask_user_tool = build_ask_user_tool()
@@ -253,7 +262,13 @@ class RunEngine:
 
         (in which case the run has already been checkpointed to Failed and committed).
         """
-        await maybe_compact(self.session, self.llm, run)
+        compact_usage = await maybe_compact(
+            self.session,
+            self.llm,
+            run,
+            context_window_tokens=self.settings.run_context_window_tokens,
+            threshold_fraction=self.settings.run_compact_threshold_percent / 100,
+        )
         if run.active_skill_revision_id is None:
             candidate = await select_skill_candidate(self.session, run)
             if candidate is not None:
@@ -330,7 +345,11 @@ class RunEngine:
             usage=response.usage,
         )
 
-        tokens_used = run.tokens_used + response.usage.total_tokens
+        tokens_used = (
+            run.tokens_used
+            + (compact_usage.total_tokens if compact_usage else 0)
+            + response.usage.total_tokens
+        )
         return tool_calls_payload, response.content, tokens_used
 
     async def _ensure_mcp_tools_loaded(self, tenant_id: uuid.UUID) -> None:
@@ -341,9 +360,24 @@ class RunEngine:
         """
         if self._mcp_tools_loaded:
             return
-        for server, mcp_tool in await self.mcp_registry.list_tools(tenant_id):
+        pairs = await self.mcp_registry.list_tools(tenant_id)
+        counts: dict[str, int] = {}
+        for _server, mcp_tool in pairs:
+            counts[mcp_tool.name] = counts.get(mcp_tool.name, 0) + 1
+        for server, mcp_tool in pairs:
+            exposed_name = (
+                canonical_tool_name(server, mcp_tool.name)
+                if counts[mcp_tool.name] > 1
+                else mcp_tool.name
+            )
             self.tools_by_name.setdefault(
-                mcp_tool.name, build_mcp_tool(server, mcp_tool, self.mcp_registry.client)
+                exposed_name,
+                build_mcp_tool(
+                    server,
+                    mcp_tool,
+                    self.mcp_registry.client,
+                    exposed_name=exposed_name,
+                ),
             )
         self._mcp_tools_loaded = True
 
@@ -355,9 +389,48 @@ class RunEngine:
                 id=raw_call["id"], name=raw_call["name"], arguments=raw_call["arguments"]
             )
 
+            if call_index >= self.settings.run_max_tool_calls_per_step:
+                async def deny_batched_call(arguments: dict[str, Any]) -> dict[str, Any]:
+                    raise ToolRuntimeError(
+                        "only one tool call is allowed per reasoning step; "
+                        "inspect its result before choosing the next action",
+                        code=ToolErrorCode.policy_denied,
+                        retryable=True,
+                    )
+
+                original = self.tools_by_name.get(call.name)
+                denied_tool = Tool(
+                    name=call.name,
+                    description="Denied batched tool call.",
+                    parameters=original.parameters if original else {"type": "object"},
+                    handler=deny_batched_call,
+                    risk_tier=original.risk_tier if original else RiskTier.read_only,
+                    idempotent=True,
+                )
+                await self.tool_executor.execute(
+                    run, step_no, call_index, call, tool=denied_tool
+                )
+                continue
+
             if call.name == FINISH_TOOL_NAME:
+                evidence_error = await self._finish_evidence_error(run, call.arguments)
+                finish_tool = self._finish_tool
+                if evidence_error:
+                    async def reject_finish(
+                        arguments: dict[str, Any], error: str = evidence_error
+                    ) -> dict[str, Any]:
+                        raise ValueError(error)
+
+                    finish_tool = Tool(
+                        name=self._finish_tool.name,
+                        description=self._finish_tool.description,
+                        parameters=self._finish_tool.parameters,
+                        handler=reject_finish,
+                        risk_tier=self._finish_tool.risk_tier,
+                        idempotent=True,
+                    )
                 outcome = await self.tool_executor.execute(
-                    run, step_no, call_index, call, tool=self._finish_tool
+                    run, step_no, call_index, call, tool=finish_tool
                 )
                 if "error" not in outcome.observation:
                     return "completed", outcome.observation
@@ -445,7 +518,61 @@ class RunEngine:
                 return "waiting_approval", {}
             if outcome.fatal:
                 return "failed", {"error": outcome.fatal_reason}
+            if outcome.observation.get("code") == "INVALID_ARGUMENT":
+                result = await self.session.execute(
+                    sa.select(sa.func.count())
+                    .select_from(ToolExecution)
+                    .where(
+                        ToolExecution.run_id == run.id,
+                        ToolExecution.tool_name == call.name,
+                        ToolExecution.error.like("INVALID_ARGUMENT%"),
+                    )
+                )
+                failures = result.scalar_one()
+                if failures > self.settings.run_max_argument_repairs:
+                    return "failed", {
+                        "error": (
+                            f"argument repair budget exhausted for {call.name!r} "
+                            f"({self.settings.run_max_argument_repairs})"
+                        )
+                    }
+            try:
+                await guardrails.check_no_progress(self.session, run.id)
+            except guardrails.GuardrailViolation as violation:
+                return "failed", {"error": violation.reason}
 
+        return None
+
+    async def _finish_evidence_error(
+        self, run: AgentRun, arguments: dict[str, Any]
+    ) -> str | None:
+        """Prevent a success claim while the most recent real tool failure is unresolved."""
+        if arguments.get("outcome", "succeeded") == "failed":
+            return None
+
+        control_tools = {
+            FINISH_TOOL_NAME,
+            ASK_USER_TOOL_NAME,
+            LIST_TOOL_DOMAINS_NAME,
+            LIST_DOMAIN_TOOLS_NAME,
+            LOAD_TOOL_NAME,
+            USE_SKILL_NAME,
+        }
+        result = await self.session.execute(
+            sa.select(ToolExecution)
+            .where(
+                ToolExecution.run_id == run.id,
+                ToolExecution.tool_name.not_in(control_tools),
+            )
+            .order_by(ToolExecution.step_no.desc(), ToolExecution.call_index.desc())
+            .limit(1)
+        )
+        latest = result.scalar_one_or_none()
+        if latest is not None and latest.status != ToolExecutionStatus.succeeded:
+            return (
+                f"finish blocked: latest tool {latest.tool_name!r} has status "
+                f"{latest.status}; recover or finish with outcome='failed'"
+            )
         return None
 
     def _builtin_tools(self) -> list[Tool]:
@@ -479,8 +606,18 @@ class RunEngine:
             if not any(s.name == domain and s.enabled for s in servers):
                 return {"error": f"unknown domain: {domain}"}
             pairs = await self.mcp_registry.list_tools(run.tenant_id)
+            name_counts: dict[str, int] = {}
+            for _server, mcp_tool in pairs:
+                name_counts[mcp_tool.name] = name_counts.get(mcp_tool.name, 0) + 1
             tools = [
-                {"name": mcp_tool.name, "summary": mcp_tool.description[:140]}
+                {
+                    "name": (
+                        canonical_tool_name(server, mcp_tool.name)
+                        if name_counts[mcp_tool.name] > 1
+                        else mcp_tool.name
+                    ),
+                    "summary": mcp_tool.description[:140],
+                }
                 for server, mcp_tool in pairs
                 if server.name == domain
             ]
@@ -493,12 +630,9 @@ class RunEngine:
             requested = arguments.get("name")
             if not requested:
                 return {"error": f"unknown tool: {requested}"}
-            mcp_tool = await self.mcp_registry.get_tool_by_name(run.tenant_id, requested)
-            if mcp_tool is not None and mcp_tool.enabled:
-                return {"name": mcp_tool.name, "schema": mcp_tool.parameters}
-            builtin_tool = self.tools_by_name.get(requested)
-            if builtin_tool is not None and builtin_tool.mcp_server_id is None:
-                return {"name": builtin_tool.name, "schema": builtin_tool.parameters}
+            available_tool = self.tools_by_name.get(requested)
+            if available_tool is not None:
+                return {"name": available_tool.name, "schema": available_tool.parameters}
             return {"error": f"unknown tool: {requested}"}
 
         return native_tools.build_load_tool_tool(handler)

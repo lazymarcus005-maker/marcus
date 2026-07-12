@@ -88,7 +88,7 @@ class LLMGateway:
         if tools:
             self._tool_capable = True
 
-        return _parse_response(body)
+        return _ensure_usage(_parse_response(body), payload)
 
     async def complete_stream(
         self,
@@ -183,7 +183,7 @@ class LLMGateway:
             ToolCall(id=v["id"], name=v["name"], arguments=orjson.loads(v["arguments"] or "{}"))
             for v in calls.values()
         ]
-        return LLMResponse(
+        response = LLMResponse(
             "".join(content_parts) or None,
             tool_calls,
             finish_reason,
@@ -191,6 +191,7 @@ class LLMGateway:
             model or self._settings.llm_model,
             {},
         )
+        return _ensure_usage(response, payload)
 
     async def _post_with_retry(
         self, payload: dict[str, Any], *, max_retries: int
@@ -274,3 +275,26 @@ def _parse_response(body: dict[str, Any]) -> LLMResponse:
         model=body.get("model", ""),
         raw=body,
     )
+
+
+def _ensure_usage(response: LLMResponse, payload: dict[str, Any]) -> LLMResponse:
+    """Estimate non-zero usage when an OpenAI-compatible provider omits it."""
+    if response.usage.total_tokens > 0:
+        return response
+
+    prompt_bytes = len(orjson.dumps(payload.get("messages", [])))
+    if payload.get("tools"):
+        prompt_bytes += len(orjson.dumps(payload["tools"]))
+    completion_bytes = len((response.content or "").encode())
+    completion_bytes += sum(
+        len(call.name.encode()) + len(orjson.dumps(call.arguments)) for call in response.tool_calls
+    )
+    prompt_tokens = max(1, (prompt_bytes + 3) // 4)
+    completion_tokens = max(1, (completion_bytes + 3) // 4)
+    response.usage = Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        source="estimated",
+    )
+    return response

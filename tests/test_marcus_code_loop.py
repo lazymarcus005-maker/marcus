@@ -4,7 +4,7 @@ import pytest
 
 from harness.db.enums import RiskTier
 from harness.llm.gateway import LLMTransientError
-from harness.llm.types import LLMMessage
+from harness.llm.types import LLMMessage, LLMResponse, ToolCall, Usage
 from harness.runtime.tools import Tool
 from marcus_code.loop import MarcusLoop
 from marcus_code.modes import AgentMode
@@ -98,6 +98,117 @@ async def test_read_only_tool_executes_without_approval_prompt():
 
 
 @pytest.mark.asyncio
+async def test_only_first_tool_call_in_a_batch_executes():
+    batched = LLMResponse(
+        content=None,
+        tool_calls=[
+            ToolCall(id="first", name="peek", arguments={}),
+            ToolCall(id="second", name="peek_two", arguments={}),
+        ],
+        finish_reason="tool_calls",
+        usage=Usage(10, 5, 15),
+        model="test-model",
+        raw={},
+    )
+    llm = ScriptedLLMGateway([batched, text_response("done")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [_read_only_tool(), _read_only_tool("peek_two")], ui)
+
+    await loop.run_turn("inspect sequentially")
+
+    assert ui.tool_calls == [("peek", {})]
+    assert any("one tool call" in error for _name, error in ui.errors)
+    policy_message = next(message for message in loop.state.history if message.tool_call_id == "second")
+    assert "POLICY_DENIED" in (policy_message.content or "")
+
+
+@pytest.mark.asyncio
+async def test_invalid_argument_repair_is_bounded():
+    tool = Tool(
+        name="typed",
+        description="d",
+        parameters={
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+        },
+        handler=lambda arguments: None,
+        risk_tier=RiskTier.read_only,
+    )
+    llm = ScriptedLLMGateway(
+        [
+            tool_call_response("typed", {"count": "bad"}),
+            tool_call_response("typed", {"count": "still-bad"}),
+        ]
+    )
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [tool], ui, max_argument_repairs=1)
+
+    await loop.run_turn("use typed tool")
+
+    assert any("argument repair budget exhausted" in reason for reason in ui.guardrail_stops)
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_cosmetic_argument_changes_with_same_error_stop_as_no_progress():
+    async def fail(arguments):
+        raise RuntimeError("same failure")
+
+    tool = Tool(
+        name="probe",
+        description="d",
+        parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+        handler=fail,
+        risk_tier=RiskTier.read_only,
+    )
+    llm = ScriptedLLMGateway(
+        [
+            tool_call_response("probe", {"query": "a"}),
+            tool_call_response("probe", {"query": "b"}),
+            tool_call_response("probe", {"query": "c"}),
+        ]
+    )
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [tool], ui, max_safe_tool_retries=0)
+
+    await loop.run_turn("investigate")
+
+    assert any("no progress" in reason for reason in ui.guardrail_stops)
+
+
+@pytest.mark.asyncio
+async def test_requested_verification_blocks_unsupported_success_claim():
+    llm = ScriptedLLMGateway([text_response("tests passed"), text_response("still passed")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [], ui)
+
+    await loop.run_turn("run tests and verify the result")
+
+    assert any("no successful evidence" in reason for reason in ui.guardrail_stops)
+    assert ui.assistant_messages == []
+
+
+@pytest.mark.asyncio
+async def test_successful_test_command_allows_final_answer():
+    llm = ScriptedLLMGateway(
+        [tool_call_response("run_cli", {"command": "pytest -q"}), text_response("passed")]
+    )
+    ui = _FakeUI()
+    loop = MarcusLoop(
+        llm,
+        [_read_only_tool("run_cli", {"exit_code": 0, "stdout": "2 passed"})],
+        ui,
+    )
+
+    await loop.run_turn("run tests and verify the result")
+
+    assert ui.assistant_messages[-1] == "passed"
+    assert ui.assistant_messages[0].startswith("Plan:")
+    assert ui.guardrail_stops == []
+
+
+@pytest.mark.asyncio
 async def test_sensitive_tool_approved_executes():
     llm = ScriptedLLMGateway([tool_call_response("mutate", {"x": 1}), text_response("done")])
     ui = _FakeUI(decisions=["yes"])
@@ -105,7 +216,7 @@ async def test_sensitive_tool_approved_executes():
 
     await loop.run_turn("change something")
 
-    assert ui.assistant_messages == ["done"]
+    assert ui.assistant_messages[-1] == "done"
     assert ui.declined == []
     tool_message = loop.state.history[-2]
     assert tool_message.role == "tool"
@@ -142,7 +253,7 @@ async def test_always_decision_skips_future_prompts_for_that_tool():
     await loop.run_turn("change things twice")
 
     assert "mutate" in loop.state.always_allowed
-    assert ui.assistant_messages == ["done"]
+    assert ui.assistant_messages[-1] == "done"
 
 
 @pytest.mark.asyncio
@@ -191,7 +302,17 @@ async def test_max_steps_guardrail_stops_the_loop():
     responses = [tool_call_response("peek", {"i": i}) for i in range(5)]
     llm = ScriptedLLMGateway(responses)
     ui = _FakeUI()
-    loop = MarcusLoop(llm, [_read_only_tool()], ui, max_steps=3)
+    async def changing_result(arguments):
+        return {"seen": arguments["i"]}
+
+    tool = Tool(
+        name="peek",
+        description="d",
+        parameters={"type": "object", "properties": {"i": {"type": "integer"}}},
+        handler=changing_result,
+        risk_tier=RiskTier.read_only,
+    )
+    loop = MarcusLoop(llm, [tool], ui, max_steps=3)
 
     await loop.run_turn("keep going forever")
 
@@ -240,7 +361,7 @@ async def test_autonomous_modes_skip_approval_for_normal_writes(mode):
 
     await loop.run_turn("change it")
 
-    assert ui.assistant_messages == ["done"]
+    assert ui.assistant_messages[-1] == "done"
 
 
 def test_compact_history_reduces_retained_context():

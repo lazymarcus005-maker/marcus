@@ -3,7 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from harness.db.enums import StepType
 from harness.db.models import AgentRun
 from harness.llm.gateway import LLMGateway
-from harness.llm.types import LLMMessage
+from harness.llm.types import LLMMessage, Usage
+from harness.llm.usage import record_usage
 from harness.runtime.context import (
     latest_covered_step_no,
     llm_call_step_to_messages,
@@ -36,7 +37,14 @@ def estimate_tokens(messages: list[LLMMessage]) -> int:
     return total_chars // CHARS_PER_TOKEN_ESTIMATE
 
 
-async def maybe_compact(session: AsyncSession, llm: LLMGateway, run: AgentRun) -> None:
+async def maybe_compact(
+    session: AsyncSession,
+    llm: LLMGateway,
+    run: AgentRun,
+    *,
+    context_window_tokens: int | None = None,
+    threshold_fraction: float = COMPACTION_THRESHOLD_FRACTION,
+) -> Usage | None:
     """Fold older steps into a summary step once context grows past ~70% of budget.
 
     Keeps the most recent KEEP_RECENT_STEPS llm_call steps verbatim; everything
@@ -50,7 +58,7 @@ async def maybe_compact(session: AsyncSession, llm: LLMGateway, run: AgentRun) -
     uncovered = [s for s in steps if s.type == StepType.llm_call and s.step_no > covered_up_to]
 
     if len(uncovered) <= KEEP_RECENT_STEPS:
-        return
+        return None
 
     executions_by_step = await load_tool_executions_by_step(session, run.id)
     uncovered_messages = [
@@ -58,8 +66,9 @@ async def maybe_compact(session: AsyncSession, llm: LLMGateway, run: AgentRun) -
         for step in uncovered
         for msg in llm_call_step_to_messages(step, executions_by_step.get(step.step_no, []))
     ]
-    if estimate_tokens(uncovered_messages) < run.token_budget * COMPACTION_THRESHOLD_FRACTION:
-        return
+    context_limit = context_window_tokens or run.token_budget
+    if estimate_tokens(uncovered_messages) < context_limit * threshold_fraction:
+        return None
 
     to_summarize = uncovered[:-KEEP_RECENT_STEPS]
     covers_up_to_step_no = to_summarize[-1].step_no
@@ -72,6 +81,13 @@ async def maybe_compact(session: AsyncSession, llm: LLMGateway, run: AgentRun) -
     messages_to_summarize.append(LLMMessage(role="user", content=SUMMARIZE_INSTRUCTION))
 
     response = await llm.complete(messages_to_summarize, tools=None)
+    await record_usage(
+        session,
+        tenant_id=run.tenant_id,
+        run_id=run.id,
+        model=response.model,
+        usage=response.usage,
+    )
 
     existing_summary_count = sum(1 for s in steps if s.type == StepType.summary)
     summary_step_no = -(existing_summary_count + 1)  # negative range never collides with step_no
@@ -84,3 +100,4 @@ async def maybe_compact(session: AsyncSession, llm: LLMGateway, run: AgentRun) -
         {"summary": response.content or "", "covers_up_to_step_no": covers_up_to_step_no},
     )
     await session.commit()
+    return response.usage
