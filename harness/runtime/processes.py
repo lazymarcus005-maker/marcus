@@ -8,7 +8,10 @@ from typing import Any
 
 def process_group_kwargs() -> dict[str, Any]:
     if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        # subprocess.CREATE_NEW_PROCESS_GROUP only exists in the Windows
+        # stdlib stub; mypy runs against the Linux stub in CI, so look it up
+        # dynamically rather than referencing the attribute directly.
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
     return {"start_new_session": True}
 
 
@@ -30,8 +33,16 @@ async def terminate_process_tree(
             await killer.communicate()
             close_process_transport(killer)
         else:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
+            # os.killpg/signal.SIGKILL are POSIX-only stdlib attributes; mypy
+            # checks against whichever platform's stub it's configured for
+            # (which differs between local Windows dev and Linux CI), so look
+            # them up dynamically rather than referencing them directly —
+            # same reasoning as CREATE_NEW_PROCESS_GROUP above.
+            killpg = getattr(os, "killpg", None)
+            sigkill = getattr(signal, "SIGKILL", None)
+            if killpg is not None and sigkill is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    killpg(proc.pid, sigkill)
     try:
         if drain_pipes:
             await asyncio.wait_for(proc.communicate(), timeout=2)

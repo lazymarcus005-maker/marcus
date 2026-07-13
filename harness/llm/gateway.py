@@ -181,7 +181,7 @@ class LLMGateway:
             ToolCall(id=v["id"], name=v["name"], arguments=orjson.loads(v["arguments"] or "{}"))
             for v in calls.values()
         ]
-        response = LLMResponse(
+        llm_response = LLMResponse(
             "".join(content_parts) or None,
             tool_calls,
             finish_reason,
@@ -189,7 +189,7 @@ class LLMGateway:
             model or self._settings.llm_model,
             {},
         )
-        return _ensure_usage(response, payload)
+        return _ensure_usage(llm_response, payload)
 
     async def _post_with_retry(
         self, payload: dict[str, Any], *, max_retries: int
