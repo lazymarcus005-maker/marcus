@@ -23,7 +23,9 @@ def normalize_and_validate_arguments(schema: dict[str, Any], arguments: Any) -> 
         raise ToolArgumentError("INVALID_ARGUMENT", "tool arguments must be an object")
     normalized = copy.deepcopy(arguments)
     _coerce_object(schema, normalized)
-    errors = sorted(Draft202012Validator(schema).iter_errors(normalized), key=lambda e: list(e.path))
+    errors = sorted(
+        Draft202012Validator(schema).iter_errors(normalized), key=lambda e: list(e.path)
+    )
     if errors:
         error = errors[0]
         path = ".".join(str(part) for part in error.absolute_path)

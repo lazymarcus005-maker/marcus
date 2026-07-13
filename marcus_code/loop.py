@@ -237,7 +237,9 @@ class MarcusLoop:
                 self.ui.print_assistant(response.content)
                 plan_shown = True
             elif contract.requires_plan and not plan_shown:
-                self.ui.print_assistant("Plan: inspect the current state, make the change, then verify it.")
+                self.ui.print_assistant(
+                    "Plan: inspect the current state, make the change, then verify it."
+                )
                 plan_shown = True
 
             for call_index, call in enumerate(response.tool_calls):
@@ -278,7 +280,10 @@ class MarcusLoop:
                     verification_succeeded = True
                 fingerprint = (
                     call.name,
-                    str(observation.get("code") or orjson.dumps(observation, option=orjson.OPT_SORT_KEYS).decode()),
+                    str(
+                        observation.get("code")
+                        or orjson.dumps(observation, option=orjson.OPT_SORT_KEYS).decode()
+                    ),
                 )
                 outcome_fingerprints.append(fingerprint)
                 if len(outcome_fingerprints) >= 3 and all(
@@ -365,7 +370,9 @@ class MarcusLoop:
         target = self.context_window_tokens * self.compact_target_percent // 100
         original_limit = self.max_history_messages
         while self.context_tokens > target and len(self.state.history) > 4:
-            self.max_history_messages = max(4, min(self.max_history_messages - 1, len(self.state.history) - 1))
+            self.max_history_messages = max(
+                4, min(self.max_history_messages - 1, len(self.state.history) - 1)
+            )
             self._trim_history()
         self.max_history_messages = original_limit
         after = self.context_tokens
@@ -417,12 +424,15 @@ class MarcusLoop:
             self.ui.print_tool_error(call.name, error)
             return {"error": error}
 
-        if tool_requires_approval(
-            self.mode,
-            tool_name=call.name,
-            risk_tier=tool.risk_tier,
-            arguments=call.arguments,
-        ) and call.name not in self.state.always_allowed:
+        if (
+            tool_requires_approval(
+                self.mode,
+                tool_name=call.name,
+                risk_tier=tool.risk_tier,
+                arguments=call.arguments,
+            )
+            and call.name not in self.state.always_allowed
+        ):
             decision = self.ui.confirm_tool_call(tool, call.arguments)
             if decision == "always":
                 self.state.always_allowed.add(call.name)
@@ -430,10 +440,9 @@ class MarcusLoop:
                 self.ui.print_tool_declined(call.name)
                 return {"error": "user declined this tool call"}
 
-        retryable = (
-            (tool.risk_tier.value == "read_only" or tool.idempotent)
-            and call.name not in {"wait_for_http"}
-        )
+        retryable = (tool.risk_tier.value == "read_only" or tool.idempotent) and call.name not in {
+            "wait_for_http"
+        }
         max_attempts = self.max_safe_tool_retries + 1 if retryable else 1
         for attempt in range(max_attempts):
             try:

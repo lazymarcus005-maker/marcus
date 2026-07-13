@@ -1,9 +1,7 @@
 import re
 from pathlib import Path
 
-_SECRET_FILE_NAMES = frozenset(
-    {".env", ".env.local", ".env.production", "credentials.json"}
-)
+_SECRET_FILE_NAMES = frozenset({".env", ".env.local", ".env.production", "credentials.json"})
 _PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S
 )

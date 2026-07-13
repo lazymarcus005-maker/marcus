@@ -140,9 +140,7 @@ class LLMGateway:
             if response.status_code != 200:
                 await response.aread()
                 if response.status_code in RETRYABLE_STATUS_CODES:
-                    raise LLMTransientError(
-                        f"status {response.status_code}: {response.text[:500]}"
-                    )
+                    raise LLMTransientError(f"status {response.status_code}: {response.text[:500]}")
                 raise LLMError(
                     f"LLM streaming request failed with status {response.status_code}: "
                     f"{response.text[:500]}"

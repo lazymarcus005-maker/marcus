@@ -20,9 +20,7 @@ _CHANGE = re.compile(
     r"(?i)\b(add|build|change|create|edit|fix|implement|install|refactor|remove|update|write)\b"
     r"|(?:เพิ่ม|แก้|สร้าง|ติดตั้ง|เขียน|ปรับปรุง|ดำเนินการ)"
 )
-_OPERATE = re.compile(
-    r"(?i)\b(run|start|stop|deploy|serve|launch)\b|(?:รัน|เปิด|ปิด|ทดสอบระบบ)"
-)
+_OPERATE = re.compile(r"(?i)\b(run|start|stop|deploy|serve|launch)\b|(?:รัน|เปิด|ปิด|ทดสอบระบบ)")
 _VERIFY = re.compile(
     r"(?i)\b(build|curl|lint|test|verify|verification|pytest|dotnet\s+run|npm\s+test)\b"
     r"|(?:ทดสอบ|ยืนยันผล|ตรวจสอบผล|รัน service|รันเซอร์วิส)"

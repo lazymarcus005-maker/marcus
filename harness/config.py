@@ -83,9 +83,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_safety_and_budgets(self) -> "Settings":
         if not 0 < self.cli_compact_target_percent < self.cli_compact_threshold_percent < 100:
-            raise ValueError(
-                "CLI compact percentages must satisfy 0 < target < threshold < 100"
-            )
+            raise ValueError("CLI compact percentages must satisfy 0 < target < threshold < 100")
         positive_fields = {
             "run_default_max_steps": self.run_default_max_steps,
             "run_default_max_tool_calls": self.run_default_max_tool_calls,
@@ -109,9 +107,10 @@ class Settings(BaseSettings):
 
         if self.env.lower() in {"production", "prod"}:
             errors = []
-            if self.secret_key == "changeme-32-bytes-minimum-secret-key!!" or len(
-                self.secret_key
-            ) < 32:
+            if (
+                self.secret_key == "changeme-32-bytes-minimum-secret-key!!"
+                or len(self.secret_key) < 32
+            ):
                 errors.append("HARNESS_SECRET_KEY must be a non-default value of 32+ characters")
             if self.llm_api_key in {"", "changeme"}:
                 errors.append("HARNESS_LLM_API_KEY must not be empty or the default placeholder")

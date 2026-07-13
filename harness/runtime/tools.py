@@ -20,9 +20,7 @@ class ToolErrorCode(enum.StrEnum):
 
 
 class ToolRuntimeError(RuntimeError):
-    def __init__(
-        self, message: str, *, code: ToolErrorCode, retryable: bool = False
-    ) -> None:
+    def __init__(self, message: str, *, code: ToolErrorCode, retryable: bool = False) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable

@@ -54,6 +54,7 @@ _MAX_LIST_RESULTS = 200
 _MAX_GREP_MATCHES = 200
 _MAX_GREP_FILE_BYTES = 2_000_000  # skip files larger than this when grepping
 
+
 def _resolve_scoped_path(root: Path, relative_path: str) -> Path:
     """Resolve relative_path under root, refusing any path that escapes it.
 
@@ -495,7 +496,9 @@ def build_background_process_tools(manager: BackgroundProcessManager) -> list[To
             raise ValueError("wait_for_http requires a 'url' field")
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
-            "localhost", "127.0.0.1", "::1"
+            "localhost",
+            "127.0.0.1",
+            "::1",
         }:
             raise ValueError("wait_for_http only permits localhost HTTP(S) URLs")
         timeout = min(max(float(arguments.get("timeout_seconds", 30)), 0.1), 120)

@@ -17,7 +17,9 @@ def test_approval_prompt_uses_pastel_orange_and_red_sections():
 def test_clear_approval_prompt_erases_every_wrapped_terminal_line(monkeypatch):
     ui, stream = _capturing_ui()
     monkeypatch.setattr(type(ui.console), "is_terminal", property(lambda self: True))
-    monkeypatch.setattr(type(ui.console), "size", property(lambda self: type("Size", (), {"width": 30})()))
+    monkeypatch.setattr(
+        type(ui.console), "size", property(lambda self: type("Size", (), {"width": 30})())
+    )
 
     ui._clear_approval_prompt("always")
 

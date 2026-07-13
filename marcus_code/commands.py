@@ -142,9 +142,7 @@ async def _cmd_mode(ctx: CommandContext, args: str) -> None:
     )
     if hasattr(ctx.ui, "set_mode"):
         ctx.ui.set_mode(mode.value)
-    ctx.ui.print_info(
-        f"Mode switched to {mode.value!r} for this session.\nHint: {mode_hint(mode)}"
-    )
+    ctx.ui.print_info(f"Mode switched to {mode.value!r} for this session.\nHint: {mode_hint(mode)}")
 
 
 async def _cmd_config(ctx: CommandContext, args: str) -> None:

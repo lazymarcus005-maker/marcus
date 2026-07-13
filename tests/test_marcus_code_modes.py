@@ -18,24 +18,33 @@ def test_normal_commands_do_not_require_approval(command):
 
 
 def test_auto_prompts_only_for_dangerous_commands():
-    assert tool_requires_approval(
-        AgentMode.auto,
-        tool_name="run_cli",
-        risk_tier=RiskTier.destructive,
-        arguments={"command": "dotnet build"},
-    ) is False
-    assert tool_requires_approval(
-        AgentMode.auto,
-        tool_name="run_cli",
-        risk_tier=RiskTier.destructive,
-        arguments={"command": "git push origin main"},
-    ) is True
+    assert (
+        tool_requires_approval(
+            AgentMode.auto,
+            tool_name="run_cli",
+            risk_tier=RiskTier.destructive,
+            arguments={"command": "dotnet build"},
+        )
+        is False
+    )
+    assert (
+        tool_requires_approval(
+            AgentMode.auto,
+            tool_name="run_cli",
+            risk_tier=RiskTier.destructive,
+            arguments={"command": "git push origin main"},
+        )
+        is True
+    )
 
 
 def test_yolo_never_requests_human_approval():
-    assert tool_requires_approval(
-        AgentMode.yolo,
-        tool_name="run_cli",
-        risk_tier=RiskTier.destructive,
-        arguments={"command": "git reset --hard HEAD"},
-    ) is False
+    assert (
+        tool_requires_approval(
+            AgentMode.yolo,
+            tool_name="run_cli",
+            risk_tier=RiskTier.destructive,
+            arguments={"command": "git reset --hard HEAD"},
+        )
+        is False
+    )

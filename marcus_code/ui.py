@@ -486,7 +486,9 @@ class TerminalUI:
         if not lines:
             self.print_info("No completed task steps in this session yet.")
             return
-        self.console.print(Panel("\n".join(escape(line) for line in lines), title="Last task steps"))
+        self.console.print(
+            Panel("\n".join(escape(line) for line in lines), title="Last task steps")
+        )
 
     def _steps_renderable(self) -> Panel:
         lines: list[str] = []
@@ -519,7 +521,15 @@ class TerminalUI:
         ratio = min(1.0, used / limit)
         filled = round(ratio * 20)
         bar = "█" * filled + "░" * (20 - filled)
-        color = "green" if ratio < 0.7 else "yellow" if ratio < 0.85 else "#F2B880" if ratio < 0.95 else "#F28B82"
+        color = (
+            "green"
+            if ratio < 0.7
+            else "yellow"
+            if ratio < 0.85
+            else "#F2B880"
+            if ratio < 0.95
+            else "#F28B82"
+        )
         text = Text()
         text.append(f"Session {hours:02d}:{minutes:02d}:{seconds:02d} │ Context ")
         text.append(f"[{bar}]", style=color)
@@ -537,7 +547,9 @@ class TerminalUI:
     def _refresh_steps(self) -> None:
         renderable = self._working_renderable()
         if self._live is None:
-            self._live = Live(renderable, console=self.console, refresh_per_second=8, transient=True)
+            self._live = Live(
+                renderable, console=self.console, refresh_per_second=8, transient=True
+            )
             self._live.start()
         else:
             self._live.update(renderable, refresh=True)
@@ -569,11 +581,7 @@ class TerminalUI:
             # Note: avoid literal square brackets in text passed through
             # Console.input/print — Rich parses "[...]" as markup tags, so
             # e.g. "[y]es" silently vanishes instead of printing.
-            answer = (
-                self.console.input(_APPROVAL_PROMPT)
-                .strip()
-                .lower()
-            )
+            answer = self.console.input(_APPROVAL_PROMPT).strip().lower()
             self._clear_approval_prompt(answer)
             if answer in ("y", "yes"):
                 self._resume_live()

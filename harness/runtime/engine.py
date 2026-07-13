@@ -390,6 +390,7 @@ class RunEngine:
             )
 
             if call_index >= self.settings.run_max_tool_calls_per_step:
+
                 async def deny_batched_call(arguments: dict[str, Any]) -> dict[str, Any]:
                     raise ToolRuntimeError(
                         "only one tool call is allowed per reasoning step; "
@@ -407,15 +408,14 @@ class RunEngine:
                     risk_tier=original.risk_tier if original else RiskTier.read_only,
                     idempotent=True,
                 )
-                await self.tool_executor.execute(
-                    run, step_no, call_index, call, tool=denied_tool
-                )
+                await self.tool_executor.execute(run, step_no, call_index, call, tool=denied_tool)
                 continue
 
             if call.name == FINISH_TOOL_NAME:
                 evidence_error = await self._finish_evidence_error(run, call.arguments)
                 finish_tool = self._finish_tool
                 if evidence_error:
+
                     async def reject_finish(
                         arguments: dict[str, Any], error: str = evidence_error
                     ) -> dict[str, Any]:
@@ -543,9 +543,7 @@ class RunEngine:
 
         return None
 
-    async def _finish_evidence_error(
-        self, run: AgentRun, arguments: dict[str, Any]
-    ) -> str | None:
+    async def _finish_evidence_error(self, run: AgentRun, arguments: dict[str, Any]) -> str | None:
         """Prevent a success claim while the most recent real tool failure is unresolved."""
         if arguments.get("outcome", "succeeded") == "failed":
             return None

@@ -84,16 +84,10 @@ async def _amain(prompt: str | None = None, mode: AgentMode | None = None) -> No
             settings = resolve_settings()
 
     session_name = _new_session_name()
-    if (
-        mode is AgentMode.yolo
-        and hasattr(ui, "confirm_yolo_mode")
-        and not ui.confirm_yolo_mode()
-    ):
+    if mode is AgentMode.yolo and hasattr(ui, "confirm_yolo_mode") and not ui.confirm_yolo_mode():
         mode = AgentMode.agent
     profile_email = (
-        load_cached_ollama_email()
-        if is_ollama_cloud(settings.llm_base_url)
-        else "(not available)"
+        load_cached_ollama_email() if is_ollama_cloud(settings.llm_base_url) else "(not available)"
     )
     ui.print_banner(
         root,
@@ -178,9 +172,7 @@ async def _amain(prompt: str | None = None, mode: AgentMode | None = None) -> No
 def main() -> None:
     parser = argparse.ArgumentParser(prog="marcus")
     parser.add_argument("-v", "--version", action="version", version=_version_string())
-    parser.add_argument(
-        "--mode", choices=[mode.value for mode in AgentMode]
-    )
+    parser.add_argument("--mode", choices=[mode.value for mode in AgentMode])
     parser.add_argument("-p", "--prompt", help="run one prompt non-interactively")
     args = parser.parse_args()
     with contextlib.suppress(KeyboardInterrupt):

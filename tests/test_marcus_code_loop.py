@@ -118,7 +118,9 @@ async def test_only_first_tool_call_in_a_batch_executes():
 
     assert ui.tool_calls == [("peek", {})]
     assert any("one tool call" in error for _name, error in ui.errors)
-    policy_message = next(message for message in loop.state.history if message.tool_call_id == "second")
+    policy_message = next(
+        message for message in loop.state.history if message.tool_call_id == "second"
+    )
     assert "POLICY_DENIED" in (policy_message.content or "")
 
 
@@ -302,6 +304,7 @@ async def test_max_steps_guardrail_stops_the_loop():
     responses = [tool_call_response("peek", {"i": i}) for i in range(5)]
     llm = ScriptedLLMGateway(responses)
     ui = _FakeUI()
+
     async def changing_result(arguments):
         return {"seen": arguments["i"]}
 
@@ -366,8 +369,12 @@ async def test_autonomous_modes_skip_approval_for_normal_writes(mode):
 
 def test_compact_history_reduces_retained_context():
     loop = MarcusLoop(
-        ScriptedLLMGateway([]), [], _FakeUI(), system_prompt="system",
-        context_window_tokens=500, compact_target_percent=50,
+        ScriptedLLMGateway([]),
+        [],
+        _FakeUI(),
+        system_prompt="system",
+        context_window_tokens=500,
+        compact_target_percent=50,
     )
     loop.state.history.extend(
         LLMMessage(role="user", content=(f"message-{index} " * 80)) for index in range(12)
@@ -481,9 +488,7 @@ async def test_wait_for_http_is_not_retried_by_outer_tool_recovery():
         risk_tier=RiskTier.read_only,
         idempotent=True,
     )
-    llm = ScriptedLLMGateway(
-        [tool_call_response("wait_for_http", {}), text_response("handled")]
-    )
+    llm = ScriptedLLMGateway([tool_call_response("wait_for_http", {}), text_response("handled")])
     loop = MarcusLoop(llm, [tool], _FakeUI())
 
     await loop.run_turn("wait")
@@ -521,7 +526,11 @@ async def test_context_over_limit_stops_before_llm_call():
     llm = ScriptedLLMGateway([text_response("must not be used")])
     ui = _FakeUI()
     loop = MarcusLoop(
-        llm, [], ui, context_window_tokens=20, compact_threshold_percent=100,
+        llm,
+        [],
+        ui,
+        context_window_tokens=20,
+        compact_threshold_percent=100,
         history_summary_enabled=False,
     )
 

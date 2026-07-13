@@ -75,9 +75,7 @@ def load_cached_ollama_email(cache_file: Path = OLLAMA_PROFILE_CACHE_FILE) -> st
     return value if isinstance(value, str) and value else None
 
 
-def save_cached_ollama_email(
-    email: str, cache_file: Path = OLLAMA_PROFILE_CACHE_FILE
-) -> None:
+def save_cached_ollama_email(email: str, cache_file: Path = OLLAMA_PROFILE_CACHE_FILE) -> None:
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(json.dumps({"email": email}, indent=2), encoding="utf-8")
     with contextlib.suppress(OSError):
@@ -236,9 +234,7 @@ class OllamaCloudUsageClient:
         deadline = asyncio.get_running_loop().time() + 30
         while asyncio.get_running_loop().time() < deadline:
             try:
-                browser = await playwright.chromium.connect_over_cdp(
-                    f"http://127.0.0.1:{port}"
-                )
+                browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
                 if not browser.contexts:
                     raise OllamaUsageError("Browser opened without a usable profile context.")
                 return browser, browser.contexts[0], process
