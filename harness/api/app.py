@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="harness", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="harness", version="1.0.0.1", lifespan=lifespan)
     app.state.settings = settings
     configure_observability(app, settings)
 
