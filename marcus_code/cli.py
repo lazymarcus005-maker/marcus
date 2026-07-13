@@ -1,8 +1,10 @@
 import argparse
 import asyncio
 import contextlib
+import inspect
 import subprocess
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from harness.config import Settings
@@ -15,10 +17,20 @@ from marcus_code.config import (
     save_user_config,
 )
 from marcus_code.loop import MarcusLoop
+from marcus_code.modes import AgentMode
+from marcus_code.ollama_usage import is_ollama_cloud, load_cached_ollama_email
 from marcus_code.prompt import build_system_prompt
 from marcus_code.skills import build_skill_catalog
 from marcus_code.tools import build_marcus_tools
 from marcus_code.ui import TerminalUI
+
+
+def _version_string() -> str:
+    try:
+        package_version = version("marcus")
+    except PackageNotFoundError:
+        package_version = "unknown"
+    return f"Marcus Code {package_version}"
 
 
 def _new_session_name() -> str:
@@ -51,10 +63,15 @@ def _git_summary(root: Path) -> str | None:
     return f"branch={branch or '<detached/unknown>'}; worktree={state}"
 
 
-async def _amain(prompt: str | None = None) -> None:
+async def _amain(prompt: str | None = None, mode: AgentMode | None = None) -> None:
     root = Path.cwd()
     ui = TerminalUI()
     settings = resolve_settings()
+    if mode is None:
+        try:
+            mode = AgentMode(settings.cli_default_mode)
+        except ValueError:
+            mode = AgentMode.agent
 
     if not has_llm_credentials(settings):
         setup = ui.run_first_time_setup(
@@ -67,7 +84,19 @@ async def _amain(prompt: str | None = None) -> None:
             settings = resolve_settings()
 
     session_name = _new_session_name()
-    ui.print_banner(root, model=settings.llm_model, session_name=session_name)
+    if mode is AgentMode.yolo and hasattr(ui, "confirm_yolo_mode") and not ui.confirm_yolo_mode():
+        mode = AgentMode.agent
+    profile_email = (
+        load_cached_ollama_email() if is_ollama_cloud(settings.llm_base_url) else "(not available)"
+    )
+    ui.print_banner(
+        root,
+        model=settings.llm_model,
+        session_name=session_name,
+        mode=mode.value,
+        provider_url=settings.llm_base_url,
+        profile_email=profile_email,
+    )
 
     llm = LLMGateway(settings=settings)
     tools = build_marcus_tools(root, settings)
@@ -82,19 +111,36 @@ async def _amain(prompt: str | None = None) -> None:
             project_instructions=project_instructions,
             git_summary=_git_summary(root),
             skill_catalog=build_skill_catalog(root),
+            mode=mode,
         ),
+        max_steps=settings.cli_max_steps,
         max_history_messages=settings.cli_max_history_messages,
         max_total_tokens=settings.cli_max_total_tokens,
         history_summary_enabled=settings.cli_history_summary_enabled,
+        mode=mode,
+        context_window_tokens=settings.cli_context_window_tokens,
+        compact_threshold_percent=settings.cli_compact_threshold_percent,
+        compact_target_percent=settings.cli_compact_target_percent,
+        llm_recovery_timeout_seconds=settings.cli_llm_recovery_timeout_seconds,
+        max_tool_calls_per_step=settings.cli_max_tool_calls_per_step,
+        max_argument_repairs=settings.cli_max_argument_repairs,
     )
+    if hasattr(ui, "bind_status"):
+        ui.bind_status(lambda: loop.status(str(root)))
     ctx = CommandContext(ui=ui, loop=loop, settings=settings)
 
     try:
         if prompt is not None:
-            await loop.run_turn(prompt)
+            try:
+                await loop.run_turn(prompt)
+            finally:
+                if hasattr(tools, "process_manager"):
+                    await tools.process_manager.aclose()
             return
         while True:
             user_input = ui.prompt_user()
+            if inspect.isawaitable(user_input):
+                user_input = await user_input
             if user_input is None:
                 break
             stripped = user_input.strip()
@@ -108,17 +154,29 @@ async def _amain(prompt: str | None = None) -> None:
             try:
                 await loop.run_turn(user_input)
             except KeyboardInterrupt:
-                ui.print_interrupted()
+                if hasattr(ui, "register_interrupt") and ui.register_interrupt():
+                    break
+                if not hasattr(ui, "register_interrupt"):
+                    ui.print_interrupted()
+            finally:
+                if hasattr(tools, "process_manager"):
+                    await tools.process_manager.aclose()
     finally:
+        if hasattr(tools, "aclose"):
+            await tools.aclose()
         await ctx.loop.llm.aclose()
+        if hasattr(ui, "aclose"):
+            await ui.aclose()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="marcus")
+    parser.add_argument("-v", "--version", action="version", version=_version_string())
+    parser.add_argument("--mode", choices=[mode.value for mode in AgentMode])
     parser.add_argument("-p", "--prompt", help="run one prompt non-interactively")
     args = parser.parse_args()
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(_amain(args.prompt))
+        asyncio.run(_amain(args.prompt, AgentMode(args.mode) if args.mode else None))
 
 
 if __name__ == "__main__":

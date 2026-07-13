@@ -10,7 +10,15 @@ from harness.llm.types import ToolCall
 from harness.observability import TOOL_CALLS, span
 from harness.runtime import guardrails
 from harness.runtime.result_pipeline import truncate_result
-from harness.runtime.tools import ExecutionOutcome, Tool
+from harness.runtime.tool_validation import ToolArgumentError, normalize_and_validate_arguments
+from harness.runtime.tools import (
+    ExecutionOutcome,
+    Tool,
+    ToolErrorCode,
+    ToolRuntimeError,
+    error_observation,
+    success_observation,
+)
 
 
 class ToolExecutor:
@@ -66,6 +74,11 @@ class ToolExecutor:
         if existing is not None:
             return await self._resolve_existing(existing, tool)
 
+        try:
+            call.arguments = normalize_and_validate_arguments(tool.parameters, call.arguments)
+        except ToolArgumentError as exc:
+            return await self._record_invalid_arguments(run, step_no, call_index, call, tool, exc)
+
         if guardrails.requires_approval(tool.risk_tier):
             gated_outcome = await self._check_approval(run, step_no, call_index, call, tool)
             if gated_outcome is not None:
@@ -88,6 +101,40 @@ class ToolExecutor:
         await self.session.commit()  # write-ahead: durable before the handler runs
 
         return await self._invoke_and_finalize(execution, tool)
+
+    async def _record_invalid_arguments(
+        self,
+        run: AgentRun,
+        step_no: int,
+        call_index: int,
+        call: ToolCall,
+        tool: Tool,
+        error: ToolArgumentError,
+    ) -> ExecutionOutcome:
+        execution = ToolExecution(
+            run_id=run.id,
+            step_no=step_no,
+            call_index=call_index,
+            idempotency_key=f"{run.id}:{step_no}:{call_index}",
+            tool_name=tool.name,
+            mcp_server_id=tool.mcp_server_id,
+            risk_tier=tool.risk_tier,
+            idempotent=tool.idempotent,
+            args=call.arguments,
+            status=ToolExecutionStatus.failed,
+            error=str(error),
+            finished_at=datetime.now(UTC),
+        )
+        self.session.add(execution)
+        await self.session.commit()
+        return ExecutionOutcome(
+            observation=error_observation(
+                str(error),
+                code=error.code,
+                retryable=True,
+                evidence_id=execution.id,
+            )
+        )
 
     async def _check_approval(
         self, run: AgentRun, step_no: int, call_index: int, call: ToolCall, tool: Tool
@@ -152,7 +199,14 @@ class ToolExecutor:
         )
         self.session.add(execution)
         await self.session.commit()
-        return ExecutionOutcome(observation={"error": error})
+        return ExecutionOutcome(
+            observation=error_observation(
+                error,
+                code=ToolErrorCode.approval_denied,
+                retryable=False,
+                evidence_id=execution.id,
+            )
+        )
 
     async def _record_unknown_tool(
         self,
@@ -163,7 +217,14 @@ class ToolExecutor:
         existing: ToolExecution | None,
     ) -> ExecutionOutcome:
         if existing is not None:
-            return ExecutionOutcome(observation={"error": existing.error or "unknown tool"})
+            return ExecutionOutcome(
+                observation=error_observation(
+                    existing.error or "unknown tool",
+                    code=ToolErrorCode.unknown_tool,
+                    retryable=False,
+                    evidence_id=existing.id,
+                )
+            )
 
         error = f"unknown tool: {call.name}"
         execution = ToolExecution(
@@ -181,13 +242,34 @@ class ToolExecutor:
         )
         self.session.add(execution)
         await self.session.commit()
-        return ExecutionOutcome(observation={"error": error})
+        return ExecutionOutcome(
+            observation=error_observation(
+                error,
+                code=ToolErrorCode.unknown_tool,
+                retryable=False,
+                evidence_id=execution.id,
+            )
+        )
 
     async def _resolve_existing(self, existing: ToolExecution, tool: Tool) -> ExecutionOutcome:
         if existing.status == ToolExecutionStatus.succeeded:
-            return ExecutionOutcome(observation=existing.result or {})
+            return ExecutionOutcome(
+                observation=success_observation(existing.result or {}, evidence_id=existing.id)
+            )
         if existing.status in (ToolExecutionStatus.failed, ToolExecutionStatus.unknown):
-            return ExecutionOutcome(observation={"error": existing.error or "tool call failed"})
+            code = (
+                ToolErrorCode.outcome_unknown
+                if existing.status == ToolExecutionStatus.unknown
+                else ToolErrorCode.execution_failed
+            )
+            return ExecutionOutcome(
+                observation=error_observation(
+                    existing.error or "tool call failed",
+                    code=code,
+                    retryable=False,
+                    evidence_id=existing.id,
+                )
+            )
         # status == started: we crashed after the write-ahead insert but before finishing.
         return await self._recover_started(existing, tool)
 
@@ -212,7 +294,12 @@ class ToolExecutor:
         )
         await self.session.commit()
         return ExecutionOutcome(
-            observation={"error": execution.error},
+            observation=error_observation(
+                execution.error,
+                code=ToolErrorCode.outcome_unknown,
+                retryable=False,
+                evidence_id=execution.id,
+            ),
             fatal=fatal,
             fatal_reason=execution.error if fatal else None,
         )
@@ -225,13 +312,28 @@ class ToolExecutor:
             execution.error = str(exc)
             execution.finished_at = datetime.now(UTC)
             await self.session.commit()
-            return ExecutionOutcome(observation={"error": str(exc)})
+            code = exc.code if isinstance(exc, ToolRuntimeError) else ToolErrorCode.execution_failed
+            retryable = (
+                exc.retryable
+                if isinstance(exc, ToolRuntimeError)
+                else tool.risk_tier == RiskTier.read_only or tool.idempotent
+            )
+            return ExecutionOutcome(
+                observation=error_observation(
+                    str(exc),
+                    code=code,
+                    retryable=retryable,
+                    evidence_id=execution.id,
+                )
+            )
 
         execution.status = ToolExecutionStatus.succeeded
         execution.result = truncate_result(result, max_chars=get_settings().tool_result_max_chars)
         execution.finished_at = datetime.now(UTC)
         await self.session.commit()
-        return ExecutionOutcome(observation=execution.result)
+        return ExecutionOutcome(
+            observation=success_observation(execution.result, evidence_id=execution.id)
+        )
 
     async def _get_existing(self, idempotency_key: str) -> ToolExecution | None:
         result = await self.session.execute(

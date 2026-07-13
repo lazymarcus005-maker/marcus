@@ -116,6 +116,20 @@ def test_has_llm_credentials_true_once_a_real_key_is_set(tmp_path, monkeypatch):
     assert has_llm_credentials(settings) is True
 
 
+def test_cli_max_steps_defaults_to_100(tmp_path, monkeypatch):
+    _point_user_config_at(monkeypatch, tmp_path)
+    monkeypatch.delenv("HARNESS_CLI_MAX_STEPS", raising=False)
+
+    assert resolve_settings().cli_max_steps == 100
+
+
+def test_cli_max_steps_can_be_overridden_by_environment(tmp_path, monkeypatch):
+    _point_user_config_at(monkeypatch, tmp_path)
+    monkeypatch.setenv("HARNESS_CLI_MAX_STEPS", "150")
+
+    assert resolve_settings().cli_max_steps == 150
+
+
 def test_load_project_instructions_returns_none_when_missing(tmp_path):
     assert load_project_instructions(tmp_path) is None
 

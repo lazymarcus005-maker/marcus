@@ -2,7 +2,7 @@ import json
 import logging
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -94,7 +94,7 @@ class MetricsMiddleware:
         start = time.perf_counter()
         status_code = 500
 
-        async def send_wrapper(message: dict) -> None:
+        async def send_wrapper(message: MutableMapping[str, Any]) -> None:
             nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = message["status"]

@@ -2,6 +2,9 @@ import asyncio
 import ipaddress
 import re
 import socket
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -10,7 +13,15 @@ import httpx
 
 from harness.config import Settings
 from harness.db.enums import RiskTier
+from harness.runtime.command_policy import inspect_shell_command
+from harness.runtime.file_writes import atomic_write_text
 from harness.runtime.native_tools import _strip_html
+from harness.runtime.processes import (
+    close_process_transport,
+    process_group_kwargs,
+    terminate_process_tree,
+)
+from harness.runtime.redaction import redact_secrets
 from harness.runtime.tools import Tool
 
 READ_FILE_TOOL_NAME = "read_file"
@@ -20,6 +31,10 @@ LIST_FILES_TOOL_NAME = "list_files"
 GREP_TOOL_NAME = "grep"
 RUN_CLI_TOOL_NAME = "run_cli"
 FETCH_URL_TOOL_NAME = "fetch_url"
+START_PROCESS_TOOL_NAME = "start_process"
+READ_PROCESS_OUTPUT_TOOL_NAME = "read_process_output"
+STOP_PROCESS_TOOL_NAME = "stop_process"
+WAIT_FOR_HTTP_TOOL_NAME = "wait_for_http"
 
 # Directories never walked by list_files/grep — noise, not user code.
 _SKIP_DIR_NAMES = frozenset(
@@ -38,30 +53,6 @@ _SKIP_DIR_NAMES = frozenset(
 _MAX_LIST_RESULTS = 200
 _MAX_GREP_MATCHES = 200
 _MAX_GREP_FILE_BYTES = 2_000_000  # skip files larger than this when grepping
-
-_SECRET_FILE_NAMES = {".env", ".env.local", ".env.production", "credentials.json"}
-_PRIVATE_KEY_PATTERN = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S
-)
-_CREDENTIAL_PATTERN = re.compile(
-    r"(?i)(api[_-]?key|secret|password|token|authorization)(\s*[:=]\s*)(['\"]?)[^\s'\"]+\3"
-)
-
-
-def _redact_secrets(path: str, content: str) -> tuple[str, int]:
-    name = Path(path).name.lower()
-    redactions = 0
-    if name in _SECRET_FILE_NAMES or name.endswith((".pem", ".key")):
-        redactions += 1
-        return "[REDACTED SENSITIVE FILE CONTENT]", redactions
-    redacted = content
-    redacted, count = _PRIVATE_KEY_PATTERN.subn("[REDACTED PRIVATE KEY]", redacted)
-    redactions += count
-    redacted, count = _CREDENTIAL_PATTERN.subn(
-        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted
-    )
-    redactions += count
-    return redacted, redactions
 
 
 def _resolve_scoped_path(root: Path, relative_path: str) -> Path:
@@ -92,7 +83,7 @@ def build_read_file_tool(root: Path) -> Tool:
         if not resolved.is_file():
             raise ValueError(f"file not found: {path}")
         content = resolved.read_text(encoding="utf-8", errors="replace")
-        safe_content, redactions = _redact_secrets(path, content)
+        safe_content, redactions = redact_secrets(path, content)
         return {
             "path": path,
             "content": safe_content,
@@ -123,9 +114,7 @@ def build_write_file_tool(root: Path) -> Tool:
         if not path or content is None:
             raise ValueError("write_file requires 'path' and 'content' fields")
         resolved = _resolve_scoped_path(root, path)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
-        return {"path": path, "bytes_written": len(content.encode("utf-8"))}
+        return {"path": path, **atomic_write_text(resolved, content)}
 
     return Tool(
         name=WRITE_FILE_TOOL_NAME,
@@ -172,8 +161,12 @@ def build_edit_file_tool(root: Path) -> Tool:
             )
 
         updated = original.replace(old_string, new_string, 1)
-        resolved.write_text(updated, encoding="utf-8")
-        return {"path": path, "old_string": old_string, "new_string": new_string}
+        return {
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+            **atomic_write_text(resolved, updated),
+        }
 
     return Tool(
         name=EDIT_FILE_TOOL_NAME,
@@ -307,6 +300,7 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
         command = arguments.get("command")
         if not command:
             raise ValueError("run_cli requires a 'command' field")
+        metadata = inspect_shell_command(command)
 
         cwd = root.resolve()
         proc = await asyncio.create_subprocess_shell(
@@ -314,26 +308,30 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_group_kwargs(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=settings.tools_run_cli_timeout_seconds
             )
         except TimeoutError as exc:
-            proc.kill()
-            await proc.wait()
+            await terminate_process_tree(proc, drain_pipes=True)
+            close_process_transport(proc)
             raise ValueError(
                 f"command timed out after {settings.tools_run_cli_timeout_seconds}s"
             ) from exc
 
         max_bytes = settings.tools_run_cli_max_output_bytes
-        return {
+        result = {
             "command": command,
             "cwd": str(cwd),
             "exit_code": proc.returncode,
             "stdout": stdout[:max_bytes].decode("utf-8", errors="replace"),
             "stderr": stderr[:max_bytes].decode("utf-8", errors="replace"),
+            **metadata.as_dict(),
         }
+        close_process_transport(proc)
+        return result
 
     return Tool(
         name=RUN_CLI_TOOL_NAME,
@@ -351,6 +349,222 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
         handler=handler,
         risk_tier=RiskTier.destructive,
     )
+
+
+@dataclass
+class _ManagedProcess:
+    command: str
+    process: asyncio.subprocess.Process
+    stdout: deque[str] = field(default_factory=deque)
+    stderr: deque[str] = field(default_factory=deque)
+    output_chars: int = 0
+    reader_tasks: list[asyncio.Task[None]] = field(default_factory=list)
+
+
+class BackgroundProcessManager:
+    """Owns long-running child processes for one Marcus CLI session."""
+
+    def __init__(self, root: Path, *, max_output_chars: int = 50_000) -> None:
+        self.root = root.resolve()
+        self.max_output_chars = max_output_chars
+        self._processes: dict[str, _ManagedProcess] = {}
+
+    async def start(self, command: str) -> dict[str, Any]:
+        metadata = inspect_shell_command(command)
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(self.root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **process_group_kwargs(),
+        )
+        process_id = uuid.uuid4().hex[:12]
+        managed = _ManagedProcess(command=command, process=proc)
+        self._processes[process_id] = managed
+        assert proc.stdout is not None and proc.stderr is not None
+        managed.reader_tasks = [
+            asyncio.create_task(self._capture(managed, proc.stdout, managed.stdout)),
+            asyncio.create_task(self._capture(managed, proc.stderr, managed.stderr)),
+        ]
+        await asyncio.sleep(0)
+        return {
+            "process_id": process_id,
+            "pid": proc.pid,
+            "command": command,
+            "cwd": str(self.root),
+            "status": self._status(proc),
+            **metadata.as_dict(),
+        }
+
+    async def _capture(
+        self,
+        managed: _ManagedProcess,
+        stream: asyncio.StreamReader,
+        destination: deque[str],
+    ) -> None:
+        while chunk := await stream.readline():
+            text = chunk.decode("utf-8", errors="replace")
+            destination.append(text)
+            managed.output_chars += len(text)
+            while managed.output_chars > self.max_output_chars:
+                candidates = [buffer for buffer in (managed.stdout, managed.stderr) if buffer]
+                if not candidates:
+                    break
+                removed = candidates[0].popleft()
+                managed.output_chars -= len(removed)
+
+    def output(self, process_id: str) -> dict[str, Any]:
+        canonical_id, managed = self._get(process_id)
+        return {
+            "process_id": canonical_id,
+            "status": self._status(managed.process),
+            "exit_code": managed.process.returncode,
+            "stdout": "".join(managed.stdout),
+            "stderr": "".join(managed.stderr),
+        }
+
+    async def stop(self, process_id: str) -> dict[str, Any]:
+        canonical_id, managed = self._get(process_id)
+        await terminate_process_tree(managed.process)
+        await asyncio.gather(*managed.reader_tasks, return_exceptions=True)
+        close_process_transport(managed.process)
+        return {
+            "process_id": canonical_id,
+            "status": "stopped",
+            "exit_code": managed.process.returncode,
+        }
+
+    async def aclose(self) -> None:
+        await asyncio.gather(
+            *(self.stop(process_id) for process_id in list(self._processes)),
+            return_exceptions=True,
+        )
+        self._processes.clear()
+
+    def _get(self, process_id: str) -> tuple[str, _ManagedProcess]:
+        if process_id in self._processes:
+            return process_id, self._processes[process_id]
+
+        # Models sometimes repeat an identifier as the visible abbreviated
+        # form (for example "4fe927..."). Accept it only when a sufficiently
+        # long prefix identifies exactly one session-owned process.
+        prefix = process_id.rstrip(".")
+        matches = [key for key in self._processes if len(prefix) >= 6 and key.startswith(prefix)]
+        if len(matches) == 1:
+            canonical_id = matches[0]
+            return canonical_id, self._processes[canonical_id]
+        if len(matches) > 1:
+            raise ValueError(f"ambiguous process_id prefix: {process_id}")
+        raise ValueError(f"unknown process_id: {process_id}")
+
+    @staticmethod
+    def _status(proc: asyncio.subprocess.Process) -> str:
+        return "running" if proc.returncode is None else "exited"
+
+
+class MarcusTools(list[Tool]):
+    def __init__(self, tools: list[Tool], process_manager: BackgroundProcessManager) -> None:
+        super().__init__(tools)
+        self.process_manager = process_manager
+
+    async def aclose(self) -> None:
+        await self.process_manager.aclose()
+
+
+def build_background_process_tools(manager: BackgroundProcessManager) -> list[Tool]:
+    async def start_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        command = arguments.get("command")
+        if not command:
+            raise ValueError("start_process requires a 'command' field")
+        return await manager.start(command)
+
+    async def output_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        process_id = arguments.get("process_id")
+        if not process_id:
+            raise ValueError("read_process_output requires a 'process_id' field")
+        return manager.output(process_id)
+
+    async def stop_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        process_id = arguments.get("process_id")
+        if not process_id:
+            raise ValueError("stop_process requires a 'process_id' field")
+        return await manager.stop(process_id)
+
+    async def wait_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        url = arguments.get("url")
+        if not url:
+            raise ValueError("wait_for_http requires a 'url' field")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            raise ValueError("wait_for_http only permits localhost HTTP(S) URLs")
+        timeout = min(max(float(arguments.get("timeout_seconds", 30)), 0.1), 120)
+        deadline = asyncio.get_running_loop().time() + timeout
+        last_error = "service not ready"
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    response = await client.get(url)
+                    if response.status_code < 500:
+                        return {"url": url, "ready": True, "status": response.status_code}
+                    last_error = f"HTTP {response.status_code}"
+                except httpx.HTTPError as exc:
+                    last_error = str(exc)
+                await asyncio.sleep(0.1)
+        raise ValueError(f"service was not ready after {timeout:g}s: {last_error}")
+
+    process_id_schema = {
+        "type": "object",
+        "properties": {"process_id": {"type": "string"}},
+        "required": ["process_id"],
+    }
+    return [
+        Tool(
+            name=START_PROCESS_TOOL_NAME,
+            description="Start a long-running service in the background and return its process_id.",
+            parameters={
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+            handler=start_handler,
+            risk_tier=RiskTier.destructive,
+        ),
+        Tool(
+            name=READ_PROCESS_OUTPUT_TOOL_NAME,
+            description="Read current stdout, stderr, and status of a background process.",
+            parameters=process_id_schema,
+            handler=output_handler,
+            risk_tier=RiskTier.read_only,
+            idempotent=True,
+        ),
+        Tool(
+            name=STOP_PROCESS_TOOL_NAME,
+            description="Stop a background process and all of its descendants.",
+            parameters=process_id_schema,
+            handler=stop_handler,
+            risk_tier=RiskTier.sensitive_write,
+            idempotent=True,
+        ),
+        Tool(
+            name=WAIT_FOR_HTTP_TOOL_NAME,
+            description="Wait until a localhost HTTP service is ready to accept requests.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "timeout_seconds": {"type": "number", "minimum": 0.1, "maximum": 120},
+                },
+                "required": ["url"],
+            },
+            handler=wait_handler,
+            risk_tier=RiskTier.read_only,
+            idempotent=True,
+        ),
+    ]
 
 
 def build_fetch_url_tool(settings: Settings) -> Tool:
@@ -436,10 +650,13 @@ def _validate_public_url(url: str) -> None:
             )
 
 
-def build_marcus_tools(root: Path, settings: Settings) -> list[Tool]:
+def build_marcus_tools(root: Path, settings: Settings) -> MarcusTools:
     from marcus_code.skills import build_load_skill_tool
 
-    return [
+    process_manager = BackgroundProcessManager(
+        root, max_output_chars=settings.tools_run_cli_max_output_bytes
+    )
+    tools = [
         build_read_file_tool(root),
         build_write_file_tool(root),
         build_edit_file_tool(root),
@@ -449,3 +666,5 @@ def build_marcus_tools(root: Path, settings: Settings) -> list[Tool]:
         build_fetch_url_tool(settings),
         build_load_skill_tool(root),
     ]
+    tools.extend(build_background_process_tools(process_manager))
+    return MarcusTools(tools, process_manager)

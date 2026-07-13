@@ -1,6 +1,6 @@
 [project]
 name = "marcus"
-version = "0.1.0"
+version = "1.0.0.1"
 description = "Hermes-style AI agent harness with PostgreSQL as source of truth"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,6 +29,7 @@ dependencies = [
     "prometheus-client>=0.21.0",
     "apscheduler>=3.10.4",
     "rich>=13.7.0",
+    "prompt-toolkit>=3.0.43",
 ]
 
 [project.urls]
@@ -40,6 +41,9 @@ Issues = "https://github.com/lazymarcus005-maker/marcus/issues"
 marcus = "marcus_code.cli:main"
 
 [project.optional-dependencies]
+ollama-usage = [
+    "playwright>=1.49.0",
+]
 dev = [
     "pytest>=8.3.3",
     "pytest-asyncio>=0.24.0",

@@ -2,9 +2,11 @@ import pytest
 
 import marcus_code.config as config_module
 from harness.config import Settings
+from harness.llm.types import LLMMessage
 from marcus_code.commands import CommandContext, dispatch
 from marcus_code.config import save_user_config
 from marcus_code.loop import MarcusLoop
+from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
 from tests.fakes import ScriptedLLMGateway, text_response
 
 
@@ -17,6 +19,7 @@ class _FakeUI:
         self.config_shown: list = []
         self._config_edit_result = config_edit_result
         self.config_edit_calls: list[dict] = []
+        self.ollama_usage = []
 
     def print_info(self, message):
         self.info.append(message)
@@ -42,6 +45,9 @@ class _FakeUI:
             }
         )
         return self._config_edit_result
+
+    def print_ollama_cloud_usage(self, usage):
+        self.ollama_usage.append(usage)
 
 
 def _point_user_config_at(monkeypatch, tmp_path):
@@ -133,6 +139,54 @@ async def test_usage_command_reports_loop_usage_stats():
 
 
 @pytest.mark.asyncio
+async def test_usage_command_fetches_ollama_cloud_usage(monkeypatch):
+    expected = OllamaCloudUsage(
+        session=UsagePeriod(14.3, "2 hours"),
+        weekly=UsagePeriod(14.5, "10 hours"),
+    )
+
+    class _Client:
+        has_profile = True
+
+        async def fetch(self, *, interactive=False):
+            assert interactive is False
+            return expected
+
+    monkeypatch.setattr("marcus_code.commands.OllamaCloudUsageClient", _Client)
+    ui = _FakeUI()
+    settings = Settings(
+        llm_api_key="sk-real",
+        llm_base_url="https://ollama.com/v1",
+        llm_model="model",
+    )
+    ctx = _make_ctx(ui, settings=settings)
+
+    await dispatch(ctx, "/usage")
+
+    assert ui.ollama_usage == [expected]
+
+
+@pytest.mark.asyncio
+async def test_usage_logout_clears_saved_ollama_session(monkeypatch):
+    class _Client:
+        def logout(self):
+            return 3
+
+    monkeypatch.setattr("marcus_code.commands.OllamaCloudUsageClient", _Client)
+    ui = _FakeUI()
+    settings = Settings(
+        llm_api_key="sk-real",
+        llm_base_url="https://ollama.com/v1",
+        llm_model="model",
+    )
+    ctx = _make_ctx(ui, settings=settings)
+
+    await dispatch(ctx, "/usage logout")
+
+    assert any("login data cleared" in message for message in ui.info)
+
+
+@pytest.mark.asyncio
 async def test_config_command_with_no_args_shows_current_settings():
     ui = _FakeUI()
     ctx = _make_ctx(ui)
@@ -219,3 +273,53 @@ async def test_config_unknown_action_reports_error():
     await dispatch(ctx, "/config bogus")
 
     assert "unknown /config action" in ui.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_mode_command_shows_and_switches_mode():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/mode")
+    await dispatch(ctx, "/mode auto")
+
+    assert ui.info[0].startswith("Current mode: agent")
+    assert all(mode in ui.info[0] for mode in ("ask", "agent", "auto", "yolo"))
+    assert ctx.loop.mode.value == "auto"
+    assert "auto" in ui.info[1]
+    assert "high-risk" in ui.info[1]
+
+
+@pytest.mark.asyncio
+async def test_mode_command_rejects_unknown_mode():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/mode reckless")
+
+    assert "unknown mode" in ui.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_clear_command_clears_context_and_all_clears_approvals():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+    ctx.loop.state.history.append(LLMMessage(role="user", content="old context"))
+    ctx.loop.state.always_allowed.add("run_cli")
+
+    await dispatch(ctx, "/clear")
+    assert not any(message.role == "user" for message in ctx.loop.state.history)
+    assert ctx.loop.state.always_allowed == {"run_cli"}
+
+    await dispatch(ctx, "/clear --all")
+    assert ctx.loop.state.always_allowed == set()
+
+
+@pytest.mark.asyncio
+async def test_compact_command_reports_before_and_after():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/compact")
+
+    assert "estimated tokens" in ui.info[-1]

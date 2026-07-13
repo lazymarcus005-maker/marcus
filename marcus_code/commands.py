@@ -3,8 +3,15 @@ from dataclasses import dataclass
 
 from harness.config import Settings
 from harness.llm.gateway import LLMGateway
+from harness.llm.types import LLMMessage
 from marcus_code.config import has_llm_credentials, resolve_settings, save_user_config
 from marcus_code.loop import MarcusLoop
+from marcus_code.modes import AgentMode, mode_help, mode_hint, mode_instructions
+from marcus_code.ollama_usage import (
+    OllamaCloudUsageClient,
+    OllamaUsageError,
+    is_ollama_cloud,
+)
 from marcus_code.ui import TerminalUI
 
 EXIT_COMMANDS = {"/exit", "/quit"}
@@ -47,11 +54,95 @@ async def _cmd_model(ctx: CommandContext, args: str) -> None:
 
 
 async def _cmd_usage(ctx: CommandContext, args: str) -> None:
+    action = args.strip().lower()
+    if action not in {"", "login", "logout"}:
+        ctx.ui.print_error("usage: /usage, /usage login, or /usage logout")
+        return
     ctx.ui.print_usage(
         ctx.loop.usage,
         session_started_at=ctx.loop.started_at,
         max_total_tokens=ctx.loop.max_total_tokens,
     )
+    if not is_ollama_cloud(ctx.settings.llm_base_url):
+        return
+
+    client = OllamaCloudUsageClient()
+    if action == "logout":
+        try:
+            removed = client.logout()
+        except OllamaUsageError as exc:
+            ctx.ui.print_error(f"Ollama Cloud logout failed: {exc}")
+            return
+        ctx.ui.print_info(f"Ollama Cloud login data cleared ({removed} item(s)).")
+        return
+    # Only the explicit login command may open a visible browser. Plain
+    # /usage must remain non-interactive and use the saved session state.
+    interactive = action == "login"
+    if interactive:
+        ctx.ui.print_info(
+            "Opening Ollama settings in a browser. Log in there if requested; "
+            "Marcus will continue when usage is available."
+        )
+    try:
+        usage = await client.fetch(interactive=interactive)
+    except OllamaUsageError as exc:
+        ctx.ui.print_error(f"Ollama Cloud usage unavailable: {exc}")
+        return
+    if hasattr(ctx.ui, "print_ollama_cloud_usage"):
+        ctx.ui.print_ollama_cloud_usage(usage)
+
+
+async def _cmd_steps(ctx: CommandContext, args: str) -> None:
+    if hasattr(ctx.ui, "print_steps"):
+        ctx.ui.print_steps()
+
+
+async def _cmd_compact(ctx: CommandContext, args: str) -> None:
+    before, after = ctx.loop.compact_history()
+    ctx.ui.print_info(f"Context compacted: {before:,} → {after:,} estimated tokens.")
+
+
+async def _cmd_clear(ctx: CommandContext, args: str) -> None:
+    action = args.strip().lower()
+    if action not in {"", "--all"}:
+        ctx.ui.print_error("usage: /clear or /clear --all")
+        return
+    ctx.loop.clear_history(clear_all=action == "--all")
+    detail = "context and approval preferences" if action == "--all" else "conversation context"
+    ctx.ui.print_info(f"Cleared {detail}.")
+
+
+async def _cmd_status(ctx: CommandContext, args: str) -> None:
+    if hasattr(ctx.ui, "print_status"):
+        ctx.ui.print_status()
+
+
+async def _cmd_mode(ctx: CommandContext, args: str) -> None:
+    value = args.strip().lower()
+    if not value:
+        ctx.ui.print_info(f"Current mode: {ctx.loop.mode.value}\n{mode_help()}")
+        return
+    try:
+        mode = AgentMode(value)
+    except ValueError:
+        choices = ", ".join(item.value for item in AgentMode)
+        ctx.ui.print_error(f"unknown mode: {value!r} (choose: {choices})")
+        return
+    if (
+        mode is AgentMode.yolo
+        and hasattr(ctx.ui, "confirm_yolo_mode")
+        and not ctx.ui.confirm_yolo_mode()
+    ):
+        ctx.ui.print_info("Mode unchanged.")
+        return
+    ctx.loop.mode = mode
+    ctx.loop.state.always_allowed.clear()
+    ctx.loop.state.history.append(
+        LLMMessage(role="system", content=f"Mode changed. {mode_instructions(mode)}")
+    )
+    if hasattr(ctx.ui, "set_mode"):
+        ctx.ui.set_mode(mode.value)
+    ctx.ui.print_info(f"Mode switched to {mode.value!r} for this session.\nHint: {mode_hint(mode)}")
 
 
 async def _cmd_config(ctx: CommandContext, args: str) -> None:
@@ -89,6 +180,11 @@ COMMANDS: dict[str, CommandHandler] = {
     "/?": _cmd_help,
     "/model": _cmd_model,
     "/usage": _cmd_usage,
+    "/steps": _cmd_steps,
+    "/compact": _cmd_compact,
+    "/clear": _cmd_clear,
+    "/status": _cmd_status,
+    "/mode": _cmd_mode,
     "/config": _cmd_config,
 }
 

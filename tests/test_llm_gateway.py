@@ -45,6 +45,20 @@ async def test_complete_parses_basic_response():
 
 
 @pytest.mark.asyncio
+async def test_complete_estimates_usage_when_provider_omits_it():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _openai_response(content="answer")
+        body.pop("usage")
+        return httpx.Response(200, json=body)
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete([LLMMessage(role="user", content="hello")])
+
+    assert response.usage.total_tokens > 0
+    assert response.usage.source == "estimated"
+
+
+@pytest.mark.asyncio
 async def test_complete_stream_emits_text_deltas():
     body = "\n".join(
         [
@@ -83,6 +97,48 @@ async def test_complete_stream_assembles_tool_call_fragments():
     response = await gateway.complete_stream([LLMMessage(role="user", content="search")])
     assert response.tool_calls[0].name == "search"
     assert response.tool_calls[0].arguments == {"q": "x"}
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_retries_on_5xx_then_succeeds(monkeypatch):
+    monkeypatch.setattr("harness.llm.gateway.asyncio.sleep", _no_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(500, text="temporary failure")
+        return httpx.Response(
+            200,
+            text='data: {"choices":[{"delta":{"content":"recovered"}}]}\n\ndata: [DONE]',
+        )
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete_stream([LLMMessage(role="user", content="hello")])
+
+    assert calls["n"] == 2
+    assert response.content == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_retries_malformed_sse_json(monkeypatch):
+    monkeypatch.setattr("harness.llm.gateway.asyncio.sleep", _no_sleep)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, text="data: {not-json}\n\ndata: [DONE]")
+        return httpx.Response(
+            200,
+            text='data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]',
+        )
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    response = await gateway.complete_stream([LLMMessage(role="user", content="hello")])
+
+    assert calls["n"] == 2
+    assert response.content == "ok"
 
 
 @pytest.mark.asyncio

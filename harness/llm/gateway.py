@@ -88,7 +88,7 @@ class LLMGateway:
         if tools:
             self._tool_capable = True
 
-        return _parse_response(body)
+        return _ensure_usage(_parse_response(body), payload)
 
     async def complete_stream(
         self,
@@ -97,6 +97,7 @@ class LLMGateway:
         tools: list[ToolSpec] | None = None,
         model: str | None = None,
         on_delta: Callable[[str], None] | None = None,
+        max_retries: int = 3,
     ) -> LLMResponse:
         """Stream text deltas while assembling a normal LLMResponse.
 
@@ -108,23 +109,52 @@ class LLMGateway:
             "messages": [m.to_openai() for m in messages],
             "temperature": 0.0,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = [t.to_openai() for t in tools]
+        attempt = 0
+        while True:
+            try:
+                return await self._complete_stream_once(payload, model=model, on_delta=on_delta)
+            except (httpx.TransportError, LLMTransientError) as exc:
+                if attempt >= max_retries:
+                    raise LLMTransientError(
+                        f"LLM streaming request failed after {attempt + 1} attempts: {exc}"
+                    ) from exc
+                await asyncio.sleep(_backoff_delay(attempt))
+                attempt += 1
+
+    async def _complete_stream_once(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str | None,
+        on_delta: Callable[[str], None] | None,
+    ) -> LLMResponse:
         content_parts: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         usage = Usage(0, 0, 0)
         finish_reason = "stop"
         async with self._client.stream("POST", "/chat/completions", json=payload) as response:
             if response.status_code != 200:
-                raise LLMError(f"LLM streaming request failed with status {response.status_code}")
+                await response.aread()
+                if response.status_code in RETRYABLE_STATUS_CODES:
+                    raise LLMTransientError(f"status {response.status_code}: {response.text[:500]}")
+                raise LLMError(
+                    f"LLM streaming request failed with status {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
                 raw = line[5:].strip()
                 if raw == "[DONE]":
                     break
-                chunk = orjson.loads(raw)
+                try:
+                    chunk = orjson.loads(raw)
+                except orjson.JSONDecodeError as exc:
+                    raise LLMTransientError("LLM stream returned malformed JSON") from exc
                 choice = (chunk.get("choices") or [{}])[0]
                 finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta") or {}
@@ -151,7 +181,7 @@ class LLMGateway:
             ToolCall(id=v["id"], name=v["name"], arguments=orjson.loads(v["arguments"] or "{}"))
             for v in calls.values()
         ]
-        return LLMResponse(
+        llm_response = LLMResponse(
             "".join(content_parts) or None,
             tool_calls,
             finish_reason,
@@ -159,6 +189,7 @@ class LLMGateway:
             model or self._settings.llm_model,
             {},
         )
+        return _ensure_usage(llm_response, payload)
 
     async def _post_with_retry(
         self, payload: dict[str, Any], *, max_retries: int
@@ -242,3 +273,26 @@ def _parse_response(body: dict[str, Any]) -> LLMResponse:
         model=body.get("model", ""),
         raw=body,
     )
+
+
+def _ensure_usage(response: LLMResponse, payload: dict[str, Any]) -> LLMResponse:
+    """Estimate non-zero usage when an OpenAI-compatible provider omits it."""
+    if response.usage.total_tokens > 0:
+        return response
+
+    prompt_bytes = len(orjson.dumps(payload.get("messages", [])))
+    if payload.get("tools"):
+        prompt_bytes += len(orjson.dumps(payload["tools"]))
+    completion_bytes = len((response.content or "").encode())
+    completion_bytes += sum(
+        len(call.name.encode()) + len(orjson.dumps(call.arguments)) for call in response.tool_calls
+    )
+    prompt_tokens = max(1, (prompt_bytes + 3) // 4)
+    completion_tokens = max(1, (completion_bytes + 3) // 4)
+    response.usage = Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        source="estimated",
+    )
+    return response

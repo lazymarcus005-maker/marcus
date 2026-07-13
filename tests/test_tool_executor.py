@@ -44,7 +44,9 @@ async def test_execute_writes_started_row_before_calling_handler(db_session):
 
     outcome = await executor.execute(run, 0, 0, call, tool=tool)
 
-    assert outcome.observation == {"ok": True}
+    assert outcome.observation["ok"] is True
+    assert outcome.observation["status"] == "ok"
+    assert outcome.observation["evidence_id"]
     assert handler_invoked["count"] == 1
 
     execution = await _get_execution(db_session, f"{run.id}:0:0")
@@ -97,7 +99,8 @@ async def test_read_only_crash_recovery_retries_automatically(db_sessionmaker):
         outcome = await executor.execute(run, 0, 0, call, tool=tool)
 
         assert handler_invoked["count"] == 1
-        assert outcome.observation == {"hits": []}
+        assert outcome.observation["hits"] == []
+        assert outcome.observation["status"] == "ok"
         assert not outcome.fatal
 
 
@@ -170,7 +173,9 @@ async def test_successful_execution_is_not_repeated_on_replay(db_session):
     second = await executor.execute(run, 0, 0, call, tool=tool)
 
     assert handler_invoked["count"] == 1
-    assert first.observation == second.observation == {"call": 1}
+    assert first.observation == second.observation
+    assert first.observation["call"] == 1
+    assert first.observation["status"] == "ok"
 
 
 @pytest.mark.asyncio
