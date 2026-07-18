@@ -7,6 +7,7 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 
 from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
+from marcus_code.todo_tracker import Phase, TodoTracker
 from marcus_code.ui import SlashCommandAutoSuggest, TerminalUI, Theme, _history_path
 
 
@@ -74,16 +75,51 @@ def _capturing_ui(*, height: int | None = None) -> tuple[TerminalUI, StringIO]:
     return ui, stream
 
 
-def test_thinking_indicator_prints_and_replaces_with_timing():
+def test_thinking_indicator_stays_inside_working_box():
     ui, stream = _capturing_ui()
 
+    ui.begin_turn()
     ui.start_thinking()
-    output = stream.getvalue()
-    assert "think..." in output
+    ui.console.print(ui._working_renderable())
+    assert "thinking" in stream.getvalue()
 
     ui.stop_thinking(1.234)
+    ui.console.print(ui._working_renderable())
+    assert "thought 1.2s" in stream.getvalue()
+
+
+def test_working_view_is_one_minimal_box_for_phase_thinking_and_steps():
+    ui, stream = _capturing_ui()
+    ui.bind_status(
+        lambda: {
+            "session_started_at": datetime.now(),
+            "model": "test-model",
+            "mode": "agent",
+            "workspace": "workspace",
+            "context_tokens": 25,
+            "context_limit": 100,
+            "total_tokens": 50,
+            "tokens_per_second": 10.0,
+        }
+    )
+    ui.begin_turn()
+    todo = TodoTracker()
+    todo.advance(Phase.implement, "working")
+    ui.update_todo(todo)
+    ui.print_tool_call("read_file", {"path": "app.py"})
+    ui.print_tool_result("read_file", {"path": "app.py", "lines": 20})
+    ui.start_thinking()
+
+    ui.console.print(ui._working_renderable())
+
     output = stream.getvalue()
-    assert "thought: 1.23s" in output
+    assert output.count("┌") == 1
+    assert output.count("└") == 1
+    assert "ดำเนินการ" in output
+    assert "app.py" in output
+    assert "thinking" in output
+    assert "test-model · ctx 25% · agent" in output
+    assert "Session" not in output
 
 
 def test_tool_call_collapses_when_finished_unsuccessfully():
@@ -93,9 +129,7 @@ def test_tool_call_collapses_when_finished_unsuccessfully():
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "stopped after 1x step" in output
-    assert "Ctrl+E expand" in output
-    assert "Ctrl+R collapse" in output
+    assert "× stopped · 1 tool(s) · /steps" in output
 
 
 def test_command_result_collapses_and_steps_expands():
@@ -109,8 +143,7 @@ def test_command_result_collapses_and_steps_expands():
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "stopped after 1x step" in output
-    assert "Ctrl+E expand" in output
+    assert "× stopped · 1 tool(s) · /steps" in output
 
     ui.print_steps()
     expanded = stream.getvalue()
@@ -132,8 +165,7 @@ def test_process_results_collapses_and_steps_expands():
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "stopped after 2x step" in output
-    assert "Ctrl+E expand" in output
+    assert "× stopped · 2 tool(s) · /steps" in output
 
     ui.print_steps()
     expanded = stream.getvalue()
@@ -149,7 +181,7 @@ def test_final_answer_has_spacing_heading_and_content():
     ui.print_final_answer("API ทำงานสำเร็จ")
 
     output = stream.getvalue()
-    assert "worked 1x step complete" in output
+    assert "✓ done · 1 tool(s) · /steps" in output
     assert output.rstrip().endswith("API ทำงานสำเร็จ")
 
 
@@ -171,16 +203,13 @@ def test_success_collapses_steps_and_steps_command_restores_details():
 
     ui.finish_steps(success=True)
     collapsed = stream.getvalue()
-    assert "worked 1x step complete" in collapsed
-    assert "Ctrl+E expand" in collapsed
-    assert "Ctrl+R collapse" in collapsed
+    assert "✓ done · 1 tool(s) · /steps" in collapsed
 
     ui.print_steps()
     expanded = stream.getvalue()
     assert "run_cli(command='pytest -q')" in expanded
     assert "10 passed" in expanded
-    assert "Ctrl+R to collapse" in expanded
-    assert "Ctrl+R collapse" in expanded
+    assert "Last steps" in expanded
 
 
 def test_working_box_keeps_latest_lines_visible_when_terminal_is_short():
@@ -192,7 +221,7 @@ def test_working_box_keeps_latest_lines_visible_when_terminal_is_short():
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "stopped after 8x step" in output
+    assert "× stopped · 8 tool(s) · /steps" in output
 
     ui.print_steps()
     expanded = stream.getvalue()

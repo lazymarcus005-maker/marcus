@@ -173,6 +173,7 @@ def build_write_file_tool(root: Path) -> Tool:
         },
         handler=handler,
         risk_tier=RiskTier.sensitive_write,
+        mutates_workspace=True,
     )
 
 
@@ -230,6 +231,7 @@ def build_edit_file_tool(root: Path) -> Tool:
         },
         handler=handler,
         risk_tier=RiskTier.sensitive_write,
+        mutates_workspace=True,
     )
 
 
@@ -452,6 +454,10 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
         },
         handler=handler,
         risk_tier=RiskTier.destructive,
+        # An arbitrary shell command can change files. Treat it conservatively
+        # and record verification after the revision bump when it is a check.
+        mutates_workspace=True,
+        evidence_type="command",
     )
 
 
@@ -636,6 +642,7 @@ def build_background_process_tools(manager: BackgroundProcessManager) -> list[To
             },
             handler=start_handler,
             risk_tier=RiskTier.destructive,
+            volatile=True,
         ),
         Tool(
             name=READ_PROCESS_OUTPUT_TOOL_NAME,
@@ -644,6 +651,7 @@ def build_background_process_tools(manager: BackgroundProcessManager) -> list[To
             handler=output_handler,
             risk_tier=RiskTier.read_only,
             idempotent=True,
+            volatile=True,
         ),
         Tool(
             name=STOP_PROCESS_TOOL_NAME,
@@ -652,6 +660,7 @@ def build_background_process_tools(manager: BackgroundProcessManager) -> list[To
             handler=stop_handler,
             risk_tier=RiskTier.sensitive_write,
             idempotent=True,
+            volatile=True,
         ),
         Tool(
             name=WAIT_FOR_HTTP_TOOL_NAME,
@@ -667,6 +676,8 @@ def build_background_process_tools(manager: BackgroundProcessManager) -> list[To
             handler=wait_handler,
             risk_tier=RiskTier.read_only,
             idempotent=True,
+            evidence_type="http",
+            volatile=True,
         ),
     ]
 

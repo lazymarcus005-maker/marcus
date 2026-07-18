@@ -79,6 +79,75 @@ def rank_message_importance(messages: list[LLMMessage]) -> list[tuple[int, int]]
     return scored
 
 
+def _atomic_message_groups(messages: list[LLMMessage]) -> list[list[int]]:
+    """Group an assistant tool request with every following tool result.
+
+    OpenAI-compatible APIs require tool-call/result messages to stay paired.
+    Treating the group as one trimming unit prevents compaction from creating
+    orphaned tool calls or orphaned observations.
+    """
+
+    groups: list[list[int]] = []
+    index = 0
+    while index < len(messages):
+        group = [index]
+        if messages[index].role == "assistant" and messages[index].tool_calls:
+            cursor = index + 1
+            while cursor < len(messages) and messages[cursor].role == "tool":
+                group.append(cursor)
+                cursor += 1
+            index = cursor
+        else:
+            index += 1
+        groups.append(group)
+    return groups
+
+
+def trim_messages_to_count(
+    messages: list[LLMMessage],
+    max_messages: int,
+    *,
+    preserve_system: bool = True,
+    preserve_latest_user: bool = True,
+) -> list[LLMMessage]:
+    """Apply a message-count cap without splitting tool interactions."""
+
+    if len(messages) <= max_messages:
+        return list(messages)
+    protected: set[int] = set()
+    if preserve_system:
+        protected.update(i for i, message in enumerate(messages) if message.role == "system")
+    if preserve_latest_user:
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].role == "user":
+                protected.add(index)
+                break
+
+    scores = dict(rank_message_importance(messages))
+    groups = _atomic_message_groups(messages)
+    keep = set(range(len(groups)))
+    current_count = len(messages)
+    candidates = sorted(
+        range(len(groups)),
+        key=lambda group_index: (
+            max(scores[index] for index in groups[group_index]),
+            group_index,
+        ),
+    )
+    for group_index in candidates:
+        group = groups[group_index]
+        if any(index in protected for index in group):
+            continue
+        keep.remove(group_index)
+        current_count -= len(group)
+        if current_count <= max_messages:
+            break
+    kept_indices = {
+        index for group_index in keep for index in groups[group_index]
+    }
+    return [message for index, message in enumerate(messages) if index in kept_indices]
+
+
 def trim_messages_to_budget(
     messages: list[LLMMessage],
     token_budget: int,
@@ -101,24 +170,37 @@ def trim_messages_to_budget(
                 protected.add(idx)
                 break
 
-    ranked = sorted(rank_message_importance(messages), key=lambda item: item[1])
-    # Start with all indices, then drop lowest-score non-protected until we fit.
-    keep = set(range(len(messages)))
+    scores = dict(rank_message_importance(messages))
+    groups = _atomic_message_groups(messages)
+    # Start with all atomic groups, then drop the least-important unprotected
+    # group until the retained context fits.
+    keep = set(range(len(groups)))
     current_tokens = sum(estimate_message_tokens(m) for m in messages)
     if current_tokens <= token_budget:
         return list(messages)
 
-    for idx, _score in ranked:
-        if idx in protected:
+    ranked_groups = sorted(
+        range(len(groups)),
+        key=lambda group_index: (
+            max(scores[index] for index in groups[group_index]),
+            group_index,
+        ),
+    )
+    for group_index in ranked_groups:
+        group = groups[group_index]
+        if any(index in protected for index in group):
             continue
-        if idx not in keep:
+        if group_index not in keep:
             continue
-        keep.remove(idx)
-        current_tokens -= estimate_message_tokens(messages[idx])
+        keep.remove(group_index)
+        current_tokens -= sum(estimate_message_tokens(messages[index]) for index in group)
         if current_tokens <= token_budget:
             break
 
-    return [messages[idx] for idx in sorted(keep)]
+    kept_indices = {
+        index for group_index in keep for index in groups[group_index]
+    }
+    return [message for index, message in enumerate(messages) if index in kept_indices]
 
 
 def summarize_tool_result(content: str, max_chars: int = 800) -> str:
