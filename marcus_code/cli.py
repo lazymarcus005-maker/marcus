@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import base64
 import contextlib
 import inspect
 import json
@@ -125,6 +126,174 @@ def _update_command(install_method: str, target_version: str | None = None) -> l
         specifier = f"marcus=={target_version}" if target_version else "marcus"
         return [sys.executable, "-m", "pip", "install", "--upgrade", specifier]
     return []
+
+
+def _update_state_dir() -> Path:
+    state_dir = Path.home() / ".marcus"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
+
+
+def _deferred_update_files() -> tuple[Path, Path]:
+    state_dir = _update_state_dir()
+    return state_dir / "update-result.json", state_dir / "update.log"
+
+
+def _should_defer_windows_update(install_method: str) -> bool:
+    """Return whether updating would replace the running Windows interpreter."""
+    return os.name == "nt" and install_method == "uv_tool"
+
+
+def _schedule_windows_update(command: list[str], target_version: str) -> Path | None:
+    """Run a uv tool update after this process exits and releases Windows locks."""
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    if powershell is None:
+        return None
+
+    result_file, log_file = _deferred_update_files()
+    configuration = {
+        "parent_pid": os.getpid(),
+        "command": command,
+        "target_version": target_version,
+        "result_path": str(result_file),
+        "log_path": str(log_file),
+    }
+    encoded_configuration = base64.b64encode(json.dumps(configuration).encode("utf-8")).decode(
+        "ascii"
+    )
+    script = r"""
+$ErrorActionPreference = "Stop"
+$configurationJson = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String("__CONFIGURATION__")
+)
+$configuration = $configurationJson | ConvertFrom-Json
+$command = @($configuration.command | ForEach-Object { [string]$_ })
+$executable = $command[0]
+$arguments = @($command | Select-Object -Skip 1)
+$outputText = ""
+$exitCode = 1
+$attempt = 0
+
+try {
+    $deadline = (Get-Date).AddMinutes(2)
+    while ($null -ne (Get-Process -Id ([int]$configuration.parent_pid) -ErrorAction SilentlyContinue)) {
+        if ((Get-Date) -ge $deadline) {
+            throw "Timed out waiting for Marcus to exit."
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 500
+
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        $outputLines = @(& $executable @arguments 2>&1)
+        $exitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
+        $outputText = ($outputLines | Out-String).TrimEnd()
+        if ($exitCode -eq 0) {
+            break
+        }
+        if ($outputText -notmatch "(?i)(access is denied|os error 5|being used by another process)") {
+            break
+        }
+        Start-Sleep -Seconds 1
+    }
+} catch {
+    $outputText = ($_ | Out-String).TrimEnd()
+    $exitCode = 1
+}
+
+$status = if ($exitCode -eq 0) { "success" } else { "failed" }
+$finishedAt = [DateTime]::UtcNow.ToString("o")
+$logText = @(
+    "Marcus update to $($configuration.target_version): $status",
+    "Finished: $finishedAt",
+    "Attempts: $attempt",
+    "Command: $($command -join ' ')",
+    "",
+    $outputText
+) -join [Environment]::NewLine
+$result = [ordered]@{
+    status = $status
+    target_version = [string]$configuration.target_version
+    exit_code = $exitCode
+    finished_at = $finishedAt
+    log_path = [string]$configuration.log_path
+}
+$utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+[IO.File]::WriteAllText([string]$configuration.log_path, $logText, $utf8NoBom)
+[IO.File]::WriteAllText(
+    [string]$configuration.result_path,
+    ($result | ConvertTo-Json -Compress),
+    $utf8NoBom
+)
+""".replace("__CONFIGURATION__", encoded_configuration)
+    encoded_script = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+    pending = {
+        "status": "pending",
+        "target_version": target_version,
+        "started_at": datetime.now().timestamp(),
+        "log_path": str(log_file),
+    }
+    try:
+        result_file.write_text(json.dumps(pending), encoding="utf-8")
+        with contextlib.suppress(OSError):
+            log_file.unlink()
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
+        subprocess.Popen(  # noqa: S603 - command and target are constructed internally
+            [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded_script,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creation_flags,
+        )
+    except OSError:
+        with contextlib.suppress(OSError):
+            result_file.unlink()
+        return None
+    return log_file
+
+
+def _report_deferred_update_result() -> bool:
+    """Report a completed background update; return True while one is pending."""
+    result_file, default_log_file = _deferred_update_files()
+    if not result_file.is_file():
+        return False
+    try:
+        result = json.loads(result_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        return False
+
+    status = result.get("status")
+    target = result.get("target_version", "the requested version")
+    if status == "pending":
+        started_at = result.get("started_at", 0)
+        if isinstance(started_at, (int, float)) and datetime.now().timestamp() - started_at < 600:
+            print(f"Marcus update to {target} is still running. Try again in a few seconds.")
+            return True
+        print("A previous Marcus update did not finish. You can run 'marcus --update' again.")
+    elif status == "success":
+        print(f"Marcus updated successfully to {target}.")
+    elif status == "failed":
+        log_file = result.get("log_path") or str(default_log_file)
+        print(f"Previous Marcus update to {target} failed. See: {log_file}")
+    else:
+        return False
+
+    with contextlib.suppress(OSError):
+        result_file.unlink()
+    return False
 
 
 def _version_cache_file() -> Path:
@@ -344,6 +513,16 @@ def _run_update(target_version: str | None = None, *, assume_yes: bool = False) 
         return 1
 
     print(f"  {' '.join(command)}")
+    if _should_defer_windows_update(method):
+        log_file = _schedule_windows_update(command, latest)
+        if log_file is None:
+            print("Could not start the Windows update helper (PowerShell was not available).")
+            print(f"Close Marcus, then run manually: {' '.join(command)}")
+            return 1
+        print("Update scheduled. Marcus will now exit so Windows can replace its files.")
+        print(f"Progress log: {log_file}")
+        return 0
+
     try:
         result = subprocess.run(
             command,
@@ -500,6 +679,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    if _report_deferred_update_result():
+        raise SystemExit(0)
     parser = _build_parser()
     args, remaining = parser.parse_known_args()
 
