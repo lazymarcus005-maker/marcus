@@ -235,13 +235,17 @@ class TerminalUI:
         )
         self.mode = "agent"
         self._step_lines: list[str] = []
+        self._working_lines: list[str] = []
         self._last_step_lines: list[str] = []
         self._tool_count = 0
         self._thinking: bool = False
         self._thinking_start: float = 0.0
+        self._last_thought_seconds: float | None = None
         self._todo: TodoTracker | None = None
         self._last_guardrail: str | None = None
         self._stream_buffer: str = ""
+        self._streaming: bool = False
+        self._turn_active: bool = False
         self._live: Live | None = None
         self._status_provider: Callable[[], dict[str, Any]] | None = None
         self._interrupt_count = 0
@@ -641,6 +645,10 @@ class TerminalUI:
         ]
 
     def print_recovery(self, message: str) -> None:
+        if self._turn_active:
+            self._working_lines.append(f"↻ {self._compact_line(message, 180)}")
+            self._refresh_steps()
+            return
         self.console.print(f"[{self.theme.warning}]↻ {escape(message)}[/{self.theme.warning}]")
 
     async def aclose(self) -> None:
@@ -675,6 +683,13 @@ class TerminalUI:
         return answer == "yolo"
 
     def print_assistant(self, text: str) -> None:
+        if self._turn_active:
+            label = "plan" if text.lstrip().lower().startswith("plan") else "note"
+            compact = self._compact_line(text, 180)
+            self._working_lines.append(f"• {label}: {compact}")
+            self._step_lines.append(f"{label}: {text}")
+            self._refresh_steps()
+            return
         self._pause_live()
         self.console.print(Markdown(text))
         self._resume_live()
@@ -696,11 +711,15 @@ class TerminalUI:
         action = _tool_action(tool_name)
         self._tool_count += 1
         self._step_lines.extend([f"→ {action}", f"  {tool_name}({summary})"])
+        compact_args = self._compact_line(summary, 120)
+        suffix = f" · {compact_args}" if compact_args else ""
+        self._working_lines.append(f"{self._tool_count}. {action}{suffix}")
         self._refresh_steps()
 
     def print_tool_result(self, tool_name: str, result: dict) -> None:
         summary = _tool_result_summary(tool_name, result)
         self._step_lines.append(f"✓ {summary}")
+        self._working_lines.append(f"   ✓ {self._compact_line(summary, 160)}")
         for label in ("stdout", "stderr"):
             output = result.get(label)
             if not output:
@@ -713,20 +732,19 @@ class TerminalUI:
 
     def print_tool_error(self, tool_name: str, error: str) -> None:
         self._step_lines.append(f"x {tool_name}: {error}")
+        self._working_lines.append(f"   × {tool_name}: {self._compact_line(error, 140)}")
         self._refresh_steps()
 
     def print_tool_declined(self, tool_name: str) -> None:
         self._step_lines.append(f"x {tool_name} declined by user")
+        self._working_lines.append(f"   × {tool_name} declined")
         self._refresh_steps()
 
     def print_guardrail_stop(self, reason: str) -> None:
         self.finish_steps(success=False)
         self._last_guardrail = reason
         self._guardrail_collapsed = True
-        self.console.print(
-            f"[{self.theme.error}]↳ guardrail stop: {escape(reason)}[/{self.theme.error}] "
-            f"[{self.theme.muted}](Ctrl+E expand · Ctrl+R collapse)[/{self.theme.muted}]"
-        )
+        self.console.print(f"[{self.theme.error}]guardrail: {escape(reason)}[/{self.theme.error}]")
 
     def print_interrupted(self) -> None:
         self.finish_steps(success=False)
@@ -753,16 +771,21 @@ class TerminalUI:
     def begin_turn(self) -> None:
         self._stop_live()
         self._step_lines = []
+        self._working_lines = []
         self._tool_count = 0
         self._thinking = False
         self._thinking_start = 0.0
+        self._last_thought_seconds = None
         self._todo = None
         self._stream_buffer = ""
+        self._streaming = False
+        self._turn_active = True
 
     def update_todo(self, todo: TodoTracker) -> None:
         """Update the workflow tracker rendered in the live panel."""
         self._todo = todo
-        self.refresh_status()
+        if self._turn_active:
+            self._refresh_steps()
 
     def _todo_renderable(self) -> Text:
         """Render the current workflow phase pipeline."""
@@ -792,33 +815,18 @@ class TerminalUI:
         return text
 
     def start_thinking(self) -> None:
-        """Show a live 'think...' indicator while the LLM is working."""
+        """Show thinking inside the single live working panel."""
         self._thinking = True
         self._thinking_start = datetime.now().timestamp()
-        if self.console.is_terminal and self._step_lines:
-            self._refresh_steps()
-        elif self.console.is_terminal:
-            # No steps yet; just print a transient thinking line that will be
-            # replaced by the working box once the first tool call arrives.
-            self.console.print(f"[{self.theme.muted}]think...[/{self.theme.muted}]", end="\r")
-            self.console.file.flush()
-        else:
-            self.console.print(f"[{self.theme.muted}]think...[/{self.theme.muted}]", end="")
-            self.console.file.flush()
+        self._refresh_steps()
 
     def stop_thinking(self, elapsed_seconds: float) -> None:
         """Finalize the thinking indicator timing in the step panel."""
         if not self._thinking:
             return
         self._thinking = False
-        if self.console.is_terminal:
-            self._step_lines.append(f"💭 thought: {elapsed_seconds:.2f}s")
-            self._refresh_steps()
-        else:
-            self.console.print(
-                f"\r\x1b[K[{self.theme.muted}]thought: {elapsed_seconds:.2f}s[/{self.theme.muted}]"
-            )
-            self.console.file.flush()
+        self._last_thought_seconds = elapsed_seconds
+        self._refresh_steps()
 
     def print_last_guardrail(self) -> None:
         """Show the last guardrail stop reason, if any."""
@@ -834,26 +842,20 @@ class TerminalUI:
         )
 
     def start_stream(self) -> None:
-        """Pause live panel and prepare to collect streamed assistant text."""
-        self._pause_live()
+        """Collect streamed text while keeping status inside the working panel."""
         self._stream_buffer = ""
-        self.console.print(f"[{self.theme.muted}]streaming...[/]", end="")
-        self.console.file.flush()
+        self._streaming = True
+        self._refresh_steps()
 
     def stream_delta(self, text: str) -> None:
         """Accumulate a streamed delta for later rendering."""
         self._stream_buffer += text
 
     def end_stream(self) -> None:
-        """Erase the streaming placeholder and render the complete Markdown."""
-        # Clear the "streaming..." line using ANSI escape codes.
-        self.console.print("\r\x1b[K", end="")
-        self.console.file.flush()
-        content = self._stream_buffer
+        """Finish streaming; the loop renders the response exactly once."""
         self._stream_buffer = ""
-        if content:
-            self.console.print(Markdown(content))
-        self._resume_live()
+        self._streaming = False
+        self._refresh_steps()
 
     def save_turn(
         self,
@@ -892,26 +894,32 @@ class TerminalUI:
         path.write_text("".join(lines), encoding="utf-8")
 
     def finish_steps(self, *, success: bool) -> None:
-        if not self._step_lines:
+        if not self._step_lines and not self._working_lines:
             # Still stop any active live panel so transient thinking lines don't
             # leak into the final output.
             self._stop_live()
+            self._turn_active = False
             return
         self._last_step_lines = list(self._step_lines)
         self._stop_live()
+        self._turn_active = False
+        detail_hint = " · /steps" if self._last_step_lines else ""
         if success:
             self._steps_collapsed = True
+            count = f" · {self._tool_count} tool(s)" if self._tool_count else ""
             self.console.print(
-                f"[{self.theme.info}]↳ worked {self._tool_count}x step complete[/{self.theme.info}] "
-                f"[{self.theme.muted}](Ctrl+E expand · Ctrl+R collapse)[/{self.theme.muted}]"
+                f"[{self.theme.success}]✓ done{count}[/{self.theme.success}]"
+                f"[{self.theme.muted}]{detail_hint}[/{self.theme.muted}]"
             )
         else:
             self._steps_collapsed = True
+            count = f" · {self._tool_count} tool(s)" if self._tool_count else ""
             self.console.print(
-                f"[{self.theme.error}]↳ stopped after {self._tool_count}x step[/{self.theme.error}] "
-                f"[{self.theme.muted}](Ctrl+E expand · Ctrl+R collapse)[/{self.theme.muted}]"
+                f"[{self.theme.error}]× stopped{count}[/{self.theme.error}]"
+                f"[{self.theme.muted}]{detail_hint}[/{self.theme.muted}]"
             )
         self._step_lines = []
+        self._working_lines = []
         self._tool_count = 0
 
     def print_steps(self) -> None:
@@ -926,12 +934,7 @@ class TerminalUI:
         saved_tool_count = self._tool_count
         self._step_lines = list(lines)
         self._tool_count = len([line for line in lines if line.startswith(("→ ", "✓ ", "x "))])
-        self.console.print(
-            self._steps_renderable(title="Last task steps · Ctrl+R to collapse")
-        )
-        self.console.print(
-            f"[{self.theme.muted}]↳ Ctrl+R collapse[/{self.theme.muted}]"
-        )
+        self.console.print(self._steps_renderable(title="Last steps"))
         self._step_lines = saved_step_lines
         self._tool_count = saved_tool_count
 
@@ -948,7 +951,7 @@ class TerminalUI:
         hidden = max(0, len(lines) - max_lines)
         if hidden:
             lines = [f"… {hidden} earlier line(s) hidden; use /steps"] + lines[-(max_lines - 1) :]
-        panel_title = title or f"Working · {self._tool_count} step(s) · Ctrl+R collapse"
+        panel_title = title or f"Steps · {self._tool_count} tool(s)"
         return Panel(
             "\n".join(escape(line) for line in lines),
             title=panel_title,
@@ -988,27 +991,70 @@ class TerminalUI:
             return self.theme.status_caution
         return self.theme.status_bad
 
-    def _working_renderable(self) -> Group:
-        parts: list[Any] = []
+    def _working_renderable(self) -> Panel:
+        lines = list(self._working_lines)
         if self._thinking:
             elapsed = datetime.now().timestamp() - self._thinking_start
-            parts.append(Text(f"💭 thinking... {elapsed:.1f}s", style=self.theme.muted))
-        if self._todo is not None:
-            parts.append(self._todo_renderable())
-        if self._step_lines:
-            parts.append(self._steps_renderable())
-        parts.append(self._status_renderable())
-        return Group(*parts)
+            activity = "streaming" if self._streaming else "thinking"
+            lines.append(f"… {activity} {elapsed:.1f}s")
+        elif self._streaming:
+            lines.append("… streaming")
+        elif not lines:
+            lines.append("… preparing")
+
+        max_lines = max(3, self.console.size.height - 8)
+        hidden = max(0, len(lines) - max_lines)
+        if hidden:
+            lines = [f"… {hidden} earlier step(s) · /steps"] + lines[-(max_lines - 1) :]
+
+        phase = self._todo.label() if self._todo is not None else "กำลังทำงาน"
+        count = f" · {self._tool_count} tool(s)" if self._tool_count else ""
+        title = f"Marcus · {phase}{count}"
+        subtitle = self._working_status_line()
+        return Panel(
+            "\n".join(escape(line) for line in lines),
+            title=title,
+            subtitle=subtitle or None,
+            border_style=self.theme.border,
+            padding=(0, 1),
+        )
+
+    def _working_status_line(self) -> str:
+        if self._status_provider is None:
+            thought = (
+                f"thought {self._last_thought_seconds:.1f}s"
+                if self._last_thought_seconds is not None
+                else ""
+            )
+            return thought
+        status = self._status_provider()
+        used = status["context_tokens"]
+        limit = max(1, status["context_limit"])
+        context_percent = min(100, round(used * 100 / limit))
+        parts = [
+            str(status["model"]),
+            f"ctx {context_percent}%",
+            str(status["mode"]),
+        ]
+        if self._last_thought_seconds is not None:
+            parts.append(f"thought {self._last_thought_seconds:.1f}s")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _compact_line(text: str, limit: int) -> str:
+        compact = " ".join(str(text).split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(1, limit - 1)].rstrip() + "…"
 
     def _refresh_steps(self) -> None:
+        if not self.console.is_terminal or not self._turn_active:
+            return
         renderable = self._working_renderable()
-        # Ensure we never stack multiple Live instances on top of each other.
         if self._live is not None:
-            self._live.stop()
-            self._live = None
-        self._live = Live(
-            renderable, console=self.console, refresh_per_second=8, transient=True
-        )
+            self._live.update(renderable, refresh=True)
+            return
+        self._live = Live(renderable, console=self.console, refresh_per_second=8, transient=True)
         self._live.start()
 
     def _pause_live(self) -> None:
@@ -1017,7 +1063,7 @@ class TerminalUI:
             self._live = None
 
     def _resume_live(self) -> None:
-        if self._step_lines:
+        if self._turn_active:
             self._refresh_steps()
 
     def _stop_live(self) -> None:

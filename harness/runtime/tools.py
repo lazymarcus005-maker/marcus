@@ -56,6 +56,12 @@ class Tool:
     handler: ToolHandler
     risk_tier: RiskTier = RiskTier.read_only
     idempotent: bool = False
+    # Runtime semantics used by the CLI loop. Risk tier answers whether an
+    # action needs approval; it does not reliably say whether workspace state
+    # changes or whether the result is verification evidence.
+    mutates_workspace: bool = False
+    evidence_type: str | None = None
+    volatile: bool = False
     mcp_server_id: uuid.UUID | None = None
 
     def to_spec(self) -> ToolSpec:

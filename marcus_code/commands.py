@@ -133,7 +133,13 @@ async def _cmd_continue(ctx: CommandContext, args: str) -> None:
             )
         )
     ctx.ui.print_info("Continuing from the previous turn...")
-    await ctx.loop.run_turn("continue from where you stopped")
+    # Preserve the original capabilities/verification policy. Reclassifying
+    # the word "continue" would otherwise turn a stopped change into a
+    # read-only explanation request.
+    await ctx.loop.run_turn(
+        "continue from where you stopped",
+        contract=ctx.loop.state.active_contract,
+    )
 
 
 async def _cmd_compact(ctx: CommandContext, args: str) -> None:

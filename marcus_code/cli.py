@@ -443,6 +443,7 @@ async def _amain(
             finally:
                 if hasattr(tools, "process_manager"):
                     await tools.process_manager.aclose()
+                    loop.state.active_process_ids.clear()
             return
         while True:
             raw_input = ui.prompt_user()
@@ -470,6 +471,7 @@ async def _amain(
             finally:
                 if hasattr(tools, "process_manager"):
                     await tools.process_manager.aclose()
+                    loop.state.active_process_ids.clear()
     finally:
         if hasattr(tools, "aclose"):
             await tools.aclose()

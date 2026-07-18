@@ -8,6 +8,13 @@ from harness.llm.types import LLMMessage, LLMResponse, ToolCall, Usage
 from harness.runtime.tools import Tool
 from marcus_code.loop import MarcusLoop
 from marcus_code.modes import AgentMode
+from marcus_code.task_contract import (
+    Capability,
+    ResponseMode,
+    TaskContract,
+    TaskKind,
+    VerificationPolicy,
+)
 from tests.fakes import ScriptedLLMGateway, text_response, tool_call_response
 
 
@@ -193,15 +200,17 @@ async def test_requested_verification_blocks_unsupported_success_claim():
             text_response("still passed"),
             text_response("really passed"),
             text_response("trust me"),
+            text_response("one more unsupported claim"),
         ]
     )
     ui = _FakeUI()
-    loop = MarcusLoop(llm, [], ui)
+    loop = MarcusLoop(llm, [_read_only_tool("run_cli")], ui)
 
     await loop.run_turn("run tests and verify the result")
 
     assert any("no successful evidence" in reason for reason in ui.guardrail_stops)
-    assert ui.assistant_messages == []
+    assert len(ui.assistant_messages) == 1
+    assert ui.assistant_messages[0].startswith("Plan:")
 
 
 @pytest.mark.asyncio
@@ -218,7 +227,8 @@ async def test_successful_test_command_allows_final_answer():
 
     await loop.run_turn("run tests and verify the result")
 
-    assert ui.assistant_messages[-1] == "passed"
+    assert ui.assistant_messages[-1].startswith("passed")
+    assert "Verification: run_cli: 2 passed" in ui.assistant_messages[-1]
     assert ui.assistant_messages[0].startswith("Plan:")
     assert ui.guardrail_stops == []
 
@@ -318,6 +328,16 @@ async def test_repeated_identical_call_triggers_recovery_then_stops():
     assert len(ui.guardrail_stops) == 1
     assert "identical arguments" in ui.guardrail_stops[0]
     assert "recovery budget exhausted" in ui.guardrail_stops[0]
+    assistant_call_ids = {
+        call.id
+        for message in loop.state.history
+        if message.role == "assistant"
+        for call in message.tool_calls
+    }
+    tool_result_ids = {
+        message.tool_call_id for message in loop.state.history if message.role == "tool"
+    }
+    assert assistant_call_ids <= tool_result_ids
 
 
 @pytest.mark.asyncio
@@ -656,3 +676,277 @@ async def test_current_turn_kept_intact_when_under_budget():
         "follow up",
     ]
     assert loop.state.history[0].role == "system"
+
+
+@pytest.mark.asyncio
+async def test_direct_question_has_no_plan_and_no_tools_disclosed():
+    llm = ScriptedLLMGateway([text_response("JWT is a signed token format.")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [_read_only_tool("read_file")], ui)
+
+    await loop.run_turn("ช่วยอธิบาย JWT แบบสั้นๆ")
+
+    assert llm.calls[0]["tools"] == []
+    assert ui.assistant_messages == ["JWT is a signed token format."]
+    assert loop.state.active_plan is None
+
+
+@pytest.mark.asyncio
+async def test_agentic_request_gets_planning_call_before_tools():
+    llm = ScriptedLLMGateway(
+        [text_response("I will inspect it."), text_response("Review complete.")]
+    )
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [_read_only_tool("read_file")], ui)
+
+    await loop.run_turn("review this code module")
+
+    assert llm.calls[0]["tools"] == []
+    assert [tool.name for tool in llm.calls[1]["tools"]] == ["read_file"]
+    assert loop.state.active_plan is not None
+    assert "Verification:" in loop.state.active_plan
+    assert ui.assistant_messages[-1] == "Review complete."
+
+
+@pytest.mark.asyncio
+async def test_capability_union_discloses_change_command_and_process_tools():
+    contract = TaskContract(
+        kind=TaskKind.change,
+        response_mode=ResponseMode.agentic,
+        capabilities=frozenset(
+            {
+                Capability.workspace_read,
+                Capability.workspace_write,
+                Capability.command,
+                Capability.process,
+            }
+        ),
+        requires_plan=True,
+        verification_policy=VerificationPolicy.none,
+    )
+    tools = [
+        _read_only_tool("read_file"),
+        _sensitive_tool("edit_file"),
+        _read_only_tool("run_tests"),
+        _sensitive_tool("start_process"),
+        _read_only_tool("wait_for_http"),
+    ]
+    llm = ScriptedLLMGateway([text_response("done")])
+    loop = MarcusLoop(llm, tools, _FakeUI())
+    loop.state.active_plan = "existing continuation plan"
+
+    await loop.run_turn("continue", contract=contract)
+
+    assert {tool.name for tool in llm.calls[0]["tools"]} == {
+        "read_file",
+        "edit_file",
+        "run_tests",
+        "start_process",
+        "wait_for_http",
+    }
+
+
+@pytest.mark.asyncio
+async def test_mutation_invalidates_cached_read_result():
+    workspace = {"version": 1, "reads": 0}
+
+    async def read_handler(arguments):
+        workspace["reads"] += 1
+        return {"version": workspace["version"]}
+
+    async def mutate_handler(arguments):
+        workspace["version"] += 1
+        return {"changed": True}
+
+    read_tool = Tool(
+        name="read_file",
+        description="read",
+        parameters={"type": "object", "properties": {}},
+        handler=read_handler,
+        risk_tier=RiskTier.read_only,
+        idempotent=True,
+    )
+    mutate_tool = Tool(
+        name="edit_file",
+        description="edit",
+        parameters={"type": "object", "properties": {}},
+        handler=mutate_handler,
+        risk_tier=RiskTier.sensitive_write,
+        mutates_workspace=True,
+    )
+    contract = TaskContract(
+        kind=TaskKind.change,
+        response_mode=ResponseMode.agentic,
+        capabilities=frozenset({Capability.workspace_read, Capability.workspace_write}),
+        requires_plan=True,
+        verification_policy=VerificationPolicy.none,
+    )
+    llm = ScriptedLLMGateway(
+        [
+            tool_call_response("read_file", {}),
+            tool_call_response("edit_file", {}),
+            tool_call_response("read_file", {}),
+            text_response("done"),
+        ]
+    )
+    loop = MarcusLoop(llm, [read_tool, mutate_tool], _FakeUI(), mode=AgentMode.auto)
+
+    await loop.run_turn("inspect and change the code", contract=contract)
+
+    assert workspace == {"version": 2, "reads": 2}
+    assert loop.state.workspace_revision == 1
+
+
+@pytest.mark.asyncio
+async def test_mutation_after_successful_check_requires_fresh_verification():
+    verify_tool = Tool(
+        name="run_tests",
+        description="test",
+        parameters={"type": "object", "properties": {}},
+        handler=lambda arguments: None,
+        risk_tier=RiskTier.read_only,
+        evidence_type="test",
+    )
+    mutate_tool = Tool(
+        name="edit_file",
+        description="edit",
+        parameters={"type": "object", "properties": {}},
+        handler=lambda arguments: None,
+        risk_tier=RiskTier.sensitive_write,
+        mutates_workspace=True,
+    )
+
+    async def verify(arguments):
+        return {"exit_code": 0, "stdout": "1 passed"}
+
+    async def mutate(arguments):
+        return {"changed": True}
+
+    verify_tool.handler = verify
+    mutate_tool.handler = mutate
+    llm = ScriptedLLMGateway(
+        [
+            tool_call_response("run_tests", {}),
+            tool_call_response("edit_file", {}),
+            text_response("done"),
+            text_response("still done"),
+        ]
+    )
+    ui = _FakeUI()
+    loop = MarcusLoop(
+        llm,
+        [verify_tool, mutate_tool],
+        ui,
+        mode=AgentMode.auto,
+        max_finalization_repairs=1,
+    )
+
+    await loop.run_turn("change code and test it")
+
+    assert any("no successful evidence" in reason for reason in ui.guardrail_stops)
+    assert loop.state.verification_evidence is None
+    assert loop.state.unverified_revision == loop.state.workspace_revision
+
+    followup = ScriptedLLMGateway(
+        [tool_call_response("run_tests", {}), text_response("verified now")]
+    )
+    loop.llm = followup
+    await loop.run_turn("continue from where you stopped", contract=loop.state.active_contract)
+
+    assert loop.state.unverified_revision is None
+    assert loop.state.verification_evidence is not None
+    assert ui.assistant_messages[-1].startswith("verified now")
+
+
+@pytest.mark.asyncio
+async def test_missing_verifier_stops_after_plan_instead_of_looping():
+    llm = ScriptedLLMGateway([text_response("I will run the tests.")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [], ui)
+
+    await loop.run_turn("run tests and verify the result")
+
+    assert len(llm.calls) == 1
+    assert any("no compatible verification tool" in reason for reason in ui.guardrail_stops)
+
+
+@pytest.mark.asyncio
+async def test_started_process_must_be_stopped_before_final_answer():
+    async def start(arguments):
+        return {"process_id": "proc-1"}
+
+    async def stop(arguments):
+        return {"stopped": True}
+
+    start_tool = Tool(
+        name="start_process",
+        description="start",
+        parameters={"type": "object", "properties": {}},
+        handler=start,
+        risk_tier=RiskTier.sensitive_write,
+        volatile=True,
+    )
+    stop_tool = Tool(
+        name="stop_process",
+        description="stop",
+        parameters={
+            "type": "object",
+            "properties": {"process_id": {"type": "string"}},
+            "required": ["process_id"],
+        },
+        handler=stop,
+        risk_tier=RiskTier.sensitive_write,
+        volatile=True,
+    )
+    llm = ScriptedLLMGateway(
+        [
+            tool_call_response("start_process", {}),
+            text_response("service is done"),
+            tool_call_response("stop_process", {"process_id": "proc-1"}),
+            text_response("service checked and stopped"),
+        ]
+    )
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [start_tool, stop_tool], ui, mode=AgentMode.auto)
+
+    await loop.run_turn("start the server")
+
+    assert ui.assistant_messages[-1] == "service checked and stopped"
+    assert loop.state.active_process_ids == set()
+
+
+def test_atomic_compaction_never_orphans_tool_results():
+    loop = MarcusLoop(
+        ScriptedLLMGateway([]),
+        [],
+        _FakeUI(),
+        system_prompt="system",
+        max_history_messages=5,
+    )
+    calls = [
+        ToolCall(id="a", name="peek", arguments={}),
+        ToolCall(id="b", name="peek", arguments={}),
+    ]
+    loop.state.history.extend(
+        [
+            LLMMessage(role="user", content="old request"),
+            LLMMessage(role="assistant", tool_calls=calls),
+            LLMMessage(role="tool", tool_call_id="a", name="peek", content='{"ok":true}'),
+            LLMMessage(role="tool", tool_call_id="b", name="peek", content='{"ok":true}'),
+            LLMMessage(role="assistant", content="old result"),
+            LLMMessage(role="user", content="latest request"),
+        ]
+    )
+
+    loop._trim_history()
+
+    retained_calls = {
+        call.id
+        for message in loop.state.history
+        if message.role == "assistant"
+        for call in message.tool_calls
+    }
+    retained_results = {
+        message.tool_call_id for message in loop.state.history if message.role == "tool"
+    }
+    assert retained_calls == retained_results

@@ -347,6 +347,7 @@ def build_apply_diff_tool(root: Path) -> Tool:
         },
         handler=handler,
         risk_tier=RiskTier.sensitive_write,
+        mutates_workspace=True,
     )
 
 
@@ -497,6 +498,7 @@ def build_run_tests_tool(root: Path, settings: Settings) -> Tool:
         },
         handler=handler,
         risk_tier=RiskTier.destructive,
+        evidence_type="test",
     )
 
 
@@ -827,6 +829,8 @@ def build_check_url_health_tool() -> Tool:
         handler=handler,
         risk_tier=RiskTier.read_only,
         idempotent=True,
+        evidence_type="http",
+        volatile=True,
     )
 
 

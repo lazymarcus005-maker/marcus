@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     cli_history_summary_enabled: bool = True
     cli_default_mode: str = "agent"
     cli_llm_recovery_timeout_seconds: float = 90.0
-    cli_max_tool_calls_per_step: int = 1
+    cli_max_tool_calls_per_step: int = 3
     cli_max_argument_repairs: int = 1
 
     @model_validator(mode="after")
