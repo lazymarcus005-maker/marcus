@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import orjson
 from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import NestedCompleter
+from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console, Group
@@ -29,6 +31,57 @@ from marcus_code.tools import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME, START_PROC
 if TYPE_CHECKING:
     from marcus_code.loop import UsageStats
     from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
+
+_SLASH_COMMANDS: tuple[str, ...] = (
+    "/help",
+    "/?",
+    "/model",
+    "/usage",
+    "/steps",
+    "/status",
+    "/compact",
+    "/retry",
+    "/continue",
+    "/clear",
+    "/mode",
+    "/config",
+    "/exit",
+    "/quit",
+)
+
+class SlashCommandAutoSuggest(AutoSuggest):
+    """Auto-suggest slash commands as the user types.
+
+    Only activates when the buffer starts with ``/``. Returns up to 7 matching
+    commands, separated by ``  |  ``, so the user can see options without
+    opening the completion menu.
+    """
+
+    _MAX_SUGGESTIONS = 7
+
+    async def get_suggestion_async(self, buffer, document: Document) -> Suggestion | None:
+        text = document.text
+        if not text.startswith("/"):
+            return None
+        prefix = text.lower()
+        matches = [cmd for cmd in _SLASH_COMMANDS if cmd.lower().startswith(prefix)]
+        if not matches:
+            return None
+        display = "  |  ".join(matches[: self._MAX_SUGGESTIONS])
+        return Suggestion(display)
+
+    def get_suggestion(self, buffer, document: Document) -> Suggestion | None:
+        # get_suggestion_async is used by PromptSession's buffer; provide a
+        # synchronous fallback in case it is ever called directly.
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.get_suggestion_async(buffer, document))
+        if loop.is_running():
+            return None
+        return loop.run_until_complete(self.get_suggestion_async(buffer, document))
+
 
 ApprovalDecision = Literal["yes", "no", "always"]
 
@@ -55,8 +108,15 @@ class TerminalUI:
             # Rich's terminal auto-detection (which is unreliable when
             # stdout isn't a real console, e.g. piped/redirected).
             try:
-                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+                # TextIO doesn't expose reconfigure in the base protocol, but
+                # the concrete CPython stream implementation has it on all
+                # platforms we support.
+                getattr(sys.stdout, "reconfigure", lambda **kwargs: None)(
+                    encoding="utf-8", errors="replace"
+                )
+                getattr(sys.stderr, "reconfigure", lambda **kwargs: None)(
+                    encoding="utf-8", errors="replace"
+                )
             except (AttributeError, ValueError):
                 pass
         self.console = Console(legacy_windows=False)
@@ -88,6 +148,8 @@ class TerminalUI:
                 "/status": None,
                 "/steps": None,
                 "/compact": None,
+                "/retry": None,
+                "/continue": None,
                 "/clear": {"--all": None},
                 "/config": {"show": None, "edit": None},
                 "/exit": None,
@@ -104,6 +166,7 @@ class TerminalUI:
         mode: str = "agent",
         provider_url: str = "",
         profile_email: str | None = None,
+        marcus_version: str | None = None,
     ) -> None:
         self.mode = mode
         # Text.from_ansi decodes raw ANSI SGR sequences into Rich's own
@@ -118,11 +181,17 @@ class TerminalUI:
         # pad also does the job the old blank Text("") separator did.
         logo_padded = Padding(logo, (1, 2))
         profile = profile_email or "(run /usage login)"
+        version_line = (
+            f"[bold]Version[/bold] : {escape(marcus_version.ljust(20))} |  "
+            if marcus_version
+            else ""
+        )
         info = Text.from_markup(
             "[dim]AI-powered coding agent   (Harness Recipe via Marcus)[/dim]\n\n"
             f"[bold]Workspace[/bold] : {escape(str(root))}\n"
             f"[bold]Model[/bold]     : {escape(model.ljust(20))} |  "
             f"[bold]Provider[/bold] : {escape(provider_url)}\n"
+            f"{version_line}"
             f"[bold]Mode[/bold]      : {escape(mode.ljust(20))} |  "
             f"[bold]Profile[/bold]  : {escape(profile)}\n"
             f"[bold]Session[/bold]   : {escape(session_name)}"
@@ -319,6 +388,7 @@ class TerminalUI:
                 [("class:prompt", f"{self.mode.upper()} > ")],
                 completer=self._completer,
                 complete_while_typing=False,
+                auto_suggest=SlashCommandAutoSuggest(),
                 bottom_toolbar=self._bottom_toolbar if self._status_provider else None,
                 refresh_interval=1,
                 style=self._prompt_style,

@@ -49,6 +49,9 @@ retry with corrected arguments, or report the failure accurately.
 haven't actually read via a tool call.
 - If a tool call fails or is declined, adapt — don't repeat the identical \
 call; the runtime stops you after a few identical repeats anyway.
+- Each new user message is an independent follow-up in the same session. Respond \
+only to the most recent user request; do not repeat or re-answer earlier messages \
+unless the user explicitly asks you to.
 - When you're done, reply with a short plain-text summary of what you did \
 (no tool call) — that's how the user knows you've finished. Keep it to a \
 few lines; this is a terminal, not a document.

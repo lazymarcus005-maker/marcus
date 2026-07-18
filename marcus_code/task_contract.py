@@ -15,6 +15,20 @@ class TaskContract:
     requires_plan: bool
     requires_verification: bool
 
+    def missing_evidence_hint(self, verification_succeeded: bool) -> str:
+        """Return a concrete hint for the model when finalization is denied."""
+        if not self.requires_verification:
+            return "this task does not require verification"
+        if verification_succeeded:
+            return (
+                "a verification tool returned success, but the final answer "
+                "must explicitly summarize the verification result"
+            )
+        return (
+            "no successful verification command or HTTP check has been run yet; "
+            "run a build, test, curl, or wait_for_http tool and report its result"
+        )
+
 
 _CHANGE = re.compile(
     r"(?i)\b(add|build|change|create|edit|fix|implement|install|refactor|remove|update|write)\b"

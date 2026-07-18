@@ -1,670 +1,337 @@
-# Harness Reliability, Safety, and Reasoning Improvement Plan
+# Improvement.md — Marcus Code (CLI Agent)
 
-เอกสารนี้เป็นผลจากการ review โค้ดปัจจุบันทั้ง `harness/`, `marcus_code/`, API,
-worker, LLM gateway, tool execution, MCP, skills, context compaction และ tests โดยมี
-เป้าหมายให้ระบบ:
+เอกสารนี้เจาะจง `marcus_code/` เท่านั้น — ส่วน CLI interactive coding agent
+ที่รันอยู่ในเทอร์มินัลผู้ใช้และพึ่งพา `LLMGateway`, 12 built-in tools, และ
+`MarcusLoop` ในหน่วยความจำ (ไม่มี DB run state)
 
-- ปลอดภัยโดยอาศัย runtime enforcement มากกว่า prompt
-- ทำงานถูกต้องและอธิบายเหตุผลได้
-- ใช้ token, เวลา, network และ tool calls อย่างประหยัด
-- ลด hallucination โดยเฉพาะเมื่อใช้โมเดลระดับล่างหรือระดับกลาง
-- ฟื้นตัวได้เมื่อ provider หรือ tool มีปัญหา แต่ไม่ retry จนเกิด loop
-- ตรวจสอบย้อนหลังได้ว่า “ระบบสรุปว่าสำเร็จจากหลักฐานอะไร”
-
-## Implementation status (2026-07-12)
-
-ส่วน correctness baseline ที่ลงมือแล้วในรอบนี้:
-
-- JSON Schema validation และ conservative type coercion ก่อน approval/handler ทั้ง server และ CLI
-- typed `INVALID_ARGUMENT` observation ที่บันทึกลง durable tool execution
-- shared process-tree termination และ bounded pipe cleanup สำหรับ CLI/server บน Windows/POSIX
-- production configuration แบบ fail-closed: ห้าม default secrets และ legacy auth ใน production
-- shared secret redaction สำหรับ `.env`, credentials, private keys และ inline tokens ก่อนเข้า model context
-- server compaction อิง context-window แยกจาก cumulative token budget และบันทึก usage ของ summary call
-- conservative finish gate: ห้ามรายงาน `succeeded` เมื่อ tool ล่าสุดยัง failed/unknown;
-  สามารถรายงาน failure อย่างตรงไปตรงมาด้วย `outcome='failed'`
-- typed tool outcome (`status`, `code`, `retryable`, `evidence_id`) และ error taxonomy กลาง
-- weak-model controls: หนึ่ง tool call ต่อ reasoning step และ argument-repair budget ที่มีขอบเขต
-- collision-safe MCP names (`domain__tool` เมื่อชื่อซ้ำ) และไม่นับ MCP error เป็น success evidence
-- provider usage fallback แบบ conservative พร้อม `source='estimated'` เมื่อ provider ไม่ส่ง usage
-- Playwright เป็น optional `ollama-usage` extra และ `/usage logout` ลบ cookie/cache/profile
-- deterministic task contract สำหรับ plan/verification และ CLI finalization gate
-- no-progress fingerprint จับ cosmetic retry ที่ได้ error/result เดิมทั้ง CLI/server
-- shared command policy บล็อก environment/secret dumps พร้อม category และ command hash
-- atomic file writes พร้อม pre-image/post-image SHA-256 สำหรับ audit และ crash safety
-
-รายการที่ยังเป็น roadmap (เช่น task-contract/evidence gate แบบเต็ม, MCP namespacing,
-encrypted browser state และ deterministic evaluation corpus) ระบุไว้ตาม phase ด้านล่าง
-และไม่ควรถูกนับว่า implement แล้วเพียงเพราะมีในเอกสารนี้
-
-เอกสารนี้ไม่เสนอ multi-agent ในระยะใกล้ เพราะ single-agent runtime ยังลดความเสี่ยงและ
-ต้นทุนได้อีกมาก การเพิ่ม agent หลายตัวก่อนแก้ control plane จะเพิ่มทั้ง hallucination,
-token cost และ failure surface
+ปัญหาสำคัญที่กำลังเกิดเมื่อสั่งทำงานกับ **repository จริง**คือ agent หยุดทำงานกลางคัน
+หรือจบเทิร์นก่อนได้ผล สาเหตุเป็นได้หลายทาง แต่ละทางมี root cause และแนวแก้ต่างกัน
+และบางทางทับซ้อนกับ roadmap ที่เคยลงไว้ใน `improvement.md` (งานฝั่ง server)
 
 ---
 
-## 1. Executive assessment
+## 1. อาการที่เกิดจริงเมื่อสั่งกับ repository จริง
 
-### จุดแข็งที่ควรรักษา
+เมื่อรันเช่น `uv run marcus -p "fix the failing tests"` หรือพิมพ์งานใน
+REPL โดยอยู่ในโฟลเดอร์ที่มีไฟล์จริงหลายร้อย/หลายพันไฟล์ เกิด:
 
-1. Server harness มี durable run state, optimistic version fencing, lease heartbeat และ
-   stale-run reaping อยู่แล้ว (`runtime/repository.py`, `lease.py`, `reaper.py`)
-2. Tool execution ใช้ write-ahead record และ idempotency key ก่อนเรียก external tool
-   (`runtime/tool_executor.py`) ซึ่งเป็นฐาน crash recovery ที่ถูกต้อง
-3. มี risk tiers และ approval gate แยกจาก LLM
-4. มี progressive disclosure สำหรับ MCP tools และ skills ช่วยลด tool schema tokens
-5. มี run/token/tool/time budgets, tenant quota และ audit records
-6. Marcus CLI มี workspace scoping, secret redaction, SSRF protection, process-tree
-   cleanup, bounded retries, context meter และ background-process lifecycle
-7. Test suite ครอบคลุม behavior สำคัญจำนวนมากและใช้ fakes ได้ดี
+1. **Agent จบเทิร์นทันที โดยทำ step เดียวหรือไม่ทำอะไรเลย** — เห็นเพียง
+   คำตอบสั้นและ prompt กลับมาเสมือนเสร็จแล้ว
+2. **ติดอยู่กับ guardrail แบบ "no progress" หรือ "repeated call"** หลังจาก
+   tool แรกหรือ tool ที่สองทำงานสำเร็จแล้ว ทั้งที่ยังไม่ได้แตะส่วนที่เป็นปัญหา
+3. **LLM call ค้างนานจนถึง `cli_llm_recovery_timeout_seconds = 90s`**
+   แล้วแสดง "LLM recovery timed out" โดยไม่ได้เปิดโอกาส recover
+4. **context บวมเร็วเกินจังหวะ** หลังจาก `list_files`, `grep`, หรืออ่านไฟล์ใหญ่
+   จนต้อง compact แล้วบางครั้ง summary ทิ้ง fact ที่จำเป็นทำให้ step ถัดไป
+   หลุดจากเป้าหมายเดิม
+5. **finalization gate บล็อก final answer ครั้งเดียวแล้วจบเทิร์น** เพราะ
+   `finalization_repairs < 1` อนุญาต repair เพียงครั้งเดียวแล้ว return
 
-### ข้อสรุปสำคัญ
-
-ปัญหาหลักไม่ใช่ “prompt ยังไม่เก่งพอ” แต่เป็นการที่ runtime ยังปล่อยให้โมเดลตัดสินใจ
-หลายเรื่องที่ควรเป็น deterministic policy เช่น:
-
-- งานนี้ต้องอ่านอะไรขั้นต่ำก่อนแก้
-- tool arguments ถูก schema และปลอดภัยหรือไม่
-- tool failure แบบใด retry ได้
-- หลักฐานใดเพียงพอที่จะประกาศว่าสำเร็จ
-- เมื่อใดถือว่าไม่มี progress และต้องหยุด
-- summary/compaction เก็บ facts ครบหรือไม่
-
-สำหรับโมเดลเล็ก ควรลดอิสระของโมเดลแล้วเพิ่ม state machine, typed outcomes,
-verification gates และ deterministic routing แทนการเพิ่ม system prompt ยาวขึ้น
+อาการเหล่านี้ไม่ได้เกิดกับโค้ดเล็กที่เขียนเองใน sandbox แต่เกิดกับ repository จริงที่
+มี noise directory มาก, ไฟล์ใหญ่, คำสั่งช้า, และเนื้อหาที่ทำให้ context บวมเร็ว
 
 ---
 
-## 2. Priority findings
+## 2. Root cause ที่พบในโค้ดปัจจุบัน
 
-| Priority | Finding | ผลกระทบ |
-|---|---|---|
-| P0 | ไม่มี evidence gate ก่อน `finish` หรือ final answer | โมเดลอาจประกาศว่าสำเร็จทั้งที่ build/test/tool ล้มเหลว |
-| P0 | Tool arguments ไม่ถูก validate ด้วย JSON Schema ก่อน handler | โมเดลเล็กส่ง type/field ผิด ทำให้เสีย step และเกิด retry loop |
-| P0 | Server `run_cli` ยังฆ่าเพียง shell process ต่างจาก CLI ที่ฆ่า process tree | child process และ pipe อาจค้าง worker/event loop |
-| P0 | Native tools ของ server และ CLI เป็น implementation คนละชุด | security/reliability fixes drift และ behavior ไม่สอดคล้อง |
-| P0 | Production config มีค่า `changeme` และ legacy auth behavior | เสี่ยง deploy แบบ fail-open หรือใช้ encryption key อ่อน |
-| P1 | Compaction เทียบกับ cumulative token budget ไม่ใช่ model context window | compact ช้า/เร็วผิดจังหวะ และ context overflow ได้ |
-| P1 | LLM summary เป็น source of truth โดยไม่มี fact preservation check | summary hallucination ทำลาย context สำหรับ step ถัดไป |
-| P1 | MCP names ใช้ global tool name และ `setdefault` | tool ชื่อชนกันข้าม server อาจเลือก/เรียกผิด domain |
-| P1 | Text จาก file/web/MCP ถูกส่งกลับเป็น tool message โดยไม่มี trust label | prompt injection จากข้อมูลภายนอกมีโอกาสเปลี่ยนพฤติกรรมโมเดล |
-| P1 | Retry policy กระจายอยู่ gateway, CLI loop และ tool executor | latency/cost สะสม และคาดการณ์จำนวน attempt ยาก |
-| P1 | `max_steps=100` และ CLI token budget default unlimited | โมเดลระดับล่างสามารถเผา token จำนวนมากก่อน circuit breaker |
-| P1 | Batch tool calls รันตามลำดับโดยไม่วิเคราะห์ dependency | โมเดลเล็กมักสร้าง call ที่สองโดยอาศัยผล call แรกที่ยังไม่รู้ |
-| P2 | Usage ที่ provider ไม่ส่งถูกนับเป็น 0 | budget/quota/observability fail-open |
-| P2 | Compaction LLM calls ไม่ถูกรวม cost ใน run usage อย่างครบถ้วน | ค่าใช้จ่ายจริงสูงกว่าที่รายงาน |
-| P2 | Ollama browser storage state เป็น plaintext secret material | local account/session theft หากเครื่องหรือ home directory ถูกอ่าน |
-| P2 | Playwright เป็น core dependency เพื่อฟีเจอร์ `/usage` | install ใหญ่ขึ้นและเพิ่ม supply-chain/runtime surface |
-| P2 | Full integration tests พึ่ง RabbitMQ ภายนอกและไม่ hermetic | CI signal ไม่แน่นอนและแยก code failure จาก infra failureยาก |
+### 2.1 การ์ด finalization อนุญาต repair ครั้งเดียวเกินไปเข้มงวด
+
+`marcus_code/loop.py:208-225` — ถ้า task ต้อง verification ตาม
+`TaskContract.requires_verification` (เกิดจาก keyword เช่น `test`, `build`,
+`pytest`, `curl`, `verify`) แล้วเมื่อโมเดลตอบเป็น plain text โดยยังไม่มี
+evidence ระบบแทรก system message สั่งให้รัน verification หนึ่งครั้งแล้วให้
+สรุปผล แต่ `finalization_repairs < 1` หมายความ repair ได้แค่ครั้งเดียวเท่านั้น
+ถ้า verification call แรกยังไม่พอ (เช่นโมเดลเรียกผิด tool, arguments ผิด,
+หรือต้อง build ก่อน test) ระบบก็หยุดด้วยข้อความ "final answer blocked:
+requested verification has no successful evidence" และ return ทันที
+
+ผู้ใช้เห็นเป็น "หยุดทำงานกลางคันทั้งที่ยังไม่เสร็จ"
+
+### 2.2 `max_tool_calls_per_step = 1` รวมถึง read-only calls ที่ควร parallel ได้
+
+`marcus_code/loop.py:246-266` — นโยบายปัจจุบันปฏิเสธทุก tool call ที่สองใน
+LLM response เดียวกันด้วย `POLICY_DENIED` แล้วส่ง observation error ให้
+โมเดล บังคับให้รอ step ใหม่เสมอ
+
+กับ repository จริง โมเดลมักเสนอ `list_files` + `read_file` + `grep` ใน
+response เดียวเพื่อสำรวจโค้ด ระบบปฏิเสธสองจากสาม ทำให้เสีย step ไปหลาย
+รอบเพื่อแค่รวบรวมข้อมูลพื้นฐาน และบางครั้งโมเดลเลิกพยายามและตอบ plain text
+ทำให้เทิร์นจบเร็วผิดจังหวะ
+
+### 2.3 `grep` และ `list_files` ไม่กรองไฟล์ตามขนาดและประเภทอย่างพอใจ
+
+`marcus_code/tools.py:238-295` — `_MAX_GREP_FILE_BYTES = 2_000_000`
+และ `_SKIP_DIR_NAMES` กรอง `.git`, `node_modules`, `.venv` ฯลฯ แล้ว แต่
+ไม่กรองไฟล์ binary ตาม content type, ไม่จำกัดจำนวนไฟล์ที่ scanned, และไม่
+sort ผลลัพธ์ตาม relevance ใน repository ขนาดกลาง–ใหญ่ `grep` ที่เรียบง่าย
+นี้สแกนไฟล์ทุกไฟล์ใน glob และคืน `matches` สูงสุด 200 รายการแรก ทำให้
+LLM ได้ผลลัพธ์เป็น noise มากกว่าสัญญาณและบางครั้ง context บวมทันที
+
+`list_files` ใน repo จริงส่งกลับ path แบบเรียบ 200 รายการแรกโดยไม่
+บอกว่ามีโฟลเดอร์หลักอะไรบ้าง โมเดลจึงมักเรียกซ้ำเพื่อสำรวจต่อ
+
+### 2.4 `read_file` ไม่มี chunking หรือ offset/limit ทำให้ไฟล์ใหญ่เป็น context bomb
+
+`marcus_code/tools.py:77-107` — อ่านไฟล์ทั้งไฟล์ทันทีแล้วส่ง content ทั้งหมด
+เข้า LLM ในไฟล์ 5,000+ บรรทัด content เดียวก็กิน context window 20–40k
+tokens ทำให้ `context_percent` กระโดดขึ้น ครั้งเดียวก็เข้า compact และ
+อาจเข้า compact ซ้ำจน history สั้นลงเกินไปและโมเดลหลุดจากเป้าหมาย
+
+### 2.5 ไม่มี progressive disclosure ตามขนาดงาน ทำให้โมเดลเล็กหลงทาง
+
+`marcus_code/prompt.py` — system prompt เดียวกันใช้กับทุกงาน: เล็ก
+เช่น "อ่านไฟล์นี้แล้วสรุป" หรือใหญ่เช่น "แก้บั๊กในระบบ" ไม่มีการเพิ่ม hint
+ตาม `TaskKind` ที่ `task_contract.py` แยกไว้ โมเดลเล็กมักตีความงานใหญ่เป็น
+"อ่าน 1–2 ไฟล์แล้วตอบ" แล้วจบเทิร์น
+
+### 2.6 `run_cli` timeout 30 วินาทีเข้มงวดเกินไปสำหรับงานจริง
+
+`harness/config.py:67` — `tools_run_cli_timeout_seconds = 30.0`
+ใน repository จริงคำสั่งเช่น `pytest`, `npm test`, `dotnet build` อาจใช้
+60–180 วินาที คำสั่งถูกฆ่าที่ 30s โดย return error แล้วโมเดลเข้าใจว่า
+"build fail" ทั้งที่จริงยังไม่เสร็จ จบลงด้วย final answer ผิด
+
+### 2.7 `compact_history` ทำซ้ำจน history สั้นเกินไป
+
+`marcus_code/loop.py:368-382` — ลด `max_history_messages` ทีละหนึ่งใน
+while loop จนกว่า `context_tokens` จะต่ำกว่า target ใน repository จริงที่
+มี tool result ใหญ่ compact หนึ่งครั้งสามารถตัดประวัติลงเหลือ 4 ข้อความ
+แล้วโมเดลหลุดจากบริบทที่จำเป็นต่อการทำงานต่อ
+
+### 2.8 `_trim_history` ไม่ preserve evidence/decisions อย่างชัดเจน
+
+`marcus_code/loop.py:334-356` — ตัดประวัติเก่าแล้วแทนด้วย summary snippet
+เพียง 12 ข้อความสุดท้าย สูงสุด 240 ตัวอักษร/ข้อความ evidence สำคัญเช่น
+"build passed at step 5", "test count = 42", "process_id = abc123"
+อาจถูกตัดออก ทำให้โมเดลเสีย state และตอบผิดหรือหยุด
+
+### 2.9 LLM recovery timeout ไม่มี fallback ที่เป็นประโยชน์
+
+`marcus_code/loop.py:160-199` — `asyncio.timeout(90s)` ครอบ `complete`
+หรือ `complete_stream`; เมื่อหมดเวลาก็แค่ return และจบเทิร์น ไม่มีการ
+- ลอง complete (non-stream) เป็น fallback ของ stream timeout
+- ลด context แล้ว retry ครั้งเดียว
+- แจ้งผู้ใช้และถามว่าจะรอต่อหรือยกเลิก
+
+### 2.10 ไม่มี resume/continue หลัง guardrail stop
+
+เมื่อ guardrail หยุดเทิร์นด้วยเหตุผลใดก็ตาม `run_turn` เพียง return
+และ REPL รอ prompt ใหม่ ไม่มีคำสั่ง `/continue` หรือ `/retry` ที่
+อนุญาตให้กลับเข้า loop ด้วย state เดิมและข้าม guardrail ที่จบไปแล้วได้
 
 ---
 
-## 3. Target execution model
+## 3. แนวแก้เฉพาะ `marcus_code` (ไม่แตะ server harness)
 
-เปลี่ยนจาก ReAct แบบอิสระ:
+### 3.1 ปล่อย finalization repair ได้มากขึ้นและ track evidence ที่ขาด
 
-```text
-LLM → tool → LLM → tool → final
+ใน `marcus_code/loop.py`:
+
+```python
+# ปัจจุบัน
+if finalization_repairs < 1:
+
+# แนวแก้
+max_finalization_repairs = 3
+if finalization_repairs < max_finalization_repairs:
+    finalization_repairs += 1
+    missing = contract.missing_evidence_hint(verification_succeeded)
+    self.state.history.append(LLMMessage(..., content=(
+        "Finalization denied: required verification not satisfied. "
+        f"Specifically: {missing}. "
+        "Run one appropriate verification tool, then summarize its result."
+    )))
+    continue
 ```
 
-เป็น state machine ที่ runtime เป็นเจ้าของ:
+เพิ่ม `TaskContract.missing_evidence_hint()` ที่คืนข้อความเฉพาะเช่น
+"no test command succeeded yet" หรือ "no HTTP check passed" เพื่อ
+ชี้แนะโมเดลแบบ concrete แทนข้อความเดียวกันทุกครั้ง
 
-```text
-INTAKE
-  → PLAN
-  → PREFLIGHT
-  → ACT
-  → OBSERVE
-  → VERIFY
-  → COMMIT / REPLAN / ASK_USER / FAIL
+### 3.2 ยอม read-only parallel calls แต่ยังบล็อก mutation ซ้อน
+
+แยก policy ตาม risk tier แทน "one call เสมอ":
+
+```python
+read_only_calls = [c for c in response.tool_calls
+                   if self.tools_by_name[c.name].risk_tier == RiskTier.read_only]
+mutation_calls  = [c for c in response.tool_calls
+                   if self.tools_by_name[c.name].risk_tier != RiskTier.read_only]
+
+# read-only อนุญาตได้พร้อมกัน (bounded, เช่น ≤ 3)
+# mutation ยังทีละรายการเท่านั้น
 ```
 
-### 3.1 Task contract
+ลด step ที่เปล่าไปกรณีสำรวจ 3 ไฟล์พร้อมกัน, และยังกัน mutation ซ้อนที่
+อาจพึ่ง output ของกันและกัน
 
-ก่อนอนุญาต mutation ให้สร้าง `TaskContract` แบบ typed:
+### 3.3 ปรับ `grep` และ `list_files` ให้ใช้ได้กับ repo จริง
+
+- `grep`: เพิ่ม parameter `max_results` (default 50), `file_pattern`
+  เพื่อจำกัด, และเรียงผลตามความสำคัญ (file path match, line แรกก่อน)
+- `grep`: skip ไฟล์ที่ไม่ใช่ text โดยดู BOM/NULL bytes แทนเพียง
+  `UnicodeDecodeError` catch
+- `list_files`: แยกผลเป็น directory summary + file list, และเพิ่ม
+  parameter `max_depth` เพื่อจำกัดความลึก
+- ทั้งสอง: ส่งกลับ `total_matches` หรือ `total_files` นอกเหนือจาก
+  `truncated` เพื่อให้โมเดลรู้ว่ายังมีข้อมูลที่ไม่ได้แสดง
+
+### 3.4 ให้ `read_file` รองรับ offset/limit และ streaming chunk
+
+เพิ่ม parameters:
 
 ```json
 {
-  "objective": "ทำให้ endpoint convert ทำงาน",
-  "constraints": ["ห้ามออกนอก workspace"],
-  "deliverables": ["source change", "passing build", "HTTP evidence"],
-  "verification": [
-    {"kind": "command", "command_class": "build", "required": true},
-    {"kind": "http", "expected_status": 200, "required": true}
-  ],
-  "allowed_write_scope": ["src/**", "tests/**"]
+  "path": "src/big.py",
+  "offset": 1,
+  "limit": 200
 }
 ```
 
-โมเดลเสนอ contract ได้ แต่ runtime validate และเติม defaults ตาม task class
+และเมื่อไฟล์ใหญ่เกิน `max_chars` ให้ส่งกลับบอกจำนวนบรรทัดทั้งหมดและ
+แนะนำให้ใช้ offset ถัดไป แทนส่งทั้งไฟล์แล้ว compact รุนแรง
 
-### 3.2 Plan as data, not prose
+### 3.5 ขยาย `run_cli` timeout ตามประเภทคำสั่งและอนุญาต override
 
-เก็บ plan เป็นรายการ step ที่มี state:
-
-```text
-pending → running → verified → completed
-                    ↘ failed → replanned
+```python
+# แทนค่าคงที่ 30s
+def _cli_timeout_for(command: str) -> float:
+    lowered = command.lower()
+    if any(k in lowered for k in ("pytest", "npm test", "dotnet build", "cargo test")):
+        return 180.0
+    if any(k in lowered for k in ("build", "compile", "webpack")):
+        return 120.0
+    return settings.tools_run_cli_timeout_seconds
 ```
 
-แต่ละ step ต้องระบุ:
+หรือเปิด parameter `timeout_seconds` ใน tool schema (capped ที่ 300)
+แล้วให้โมเดลเลือกได้
 
-- intent
-- required observations
-- allowed tools
-- expected outcome
-- verifier
-- maximum attempts
+### 3.6 compact แบบ preserve evidence และไม่ตัดรุนแรง
 
-โมเดลเล็กจะเห็นเฉพาะ current step + facts ที่จำเป็น ไม่ต้องแบก plan prose ยาวทุก call
+- ก่อน compact ให้แยก history เป็นสามชั้น:
+  1. **protected**: system, user เดิม, evidence message (tool call +
+     result ที่ผ่าน `is_verification_evidence`), และแผนที่โมเดลแสดง
+  2. **keep**: ข้อความ 6 ล่าสุด
+  3. **droppable**: ที่เหลือ
+- compact เฉพาะ droppable, แล้วสร้าง summary ที่ preserve fact สำคัญ
+  เช่น exit code, process_id, test count, จาก droppable messages
+- ลด `max_history_messages` ทีละห้าไม่ใช่ทีละหนึ่ง เพื่อลด iteration
+  และลดโอกาส trim รุนแรง
+- เก็บ protected message ไว้ใน `SessionState.protected` แยกจาก
+  `history` แล้ว inject ใหม่ทุก LLM call
 
-### 3.3 Evidence ledger
+### 3.7 recovery timeout ที่เป็นประโยชน์
 
-สร้าง `EvidenceRecord` จาก tool results โดย runtime:
+```python
+except TimeoutError:
+    # แทน return ทันที ลด context แล้ว retry ครั้งเดียว
+    if not retried_after_timeout:
+        retried_after_timeout = True
+        self.compact_history()
+        self.ui.print_recovery("LLM timed out; retrying with compacted context.")
+        continue
+    self.ui.print_guardrail_stop(...)
+    return
+```
 
-```json
-{
-  "claim": "build passes",
-  "source": "tool_execution:uuid",
-  "status": "supported",
-  "facts": {"exit_code": 0, "command_class": "build"},
-  "observed_at": "..."
+### 3.8 เพิ่มคำสั่ง `/continue` และ `/retry`
+
+เก็บ last turn state ใน `SessionState`:
+
+```python
+@dataclass
+class SessionState:
+    history: list[LLMMessage] = field(default_factory=list)
+    always_allowed: set[str] = field(default_factory=list)
+    last_turn_input: str | None = None
+    last_turn_guardrail: str | None = None
+```
+
+เมื่อ guardrail หยุดเทิร์น ให้ `ui.prompt_user()` แสดง hint:
+"stopped: <reason>. ใช้ /retry เพื่อลองใหม่ หรือ /continue เพื่อข้าม"
+
+`/retry` เรียก `run_turn(last_turn_input)` ใหม่
+`/continue` เรียก `run_turn("continue from where you stopped")` โดย
+inject system message บอก state ปัจจุบัน
+
+### 3.9 task contract hint ตาม TaskKind
+
+เพิ่มใน system prompt ที่ `build_system_prompt`:
+
+```python
+kind_hint = {
+    TaskKind.explain: "อ่านให้ครบก่อนสรุป อย่าตอบก่อนได้ข้อมูลครบ",
+    TaskKind.change:  "สำรวจ → แผน → เปลี่ยน → ตรวจสอบ ตามลำดับ",
+    TaskKind.operate:  "start_process → wait → ตรวจสอบ → stop_process",
 }
 ```
 
-`finish` ต้อง reject หาก required evidence ขาด, stale หรือขัดแย้งกัน โมเดลจึงไม่สามารถ
-กล่าวว่า “หยุด service แล้ว” หาก `stop_process` คืน error
+และ inject `kind` กับข้อกำหนดเข้า history เป็น system message แรกของ
+เทิร์นเพื่อให้โมเดลเล็กเห็นกรอบชัด
+
+### 3.10 context meter ที่แสดง budget จริง
+
+เพิ่มใน `refresh_status` / `_bottom_toolbar`:
+
+- แสดง `max_steps` และ `current_step` ที่กำลังรัน (loop.py ต้อง expose)
+- แสดง `verification_succeeded` flag
+- แสดง "finalization repair X/3" เมื่ออยู่ในขั้นนั้น
+
+ช่วยให้ผู้ใช้เห็นว่า agent กำลังทำอะไรและทำไมยังไม่จบแทน "ดูเหมือนค้าง"
 
 ---
 
-## 4. ลด hallucination สำหรับโมเดลระดับล่าง–กลาง
+## 4. ลำดับการทำ
 
-### 4.1 Capability profile ต่อ model
+### Priority 1 — แก้ "หยุดทำงานกลางคัน" โดยตรง
 
-เพิ่ม model profile แทนใช้ behavior เดียวทุก model:
+1. **ขยาย finalization repair เป็น 3 และใส่ missing-evidence hint**
+   (3.1) — แก้อาการ 1 และ 5 โดยตรง
+2. **ยอม read-only parallel calls** (3.2) — ลด step เปล่าในการสำรวจ
+3. **เพิ่ม `/continue` และ `/retry`** (3.8) — ให้ผู้ใช้กู้เทิร์นที่หยุดได้
+4. **recovery timeout ที่ compact แล้ว retry ครั้งเดียว** (3.7) — แก้อาการ 3
 
-| Tier | Tool calls/step | Visible tools | Planning | Verification |
-|---|---:|---:|---|---|
-| low | 1 | 3–6 | runtime template | mandatory deterministic |
-| medium | 1–2 independent calls | 6–12 | typed plan | mandatory |
-| high | bounded batch | progressive | model-assisted | mandatory |
+### Priority 2 — ทำให้ใช้ได้กับ repository จริง
 
-ห้าม infer tier จากชื่อ model อย่างเดียว ให้ config หรือผ่าน capability probe/evaluation
+5. **`read_file` offset/limit** (3.4) — กัน context bomb จากไฟล์ใหญ่
+6. **`grep` และ `list_files` ที่กรองและ sort ดีขึ้น** (3.3) — ลด noise
+7. **`run_cli` timeout ตามประเภทคำสั่ง** (3.5) — กัน build/test ถูกฆ่าก่อนเสร็จ
+8. **compact แบบ preserve evidence** (3.6) — กันหลุดเป้าหมายหลัง compact
 
-### 4.2 One dependent action per turn
+### Priority 3 — คุณภาพและความชาญฉลาด
 
-สำหรับ low/medium model ให้ยอมรับ tool call เดียวต่อ LLM responseโดย default หากมีหลาย call:
-
-- รันพร้อมกันได้เฉพาะ read-only calls ที่ประกาศว่า independent
-- หาก call B ต้องใช้ output ของ call A ให้ reject B ด้วย error code
-  `DEPENDENCY_REQUIRES_NEW_STEP`
-- mutation calls ทำทีละรายการ
-
-วิธีนี้ลด argument guessing และลด partial-success ambiguity
-
-### 4.3 Typed tool observations
-
-ทุก tool result ควรอยู่ใน envelope เดียว:
-
-```json
-{
-  "ok": true,
-  "code": "COMMAND_SUCCEEDED",
-  "summary": "Build completed",
-  "facts": {"exit_code": 0},
-  "artifacts": [],
-  "retryable": false,
-  "redactions": 0
-}
-```
-
-ห้ามให้ LLM ตีความจาก free-form `stdout` เพียงอย่างเดียว Runtime adapter ต้อง extract
-exit code, HTTP status, file hash, test count และ process status เป็น facts
-
-### 4.4 Schema validation and bounded repair
-
-ก่อน handler:
-
-1. validate arguments ด้วย JSON Schema
-2. normalize safe coercions เช่น `"30"` → `30` เฉพาะ schema ที่อนุญาต
-3. หากผิด ส่ง concise validation error พร้อม fields ที่ผิด
-4. ให้โมเดล repair ได้หนึ่งครั้ง
-5. ผิดซ้ำ → ask user หรือ fail step
-
-อย่าส่ง Python traceback หรือ exception text ยาวกลับโมเดล
-
-### 4.5 Claim policy
-
-Final response ใช้ facts จาก evidence ledger ไม่ใช่ความจำของโมเดล:
-
-- ตัวเลข, paths, status และ test totals ต้อง copy จาก evidence
-- unsupported claim ถูกตัดหรือทำเครื่องหมาย “ยังไม่ยืนยัน”
-- final answer generator รับเฉพาะ approved facts
-- หากใช้โมเดลเล็ก สามารถใช้ deterministic template โดยไม่เรียก LLM เพิ่ม
+9. **task contract hint ใน system prompt** (3.9)
+10. **context meter ที่แสดง state จริง** (3.10)
 
 ---
 
-## 5. Safety improvements
+## 5. วิธียืนยันว่าแก้แล้ว
 
-### 5.1 Fail-closed production startup
+หลังลงมือ Priority 1 รันกับ repository จริงที่เคยหยุด:
 
-เมื่อ `env != development` ให้ process ปฏิเสธ startup หาก:
+- `uv run marcus -p "run pytest and summarize failures"` — ต้องไม่
+  จบก่อน pytest เสร็จ และต้องมี evidence ใน final answer
+- สั่ง "อ่านไฟล์ X, Y, Z แล้วสรุป" — ต้องอ่านครบทั้งสามใน step ใกล้เคียง
+  ไม่ใช่ step ละไฟล์
+- สั่งงานยาวแล้วกด Ctrl+C ตอด mid-step — `/retry` ต้องกลับเข้า loop ได้
+  โดยไม่เสีย context สำคัญ
 
-- `secret_key` ยังเป็น default
-- LLM/API/Slack secrets เป็น placeholder
-- encryption key สั้นหรือไม่มี key version
-- CORS/host config กว้างเกิน policy
-- legacy unauthenticated tenant mode ยังเปิด
+หลัง Priority 2:
 
-เพิ่ม `/readyz` check สำหรับ unsafe configuration โดยไม่เปิดเผย secret
-
-### 5.2 Unify native tool implementations
-
-ย้าย shared implementation ไป package เช่น `harness.tools.local` แล้วให้ CLI/server inject:
-
-- root scope
-- approval policy
-- process manager
-- output policy
-- network policy
-
-ต้องมี contract tests ชุดเดียวรันกับทั้งสอง adapters ป้องกันกรณี CLI แก้ process-tree kill
-แต่ server `runtime/native_tools.py` ยังใช้ `proc.kill()` กับ shell อย่างเดียว
-
-### 5.3 Command policy before shell
-
-แยก command execution ออกจาก raw shell string:
-
-- prefer argv execution (`create_subprocess_exec`) สำหรับ known commands
-- shell mode ต้อง explicit และ approval สูงกว่า
-- classify command: inspect/build/test/network/package/git/db/system
-- allow workspace command policy ต่อ mode/tenant
-- block command substitution, redirects ออกนอก workspace และ environment secret dumps
-- record executable, argv, cwd และ normalized command hash
-
-### 5.4 File safety
-
-- Server `read_file` ต้องใช้ secret redaction เทียบเท่า CLI
-- ทุก write/edit เก็บ pre-image hash และ post-image hash
-- edit ต้องใช้ expected hash ป้องกันเขียนทับ concurrent user changes
-- จำกัด total bytes written ต่อ run
-- atomic write (`temp + fsync + replace`) สำหรับ config/artifacts สำคัญ
-- symlink/reparse-point checks ต้องเกิดทั้งก่อนและทันทีตอนเปิด file เพื่อลด TOCTOU
-
-### 5.5 Network/MCP safety
-
-- ใช้ canonical tool id: `server_id:tool_name` ไม่ใช้ name เดี่ยว
-- validate MCP tool schemas และ cap schema/description size ก่อนเข้า prompt
-- pin resolved IP ต่อ request หรือใช้ controlled egress proxy ป้องกัน DNS rebinding
-- timeout แยก connect/read/write และ overall deadline
-- treat MCP/file/web content เป็น untrusted data พร้อม trust metadata
-- ห้าม tool result สั่ง `load_tool`, เปลี่ยน mode หรือแก้ plan โดยตรง
-
-### 5.6 Local credential safety
-
-`ollama-storage-state.json` มี bearer/session cookies ไม่ควรพึ่ง `chmod` อย่างเดียวบน Windows:
-
-- ใช้ Windows DPAPI / macOS Keychain / Secret Service
-- เก็บ encryption metadata และ key version
-- `/usage logout` ลบ storage state, cache และ browser profile
-- ตั้งอายุ cache และแสดง last refreshed
-- ย้าย Playwright เป็น optional extra เช่น `marcus[ollama-usage]`
+- `grep` ใน repo 1,000 ไฟล์ต้องคืน < 1 วินาที และผลเป็นไฟล์ที่เกี่ยวข้อง
+- อ่านไฟล์ 5,000 บรรทัดต้องไม่ทำให้ context บวมเกิน 15%
+- `dotnet build` ที่ใช้ 90 วินาทีต้องไม่ถูกฆ่าที่ 30s
 
 ---
 
-## 6. Reliability and anti-loop design
-
-### 6.1 Central retry budget
-
-สร้าง `RetryController` จุดเดียวสำหรับ LLM, MCP และ tools:
-
-```text
-max attempts per operation
-max retry delay
-overall deadline
-retryable error codes
-cost already spent
-idempotency classification
-```
-
-ห้าม retry ซ้อนหลาย layer เช่น gateway retry + loop fallback + worker retry โดยไม่มี shared
-budget ทุก attempt ต้องมี `attempt_id` และ reason
-
-### 6.2 Progress/stagnation detector
-
-แทนการตรวจ identical call อย่างเดียว ให้สร้าง progress fingerprint จาก:
-
-- files/facts/evidence ที่เพิ่ม
-- error code ล่าสุด
-- plan step state
-- normalized tool + arguments
-- workspace diff hash
-
-หาก N steps ไม่มี evidence ใหม่หรือ diff ใหม่ ให้:
-
-1. ลด tool set
-2. ขอ replan แบบ structured หนึ่งครั้ง
-3. หากยัง stagnate ให้ ask user/fail อย่างมีเหตุผล
-
-### 6.3 Error taxonomy
-
-แทน free-form strings ด้วย error codes:
-
-```text
-INVALID_ARGUMENT
-POLICY_DENIED
-AUTH_REQUIRED
-TRANSIENT_NETWORK
-RATE_LIMITED
-TIMEOUT
-PROCESS_EXITED
-OUTCOME_UNKNOWN
-VERIFICATION_FAILED
-NO_PROGRESS
-```
-
-แต่ละ code มี retry policy ที่ runtime กำหนด โมเดลทำหน้าที่เลือกทางเลือก ไม่ตัดสินว่า error
-retryable เอง
-
-### 6.4 Cleanup semantics
-
-- resource ทุกชนิดต้องเป็น session/turn scoped และ implement `aclose`
-- process, browser, HTTP client, MCP session และ prompt UI ต้องอยู่ใน async context stack
-- background process ต้องมี ownership record และ cleanup deadline
-- cleanup failure ต้องแสดงเป็น evidence ไม่ถูกกลืน
-- เพิ่ม leak tests บน Windows Proactor และ POSIX
-
----
-
-## 7. Context and cost control
-
-### 7.1 แยกสาม budget
-
-อย่าใช้ `run.token_budget` ตัวเดียวสำหรับทุกความหมาย:
-
-1. `context_window_tokens` — tokens ที่ส่ง request ปัจจุบัน
-2. `run_token_budget` — tokens สะสมรวม LLM calls ทั้ง run
-3. `cost_budget` — เงินหรือ provider quota
-
-Compaction ต้องเทียบกับข้อ 1 ไม่ใช่ข้อ 2
-
-### 7.2 Account for hidden calls
-
-ต้องนับ usage ของ:
-
-- compaction/summarization
-- retries ที่ provider charge
-- repair calls
-- verification/finalization calls
-- skill routing calls หากเพิ่มในอนาคต
-
-หาก provider ไม่ส่ง usage ให้ใช้ estimate พร้อม `usage_source=estimated` และบังคับ conservative
-budget ไม่ใช่นับ 0
-
-### 7.3 Deterministic compaction first
-
-ก่อนเรียก LLM summary:
-
-- drop duplicate directory listings
-- replace large stdout ด้วย artifact reference + facts
-- keep only latest successful result ต่อ command class
-- fold repeated errors เป็น count
-- preserve decisions, constraints, file hashes และ evidence verbatim
-
-ถ้าต้องใช้ LLM summary ให้ output เป็น schema และ validate facts กับ source records
-
-### 7.4 Prompt and tool-schema budget
-
-- มี token budget แยกสำหรับ system prompt, skills และ tool schemas
-- rank tools deterministically และส่ง top-K
-- description ต้องสั้นและใช้ examples เฉพาะ ambiguous fields
-- cache stable prompt prefix หาก provider รองรับ
-- ไม่ส่ง full workspace listing ซ้ำเมื่อ snapshot hash ไม่เปลี่ยน
-
-### 7.5 Adaptive stopping
-
-Default CLI ไม่ควรเป็น 100 steps + unlimited tokens สำหรับทุก model:
-
-```text
-low tier:    20–30 steps, strict one-call policy
-medium tier: 40–50 steps
-high tier:   configurable up to 100
-```
-
-ขยาย budget ได้เมื่อมี measurable progress ไม่ใช่ตามคำขอของโมเดล
-
----
-
-## 8. Skill selection
-
-แนวทาง catalog → LLM เลือก → `load_skill` เหมาะกับ CLI และควรรักษาไว้ แต่เพิ่ม safeguards:
-
-- validate `SKILL.md` size, frontmatter และ allowed references
-- mark skill content เป็น privileged local instruction เฉพาะเมื่อ trusted
-- เก็บ skill digest ใน run audit
-- จำกัดหนึ่ง active skill โดย default สำหรับ low-tier model
-- หาก skill candidates ใกล้กัน ไม่ควรให้ lexical tie-break ตัดสิน silently
-- required tools ต้องตรวจ risk/policy อีกครั้ง Skill ไม่สามารถยกระดับสิทธิ์
-- วัด success rate แยกตาม model tier และ task class ป้องกันเลือก skill จาก aggregate ที่หลอกตา
-
-ไม่ควรเพิ่ม LLM routing call แยกโดย default เพราะเพิ่ม cost การ lexical retrieval แบบ conservative
-ที่มีอยู่เป็นฐานที่ดี
-
----
-
-## 9. Observability and audit
-
-เพิ่ม structured events:
-
-```text
-plan.created
-policy.denied
-tool.validation_failed
-tool.retry_scheduled
-evidence.recorded
-verification.failed
-context.compacted
-stagnation.detected
-resource.cleanup_failed
-```
-
-Metrics ที่ควรมี:
-
-- success rate แบบ verified/unverified
-- tokens และ cost ต่อ successful task
-- tool calls ต่อ verified task
-- retry amplification factor
-- no-progress steps
-- invalid argument rate แยกตาม model
-- claim rejection rate จาก evidence gate
-- compaction fact-loss rate
-- leaked resource count
-
-Log ต้อง redact secrets ก่อน serialization ไม่ใช่หวังว่า caller ไม่ส่ง secret
-
----
-
-## 10. Testing and evaluation strategy
-
-### 10.1 Contract tests
-
-สร้างชุดเดียวสำหรับ CLI/server tool implementations:
-
-- path traversal, symlink, reparse point
-- secret redaction
-- timeout + process tree cleanup
-- output truncation
-- malformed arguments
-- cancellation at every await boundary
-
-### 10.2 Model-tier simulation
-
-เพิ่ม scripted weak-model behaviors:
-
-- tool name hallucination
-- wrong argument type
-- repeated call with cosmetic argument changes
-- claims success after error
-- multiple dependent calls in one response
-- ignores instruction to stop process
-- produces empty final response
-
-Expected result ต้องเป็น runtime repair/deny/verify ไม่ใช่เพียง prompt ทำให้ model ตอบดีขึ้น
-
-### 10.3 Golden task suite
-
-อย่างน้อย 20–50 tasks ต่อ class:
-
-- explain-only
-- single-file edit
-- multi-file implementation
-- build/test repair
-- background service + HTTP verification
-- destructive request requiring approval
-- provider outage/recovery
-
-วัด correctness จาก deterministic assertions และ artifacts ก่อนใช้ LLM-as-judge
-
-### 10.4 Fault injection
-
-จำลอง crash ที่จุด:
-
-- หลัง write-ahead ก่อน tool call
-- หลัง external side effect ก่อน result commit
-- ระหว่าง lease heartbeat
-- ระหว่าง compaction
-- หลัง approval แต่ก่อน execution
-- ขณะ process/browser cleanup
-
-Full-stack tests ควรใช้ Testcontainers หรือ compose fixture และ skip พร้อมเหตุผลเมื่อ infra ไม่มี
-ไม่ควรปล่อย connection refused เป็น test error ที่ปะปนกับ code regression
-
----
-
-## 11. Recommended roadmap
-
-### Phase 0 — Correctness baseline (P0)
-
-1. เพิ่ม JSON Schema validation ก่อนทุก tool handler
-2. เพิ่ม typed `ToolOutcome` และ error taxonomy
-3. เพิ่ม evidence ledger + verification gate ก่อน finish
-4. unify CLI/server native tool core
-5. port process-tree cleanup ไป server `run_cli`
-6. fail-closed production config validation
-
-Acceptance criteria:
-
-- final success ทุกครั้งมี evidence id
-- invalid tool arguments ไม่ถึง handler
-- child process leak tests ผ่านบน Windows/Linux
-- default secrets ทำให้ production startup fail
-
-### Phase 1 — Weak-model control plane
-
-1. TaskContract + typed plan
-2. model capability profiles
-3. one dependent tool call per step
-4. stagnation detector
-5. bounded repair/replan policy
-6. deterministic final response template สำหรับ low tier
-
-Acceptance criteria:
-
-- scripted weak model ที่ claim success หลัง tool errorไม่สามารถ finish ได้
-- cosmetic retry loops หยุดภายใน configured bound
-- invalid argument repair ไม่เกินหนึ่ง LLM call
-
-### Phase 2 — Context and cost
-
-1. แยก context/run/cost budgets
-2. นับ hidden LLM calls
-3. deterministic compaction + artifact references
-4. adaptive step/tool budgets
-5. prompt/tool-schema token accounting
-
-Acceptance criteria:
-
-- reported usage ไม่ต่ำกว่าการใช้งานจริงที่วัดได้
-- p95 tokens ต่อ verified task ลดลงอย่างน้อย 25%
-- context overflow เป็นศูนย์ใน golden suite
-
-### Phase 3 — Security hardening
-
-1. canonical MCP tool ids
-2. content trust labels + injection resistance
-3. command policy/argv execution
-4. OS credential vault สำหรับ local browser state
-5. optionalize Playwright
-6. egress policy/proxy
-
-Acceptance criteria:
-
-- cross-domain tool collision เป็นไปไม่ได้
-- untrusted tool output ไม่สามารถเปลี่ยน mode/policy
-- secrets ไม่ปรากฏใน LLM messages/log snapshots ของ security suite
-
-### Phase 4 — Evaluation and operations
-
-1. golden tasks ใน CI
-2. fault injection suite
-3. model-tier scorecard
-4. verified-success/cost dashboards
-5. canary rollout ต่อ model/provider
-
----
-
-## 12. Suggested configuration additions
-
-```toml
-[agent]
-model_tier = "medium"
-max_tool_calls_per_step = 1
-max_argument_repairs = 1
-max_replans = 2
-max_no_progress_steps = 3
-require_verified_finish = true
-
-[budget]
-context_window_tokens = 32768
-run_token_budget = 50000
-cost_budget_usd = 1.00
-tool_schema_token_budget = 4000
-
-[tools]
-shell_enabled = false
-max_write_bytes_per_run = 2000000
-require_expected_file_hash = true
-
-[security]
-fail_on_default_secrets = true
-legacy_auth_enabled = false
-untrusted_content_policy = "data_only"
-```
-
-ค่า config ต้อง validate ความสัมพันธ์ เช่น compact target ต้องต่ำกว่า threshold และ token budgets
-ต้องเป็นค่าบวก
-
----
-
-## 13. Definition of “reasoned and correct”
-
-งานหนึ่งถือว่าทำงานอย่างมีเหตุผลเมื่อ:
-
-1. มี objective และ constraints ที่ชัด
-2. ทุก mutation เชื่อมกับ plan step
-3. tool arguments ผ่าน schema และ policy
-4. retry เกิดจาก typed retryable error และอยู่ใน shared budget
-5. ทุก conclusion สำคัญมี evidence
-6. verification เป็น independent check ไม่ใช่คำกล่าวของ model
-7. cleanup ถูกตรวจและบันทึก
-8. final answer แยก verified, failed และ unverified claims
-9. token/tool/time cost อยู่ใน budget
-10. audit replay อธิบายได้ว่าทำไม runtime อนุญาตแต่ละ action
-
-หลักการสำคัญที่สุดคือ:
-
-> ให้ LLM เสนอความหมายและทางเลือก แต่ให้ runtime เป็นผู้ตัดสิน policy, state,
-> retry, evidence และ completion
-
-แนวทางนี้ทำให้โมเดลระดับล่าง–กลางใช้งานได้ดีขึ้นโดยไม่ต้องหวังว่า prompt จะควบคุม
-พฤติกรรมได้ทุกครั้ง และยังลดค่าใช้จ่ายเพราะจำนวน repair/retry/verification ที่ไม่จำเป็นลดลง
+## 6. หมายเหตุ
+
+- แนวแก้ทั้งหมดนี้อยู่ใน `marcus_code/` และ `harness/config.py` เท่านั้น
+  ไม่กระทบ `harness/runtime/engine.py` หรือ server harness
+- บางข้อ (เช่น evidence preservation, typed outcome) ทับซ้อนกับ
+  `improvement.md` ของฝั่ง server แต่ใช้ implementation แยกเพราะ CLI
+  เก็บ state ในหน่วยความจำไม่ใช่ DB
+- task contract และ verification gate ของ CLI ปัจจุบันเป็น heuristic
+  อิง keyword เท่านั้น หากต้องการให้แม่นยำขึ้นต้องเพิ่ม explicit `--verify`
+  flag หรือให้ผู้ใช้ mark task ที่ต้อง verification แบบชัดแจ้ง

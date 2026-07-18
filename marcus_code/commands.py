@@ -97,6 +97,29 @@ async def _cmd_steps(ctx: CommandContext, args: str) -> None:
         ctx.ui.print_steps()
 
 
+async def _cmd_retry(ctx: CommandContext, args: str) -> None:
+    previous = ctx.loop.state.last_turn_input
+    if not previous:
+        ctx.ui.print_error("no previous task to retry")
+        return
+    ctx.ui.print_info(f"Retrying previous task: {previous[:80]}{'...' if len(previous) > 80 else ''}")
+    await ctx.loop.run_turn(previous)
+
+
+async def _cmd_continue(ctx: CommandContext, args: str) -> None:
+    guardrail = ctx.loop.state.last_turn_guardrail
+    if guardrail:
+        ctx.loop.state.history.append(
+            LLMMessage(
+                role="system",
+                content=f"The previous turn was stopped by the runtime: {guardrail}. "
+                "Continue from where you left off and make progress toward the original goal.",
+            )
+        )
+    ctx.ui.print_info("Continuing from the previous turn...")
+    await ctx.loop.run_turn("continue from where you stopped")
+
+
 async def _cmd_compact(ctx: CommandContext, args: str) -> None:
     before, after = ctx.loop.compact_history()
     ctx.ui.print_info(f"Context compacted: {before:,} → {after:,} estimated tokens.")
@@ -181,6 +204,8 @@ COMMANDS: dict[str, CommandHandler] = {
     "/model": _cmd_model,
     "/usage": _cmd_usage,
     "/steps": _cmd_steps,
+    "/retry": _cmd_retry,
+    "/continue": _cmd_continue,
     "/compact": _cmd_compact,
     "/clear": _cmd_clear,
     "/status": _cmd_status,

@@ -5,6 +5,7 @@ from datetime import datetime
 
 import orjson
 
+from harness.db.enums import RiskTier
 from harness.llm.gateway import LLMError, LLMGateway, LLMTransientError
 from harness.llm.types import LLMMessage, ToolCall, Usage
 from harness.runtime.guardrails import REPEATED_CALL_WINDOW
@@ -12,12 +13,29 @@ from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tool_validation import ToolArgumentError, normalize_and_validate_arguments
 from harness.runtime.tools import Tool
 from marcus_code.modes import AgentMode, tool_is_allowed, tool_requires_approval
-from marcus_code.task_contract import derive_task_contract, is_verification_evidence
+from marcus_code.task_contract import TaskKind, derive_task_contract, is_verification_evidence
 from marcus_code.ui import TerminalUI
 
 DEFAULT_MAX_STEPS = 100
 DEFAULT_RESULT_MAX_CHARS = 4000
 DEFAULT_MAX_HISTORY_MESSAGES = 100
+DEFAULT_MAX_FINALIZATION_REPAIRS = 3
+DEFAULT_MAX_PARALLEL_READ_ONLY = 3
+
+_TASK_KIND_HINTS = {
+    TaskKind.explain: (
+        "This is an explanation request. Read the relevant files first, "
+        "then summarize what you found. Do not answer before you have gathered the facts."
+    ),
+    TaskKind.change: (
+        "This is a code-change request. Follow the sequence: explore → plan → change → verify. "
+        "State a concise plan before the first mutation, and run a verification tool before finishing."
+    ),
+    TaskKind.operate: (
+        "This is an operation request. Use start_process → wait_for_http → run client commands "
+        "→ stop_process. Always stop background processes you start."
+    ),
+}
 
 
 @dataclass
@@ -27,6 +45,8 @@ class SessionState:
 
     history: list[LLMMessage] = field(default_factory=list)
     always_allowed: set[str] = field(default_factory=set)
+    last_turn_input: str | None = None
+    last_turn_guardrail: str | None = None
 
 
 @dataclass
@@ -96,6 +116,8 @@ class MarcusLoop:
         llm_recovery_timeout_seconds: float = 90.0,
         max_tool_calls_per_step: int = 1,
         max_argument_repairs: int = 1,
+        max_finalization_repairs: int = DEFAULT_MAX_FINALIZATION_REPAIRS,
+        max_parallel_read_only: int = DEFAULT_MAX_PARALLEL_READ_ONLY,
     ) -> None:
         self.llm = llm
         self.tools_by_name = {t.name: t for t in tools}
@@ -116,6 +138,8 @@ class MarcusLoop:
         self.llm_recovery_timeout_seconds = llm_recovery_timeout_seconds
         self.max_tool_calls_per_step = max_tool_calls_per_step
         self.max_argument_repairs = max_argument_repairs
+        self.max_finalization_repairs = max_finalization_repairs
+        self.max_parallel_read_only = max_parallel_read_only
         self.state = SessionState()
         self.usage = UsageStats()
         self.started_at = datetime.now()
@@ -130,9 +154,15 @@ class MarcusLoop:
         consecutive_tool_failures = 0
         argument_failures: dict[str, int] = {}
         contract = derive_task_contract(user_input)
+        self.state.last_turn_input = user_input
+        self.state.last_turn_guardrail = None
+        kind_hint = _TASK_KIND_HINTS.get(contract.kind)
+        if kind_hint:
+            self.state.history.append(LLMMessage(role="system", content=kind_hint))
         plan_shown = False
         verification_succeeded = False
         finalization_repairs = 0
+        retried_after_timeout = False
         outcome_fingerprints: list[tuple[str, str]] = []
 
         for _ in range(self.max_steps):
@@ -192,10 +222,19 @@ class MarcusLoop:
                 self.ui.print_guardrail_stop(f"LLM call failed: {exc}")
                 return
             except TimeoutError:
-                self.ui.print_guardrail_stop(
+                if not retried_after_timeout:
+                    retried_after_timeout = True
+                    self.compact_history()
+                    if hasattr(self.ui, "print_recovery"):
+                        self.ui.print_recovery(
+                            "LLM timed out; retrying once with compacted context."
+                        )
+                    continue
+                self.state.last_turn_guardrail = (
                     "LLM recovery timed out after "
                     f"{self.llm_recovery_timeout_seconds:g}s; returned control safely"
                 )
+                self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
                 return
 
             self.state.history.append(
@@ -206,22 +245,24 @@ class MarcusLoop:
 
             if not response.tool_calls:
                 if contract.requires_verification and not verification_succeeded:
-                    if finalization_repairs < 1:
+                    if finalization_repairs < self.max_finalization_repairs:
                         finalization_repairs += 1
+                        hint = contract.missing_evidence_hint(verification_succeeded)
                         self.state.history.append(
                             LLMMessage(
                                 role="system",
                                 content=(
-                                    "Finalization denied by runtime: this task explicitly requires "
-                                    "verification, but no successful build/test/HTTP evidence exists. "
+                                    f"Finalization denied by runtime (repair {finalization_repairs}/"
+                                    f"{self.max_finalization_repairs}): {hint}. "
                                     "Run one appropriate verification tool, then summarize its result."
                                 ),
                             )
                         )
                         continue
-                    self.ui.print_guardrail_stop(
+                    self.state.last_turn_guardrail = (
                         "final answer blocked: requested verification has no successful evidence"
                     )
+                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
                     return
                 self._trim_history()
                 if response.content:
@@ -242,40 +283,45 @@ class MarcusLoop:
                 )
                 plan_shown = True
 
-            for call_index, call in enumerate(response.tool_calls):
-                if call_index >= self.max_tool_calls_per_step:
-                    error = (
-                        "only one tool call is allowed per reasoning step; "
-                        "inspect its result before choosing the next action"
+            selected_calls, rejected_calls = self._plan_tool_calls(response.tool_calls)
+
+            # Reject calls that exceed the per-step policy before execution.
+            for call in rejected_calls:
+                policy_reason = self._policy_reason_for_rejected(call, selected_calls)
+                self.ui.print_tool_error(call.name, policy_reason)
+                observation = {
+                    "status": "error",
+                    "error": policy_reason,
+                    "code": "POLICY_DENIED",
+                    "retryable": True,
+                }
+                self.state.history.append(
+                    LLMMessage(
+                        role="tool",
+                        tool_call_id=call.id,
+                        name=call.name,
+                        content=orjson.dumps(observation).decode(),
                     )
-                    self.ui.print_tool_error(call.name, error)
-                    observation = {
-                        "status": "error",
-                        "error": error,
-                        "code": "POLICY_DENIED",
-                        "retryable": True,
-                    }
-                    self.state.history.append(
-                        LLMMessage(
-                            role="tool",
-                            tool_call_id=call.id,
-                            name=call.name,
-                            content=orjson.dumps(observation).decode(),
-                        )
-                    )
-                    continue
+                )
+
+            # Execute selected calls: read-only calls may run concurrently,
+            # mutation calls are processed sequentially (at most one here).
+            observations = await self._execute_selected_calls(selected_calls)
+
+            # Process results in response order so guardrails remain sequential.
+            for call, observation in observations:
                 key = (call.name, call.arguments)
                 recent_calls.append(key)
                 if len(recent_calls) >= REPEATED_CALL_WINDOW and all(
                     c == key for c in recent_calls[-REPEATED_CALL_WINDOW:]
                 ):
-                    self.ui.print_guardrail_stop(
+                    self.state.last_turn_guardrail = (
                         f"tool {call.name!r} called with identical arguments "
                         f"{REPEATED_CALL_WINDOW} times in a row"
                     )
+                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
                     return
 
-                observation = await self._process_tool_call(call)
                 if is_verification_evidence(call.name, call.arguments, observation):
                     verification_succeeded = True
                 fingerprint = (
@@ -289,9 +335,10 @@ class MarcusLoop:
                 if len(outcome_fingerprints) >= 3 and all(
                     item == fingerprint for item in outcome_fingerprints[-3:]
                 ):
-                    self.ui.print_guardrail_stop(
+                    self.state.last_turn_guardrail = (
                         f"no progress after 3 calls to {call.name!r}; stopped to prevent a loop"
                     )
+                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
                     return
                 if observation.get("code") == "INVALID_ARGUMENT":
                     argument_failures[call.name] = argument_failures.get(call.name, 0) + 1
@@ -304,10 +351,11 @@ class MarcusLoop:
                                 content=orjson.dumps(observation).decode(),
                             )
                         )
-                        self.ui.print_guardrail_stop(
+                        self.state.last_turn_guardrail = (
                             f"argument repair budget exhausted for {call.name!r} "
                             f"({self.max_argument_repairs})"
                         )
+                        self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
                         return
                 if "error" in observation and "declined" not in str(observation["error"]):
                     consecutive_tool_failures += 1
@@ -323,37 +371,115 @@ class MarcusLoop:
                 )
                 self._trim_history()
                 if consecutive_tool_failures >= self.max_consecutive_tool_failures:
-                    self.ui.print_guardrail_stop(
+                    self.state.last_turn_guardrail = (
                         "too many consecutive tool failures "
                         f"({self.max_consecutive_tool_failures}); stopped to prevent a retry loop"
                     )
+                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
                     return
 
-        self.ui.print_guardrail_stop(f"exceeded max steps ({self.max_steps})")
+        self.state.last_turn_guardrail = f"exceeded max steps ({self.max_steps})"
+        self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
 
     def _trim_history(self) -> None:
         if len(self.state.history) <= self.max_history_messages:
             return
-        system = [message for message in self.state.history if message.role == "system"][:1]
-        if self.history_summary_enabled:
-            old = self.state.history[len(system) : -(self.max_history_messages - len(system) - 1)]
-            if old:
-                snippets = []
-                for message in old[-12:]:
-                    text = (message.content or "").replace("\n", " ")
-                    if text:
-                        snippets.append(f"{message.role}: {text[:240]}")
-                if snippets:
-                    system.append(
-                        LLMMessage(
-                            role="system",
-                            content="[Earlier conversation summarized]\n" + "\n".join(snippets),
-                        )
-                    )
-        tail = self.state.history[-(self.max_history_messages - len(system)) :]
-        while tail and tail[0].role in {"tool", "assistant"}:
-            tail = tail[1:]
-        self.state.history = system + tail
+
+        # Keep the original system prompt and the most recent user request
+        # (plus its tool/assistant turns). Older turns are collapsed into a
+        # compact summary so the model cannot answer stale user questions again.
+        first_system = [self.state.history[0]] if self.state.history[0].role == "system" else []
+
+        # Find the latest user message; everything before it is a prior turn.
+        latest_user_index = self._latest_user_index()
+        if latest_user_index is None or latest_user_index == 0:
+            # No user message or only system prompt: fall back to simple tail.
+            tail_size = max(0, self.max_history_messages - len(first_system))
+            tail = self.state.history[-tail_size:]
+            while tail and tail[0].role in {"tool", "assistant"}:
+                tail = tail[1:]
+            self.state.history = first_system + tail
+            return
+
+        prior_turns = self.state.history[len(first_system) : latest_user_index]
+        current_turn = self.state.history[latest_user_index:]
+
+        budget = self.max_history_messages - len(first_system)
+        # Give the current turn most of the budget; leave one slot for the summary.
+        current_budget = max(1, budget - 1)
+        if len(current_turn) > current_budget:
+            # Trim from the front of the current turn but never drop the user message.
+            excess = len(current_turn) - current_budget
+            current_turn = [current_turn[0]] + current_turn[excess + 1 :]
+            while current_turn and current_turn[0].role in {"tool", "assistant"}:
+                current_turn = current_turn[1:]
+
+        summary = self._summarize_prior_turns(prior_turns)
+
+        # Ensure the current turn starts with a message the model can respond to.
+        while current_turn and current_turn[0].role in {"tool", "assistant"}:
+            current_turn = current_turn[1:]
+
+        if summary and len(first_system) + len(current_turn) + 1 <= self.max_history_messages:
+            self.state.history = first_system + [summary] + current_turn
+        else:
+            self.state.history = first_system + current_turn
+
+    def _latest_user_index(self) -> int | None:
+        for index in range(len(self.state.history) - 1, -1, -1):
+            if self.state.history[index].role == "user":
+                return index
+        return None
+
+    def _summarize_prior_turns(self, messages: list[LLMMessage]) -> LLMMessage | None:
+        if not messages or not self.history_summary_enabled:
+            return None
+        facts = self._extract_facts(messages)
+        # Preserve the last assistant reply from each prior turn so the model
+        # knows the outcome without replaying the whole tool conversation.
+        prior_outcomes: list[str] = []
+        for message in reversed(messages):
+            if message.role == "assistant" and message.content:
+                prior_outcomes.insert(0, message.content[:240])
+            if len(prior_outcomes) >= 6:
+                break
+        summary_parts = []
+        if prior_outcomes:
+            summary_parts.append(
+                "[Prior turns summarized]\n" + "\n".join(f"- {text}" for text in prior_outcomes)
+            )
+        if facts:
+            summary_parts.append("[Preserved facts from earlier steps]\n" + "\n".join(facts))
+        if not summary_parts:
+            return None
+        return LLMMessage(role="system", content="\n\n".join(summary_parts))
+
+    @staticmethod
+    def _extract_facts(messages: list[LLMMessage]) -> list[str]:
+        """Pull concrete facts out of old tool result messages before they are summarized away."""
+        facts: list[str] = []
+        for message in messages:
+            if message.role != "tool" or not message.content:
+                continue
+            try:
+                data = orjson.loads(message.content)
+            except orjson.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if "exit_code" in data:
+                facts.append(f"{message.name}: exit_code={data['exit_code']}")
+            if "status" in data:
+                facts.append(f"{message.name}: status={data['status']}")
+            if "ready" in data and data.get("ready"):
+                facts.append(f"{message.name}: ready={data['ready']}")
+            if "process_id" in data:
+                facts.append(f"{message.name}: process_id={data['process_id']}")
+            if "files" in data and isinstance(data["files"], list):
+                facts.append(f"{message.name}: listed {len(data['files'])} file(s)")
+            if "matches" in data and isinstance(data["matches"], list):
+                facts.append(f"{message.name}: found {len(data['matches'])} match(es)")
+        return facts
 
     @property
     def context_tokens(self) -> int:
@@ -370,10 +496,17 @@ class MarcusLoop:
         target = self.context_window_tokens * self.compact_target_percent // 100
         original_limit = self.max_history_messages
         while self.context_tokens > target and len(self.state.history) > 4:
+            previous = self.context_tokens
+            # Compaction must be aggressive enough to actually shrink context.
+            # Drop the limit below the current turn size when necessary, but
+            # _trim_history still preserves the system prompt and latest user.
             self.max_history_messages = max(
-                4, min(self.max_history_messages - 1, len(self.state.history) - 1)
+                3, min(self.max_history_messages - 5, len(self.state.history) // 2)
             )
             self._trim_history()
+            if self.context_tokens >= previous:
+                # No further reduction possible; stop before looping forever.
+                break
         self.max_history_messages = original_limit
         after = self.context_tokens
         if after < before:
@@ -404,7 +537,152 @@ class MarcusLoop:
         if hasattr(self.ui, "refresh_status"):
             self.ui.refresh_status()
 
+    def _plan_tool_calls(
+        self, tool_calls: list[ToolCall]
+    ) -> tuple[list[ToolCall], list[ToolCall]]:
+        """Select which tool calls from one LLM response may execute.
+
+        Mutation calls run one at a time. Read-only calls may run concurrently
+        up to ``max_parallel_read_only`` when they appear first in the response.
+        """
+        if not tool_calls:
+            return [], []
+
+        first_tier = self.tools_by_name.get(tool_calls[0].name, Tool).risk_tier
+        if first_tier != RiskTier.read_only:
+            # Mutation-first response: run only the first call.
+            return [tool_calls[0]], list(tool_calls[1:])
+
+        selected: list[ToolCall] = []
+        rejected: list[ToolCall] = []
+        for call in tool_calls:
+            tool = self.tools_by_name.get(call.name)
+            if tool is None:
+                rejected.append(call)
+                continue
+            if tool.risk_tier != RiskTier.read_only:
+                rejected.append(call)
+                continue
+            if len(selected) < self.max_parallel_read_only:
+                selected.append(call)
+            else:
+                rejected.append(call)
+        return selected, rejected
+
+    def _policy_reason_for_rejected(
+        self, call: ToolCall, selected_calls: list[ToolCall]
+    ) -> str:
+        tool = self.tools_by_name.get(call.name)
+        if tool is None:
+            return f"unknown tool: {call.name}"
+        if tool.risk_tier != RiskTier.read_only:
+            return (
+                "mutation tool calls run one at a time; "
+                "inspect the result before the next write/execute action"
+            )
+        if len(selected_calls) >= self.max_parallel_read_only:
+            return (
+                f"only {self.max_parallel_read_only} read-only tool calls "
+                "are allowed per reasoning step"
+            )
+        return "tool call rejected by per-step policy"
+
+    async def _execute_selected_calls(
+        self, selected_calls: list[ToolCall]
+    ) -> list[tuple[ToolCall, dict]]:
+        """Run selected calls and return (call, observation) tuples in order."""
+        if not selected_calls:
+            return []
+
+        # Separate mutation calls (sequential) from read-only calls (parallel).
+        read_only_calls: list[ToolCall] = []
+        mutation_calls: list[ToolCall] = []
+        for call in selected_calls:
+            tool = self.tools_by_name.get(call.name)
+            if tool is not None and tool.risk_tier == RiskTier.read_only:
+                read_only_calls.append(call)
+            else:
+                mutation_calls.append(call)
+
+        results: dict[str, dict] = {}
+
+        # Validate arguments first so we fail fast before any side effects.
+        for call in read_only_calls:
+            tool = self.tools_by_name.get(call.name)
+            if tool is None:
+                continue
+            try:
+                call.arguments = normalize_and_validate_arguments(tool.parameters, call.arguments)
+            except ToolArgumentError as exc:
+                results[call.id] = {"error": str(exc), "code": exc.code, "retryable": True}
+
+        async def _run_read_only(call: ToolCall) -> tuple[str, dict]:
+            if call.id in results:
+                return call.id, results[call.id]
+            observation = await self._invoke_tool_handler(call)
+            return call.id, observation
+
+        read_only_results = await asyncio.gather(
+            *(_run_read_only(call) for call in read_only_calls), return_exceptions=True
+        )
+        for item in read_only_results:
+            if isinstance(item, BaseException):
+                # Should not happen because _invoke_tool_handler catches exceptions,
+                # but guard against unexpected errors from parallel scheduling.
+                continue
+            call_id, observation = item
+            results[call_id] = observation
+
+        # Mutation calls are processed sequentially after read-only calls.
+        for call in mutation_calls:
+            results[call.id] = await self._process_tool_call(call)
+
+        return [(call, results[call.id]) for call in selected_calls]
+
+    async def _invoke_tool_handler(self, call: ToolCall) -> dict:
+        """Execute a single tool call without approval or policy checks.
+
+        Used for read-only calls that have already been validated and selected.
+        """
+        tool = self.tools_by_name.get(call.name)
+        if tool is None:
+            error = f"unknown tool: {call.name}"
+            self.ui.print_tool_error(call.name, error)
+            return {"error": error}
+
+        self.ui.print_tool_call(call.name, call.arguments)
+
+        if not tool_is_allowed(self.mode, tool.risk_tier):
+            error = f"tool {call.name!r} is not available in {self.mode.value} mode"
+            self.ui.print_tool_error(call.name, error)
+            return {"error": error}
+
+        retryable = (tool.risk_tier.value == "read_only" or tool.idempotent) and call.name not in {
+            "wait_for_http"
+        }
+        max_attempts = self.max_safe_tool_retries + 1 if retryable else 1
+        for attempt in range(max_attempts):
+            try:
+                result = await tool.handler(call.arguments)
+                break
+            except Exception as exc:  # noqa: BLE001 - failures become observations
+                if attempt + 1 < max_attempts:
+                    if hasattr(self.ui, "print_recovery"):
+                        self.ui.print_recovery(
+                            f"Tool {call.name} failed; retrying safely "
+                            f"({attempt + 2}/{max_attempts})."
+                        )
+                    continue
+                self.ui.print_tool_error(call.name, str(exc))
+                return {"error": str(exc)}
+
+        observation = truncate_result(result, max_chars=self.result_max_chars)
+        if hasattr(self.ui, "print_tool_result"):
+            self.ui.print_tool_result(call.name, observation)
+        return observation
+
     async def _process_tool_call(self, call: ToolCall) -> dict:
+        """Full single-tool execution path including validation and approval."""
         tool = self.tools_by_name.get(call.name)
         if tool is None:
             error = f"unknown tool: {call.name}"
@@ -440,26 +718,4 @@ class MarcusLoop:
                 self.ui.print_tool_declined(call.name)
                 return {"error": "user declined this tool call"}
 
-        retryable = (tool.risk_tier.value == "read_only" or tool.idempotent) and call.name not in {
-            "wait_for_http"
-        }
-        max_attempts = self.max_safe_tool_retries + 1 if retryable else 1
-        for attempt in range(max_attempts):
-            try:
-                result = await tool.handler(call.arguments)
-                break
-            except Exception as exc:  # noqa: BLE001 - failures become observations
-                if attempt + 1 < max_attempts:
-                    if hasattr(self.ui, "print_recovery"):
-                        self.ui.print_recovery(
-                            f"Tool {call.name} failed; retrying safely "
-                            f"({attempt + 2}/{max_attempts})."
-                        )
-                    continue
-                self.ui.print_tool_error(call.name, str(exc))
-                return {"error": str(exc)}
-
-        observation = truncate_result(result, max_chars=self.result_max_chars)
-        if hasattr(self.ui, "print_tool_result"):
-            self.ui.print_tool_result(call.name, observation)
-        return observation
+        return await self._invoke_tool_handler(call)

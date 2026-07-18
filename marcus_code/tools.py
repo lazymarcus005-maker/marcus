@@ -36,6 +36,8 @@ READ_PROCESS_OUTPUT_TOOL_NAME = "read_process_output"
 STOP_PROCESS_TOOL_NAME = "stop_process"
 WAIT_FOR_HTTP_TOOL_NAME = "wait_for_http"
 
+DEFAULT_READ_FILE_MAX_CHARS = 4000
+
 # Directories never walked by list_files/grep — noise, not user code.
 _SKIP_DIR_NAMES = frozenset(
     {
@@ -74,7 +76,7 @@ def _should_skip_dir(path: Path) -> bool:
     return any(part in _SKIP_DIR_NAMES for part in path.parts)
 
 
-def build_read_file_tool(root: Path) -> Tool:
+def build_read_file_tool(root: Path, *, max_chars: int = DEFAULT_READ_FILE_MAX_CHARS) -> Tool:
     async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         path = arguments.get("path")
         if not path:
@@ -82,22 +84,56 @@ def build_read_file_tool(root: Path) -> Tool:
         resolved = _resolve_scoped_path(root, path)
         if not resolved.is_file():
             raise ValueError(f"file not found: {path}")
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+
+        raw = resolved.read_text(encoding="utf-8", errors="replace")
+        total_lines = raw.count("\n") + 1
+
+        offset = max(1, int(arguments.get("offset", 1)))
+        limit = arguments.get("limit")
+        if limit is not None:
+            limit = max(1, int(limit))
+
+        if limit is not None or offset > 1:
+            lines = raw.splitlines(keepends=True)
+            start = offset - 1
+            end = len(lines) if limit is None else min(start + limit, len(lines))
+            selected = lines[start:end]
+            content = "".join(selected)
+            chunk_lines = len(selected)
+        else:
+            content = raw
+            chunk_lines = total_lines
+
         safe_content, redactions = redact_secrets(path, content)
-        return {
+        truncated = len(safe_content) > max_chars
+        if truncated:
+            safe_content = safe_content[:max_chars]
+
+        result: dict[str, Any] = {
             "path": path,
             "content": safe_content,
-            "lines": content.count("\n") + 1,
+            "lines": chunk_lines,
+            "total_lines": total_lines,
+            "offset": offset,
             "redacted": redactions > 0,
+            "truncated": truncated,
         }
+        if limit is not None:
+            result["limit"] = limit
+        return result
 
     return Tool(
         name=READ_FILE_TOOL_NAME,
-        description="Read a text file's full contents. Path is relative to the working directory.",
+        description=(
+            "Read a text file's contents. Path is relative to the working directory. "
+            "Use offset (1-based) and limit to read a specific chunk of a large file."
+        ),
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path relative to the working directory."}
+                "path": {"type": "string", "description": "Path relative to the working directory."},
+                "offset": {"type": "integer", "minimum": 1, "description": "1-based starting line."},
+                "limit": {"type": "integer", "minimum": 1, "description": "Maximum lines to return."},
             },
             "required": ["path"],
         },
@@ -199,18 +235,25 @@ def build_edit_file_tool(root: Path) -> Tool:
 def build_list_files_tool(root: Path) -> Tool:
     async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         pattern = arguments.get("pattern") or "**/*"
+        max_depth = arguments.get("max_depth")
+        if max_depth is not None:
+            max_depth = max(1, int(max_depth))
         base = root.resolve()
         matches = []
         for candidate in base.glob(pattern):
-            if _should_skip_dir(candidate.relative_to(base)):
+            rel = candidate.relative_to(base)
+            if _should_skip_dir(rel):
+                continue
+            if max_depth is not None and len(rel.parts) > max_depth:
                 continue
             if candidate.is_file():
-                matches.append(str(candidate.relative_to(base)))
+                matches.append(str(rel))
             if len(matches) >= _MAX_LIST_RESULTS:
                 break
         matches.sort()
         return {
             "pattern": pattern,
+            "max_depth": max_depth,
             "files": matches,
             "truncated": len(matches) >= _MAX_LIST_RESULTS,
         }
@@ -220,12 +263,17 @@ def build_list_files_tool(root: Path) -> Tool:
         description=(
             "List files under the working directory matching a glob pattern "
             "(e.g. '**/*.py', 'src/**/*'). Defaults to all files. "
-            f"Results capped at {_MAX_LIST_RESULTS}."
+            f"Results capped at {_MAX_LIST_RESULTS}. Use max_depth to avoid deep scans."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Glob pattern, default '**/*'."},
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum directory depth to include.",
+                },
             },
             "required": [],
         },
@@ -235,12 +283,33 @@ def build_list_files_tool(root: Path) -> Tool:
     )
 
 
+def _is_text_file(path: Path) -> bool:
+    """Best-effort binary detection by sampling bytes for null bytes / non-text."""
+    try:
+        sample = path.read_bytes()[:8192]
+    except OSError:
+        return False
+    if not sample:
+        return True
+    if b"\x00" in sample:
+        return False
+    # Simple heuristic: if more than 30% of bytes are outside printable ASCII
+    # plus common whitespace, treat as binary.
+    non_text = sum(1 for b in sample if b < 9 or (13 < b < 32 and b not in {9, 10, 13}))
+    return non_text / len(sample) <= 0.30
+
+
 def build_grep_tool(root: Path) -> Tool:
     async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         pattern = arguments.get("pattern")
         if not pattern:
             raise ValueError("grep requires a 'pattern' field")
         glob_pattern = arguments.get("glob") or "**/*"
+        max_results = arguments.get("max_results")
+        if max_results is None:
+            max_results = 50
+        else:
+            max_results = max(1, min(int(max_results), _MAX_GREP_MATCHES))
         try:
             regex = re.compile(pattern)
         except re.error as exc:
@@ -249,34 +318,40 @@ def build_grep_tool(root: Path) -> Tool:
         base = root.resolve()
         matches: list[dict[str, Any]] = []
         for candidate in base.glob(glob_pattern):
-            if len(matches) >= _MAX_GREP_MATCHES:
+            if len(matches) >= max_results:
                 break
             if not candidate.is_file() or _should_skip_dir(candidate.relative_to(base)):
                 continue
+            if candidate.stat().st_size > _MAX_GREP_FILE_BYTES:
+                continue
+            if not _is_text_file(candidate):
+                continue
             try:
-                if candidate.stat().st_size > _MAX_GREP_FILE_BYTES:
-                    continue
                 text = candidate.read_text(encoding="utf-8", errors="strict")
             except (UnicodeDecodeError, OSError):
-                continue  # binary or unreadable file — skip, not an error
+                continue
             rel = str(candidate.relative_to(base))
             for line_no, line in enumerate(text.splitlines(), start=1):
                 if regex.search(line):
                     matches.append({"path": rel, "line": line_no, "text": line.strip()[:300]})
-                    if len(matches) >= _MAX_GREP_MATCHES:
+                    if len(matches) >= max_results:
                         break
+
+        # Sort by filename/path relevance: matches in shorter paths first.
+        matches.sort(key=lambda m: (len(m["path"].split("/")), m["path"], m["line"]))
 
         return {
             "pattern": pattern,
             "matches": matches,
-            "truncated": len(matches) >= _MAX_GREP_MATCHES,
+            "truncated": len(matches) >= max_results,
         }
 
     return Tool(
         name=GREP_TOOL_NAME,
         description=(
             "Search file contents for a regex pattern under the working directory. "
-            f"Skips binary files and common noise directories. Results capped at {_MAX_GREP_MATCHES}."
+            f"Skips binary files and common noise directories. "
+            "Default max_results is 50; use max_results up to {_MAX_GREP_MATCHES}."
         ),
         parameters={
             "type": "object",
@@ -285,6 +360,12 @@ def build_grep_tool(root: Path) -> Tool:
                 "glob": {
                     "type": "string",
                     "description": "Glob to restrict which files are searched, default '**/*'.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _MAX_GREP_MATCHES,
+                    "description": "Maximum matches to return.",
                 },
             },
             "required": ["pattern"],
@@ -295,12 +376,30 @@ def build_grep_tool(root: Path) -> Tool:
     )
 
 
+def _run_cli_timeout_for(command: str, default: float) -> float:
+    """Select a longer timeout for known slow commands while keeping a cap."""
+    lowered = command.lower()
+    slow_markers = ("pytest", "npm test", "dotnet build", "cargo test", "mvn ", "gradle ")
+    build_markers = ("build", "compile", "webpack", "tsc", "npm run build")
+    if any(marker in lowered for marker in slow_markers):
+        return max(default, 180.0)
+    if any(marker in lowered for marker in build_markers):
+        return max(default, 120.0)
+    return default
+
+
 def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
     async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
         command = arguments.get("command")
         if not command:
             raise ValueError("run_cli requires a 'command' field")
         metadata = inspect_shell_command(command)
+
+        requested_timeout = arguments.get("timeout_seconds")
+        if requested_timeout is not None:
+            timeout = max(0.1, min(float(requested_timeout), 300.0))
+        else:
+            timeout = _run_cli_timeout_for(command, settings.tools_run_cli_timeout_seconds)
 
         cwd = root.resolve()
         proc = await asyncio.create_subprocess_shell(
@@ -311,15 +410,11 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
             **process_group_kwargs(),
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=settings.tools_run_cli_timeout_seconds
-            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError as exc:
             await terminate_process_tree(proc, drain_pipes=True)
             close_process_transport(proc)
-            raise ValueError(
-                f"command timed out after {settings.tools_run_cli_timeout_seconds}s"
-            ) from exc
+            raise ValueError(f"command timed out after {timeout:g}s") from exc
 
         max_bytes = settings.tools_run_cli_max_output_bytes
         result = {
@@ -329,6 +424,7 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
             "stdout": stdout[:max_bytes].decode("utf-8", errors="replace"),
             "stderr": stderr[:max_bytes].decode("utf-8", errors="replace"),
             **metadata.as_dict(),
+            "timeout_seconds": timeout,
         }
         close_process_transport(proc)
         return result
@@ -337,12 +433,19 @@ def build_run_cli_tool(root: Path, settings: Settings) -> Tool:
         name=RUN_CLI_TOOL_NAME,
         description=(
             "Run a shell command in the working directory. DESTRUCTIVE — requires "
-            "approval every call. Prefer a narrower tool when one suffices."
+            "approval every call. Prefer a narrower tool when one suffices. "
+            "Optional timeout_seconds up to 300."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "The shell command to run."}
+                "command": {"type": "string", "description": "The shell command to run."},
+                "timeout_seconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 300,
+                    "description": "Optional timeout in seconds (default varies by command).",
+                },
             },
             "required": ["command"],
         },

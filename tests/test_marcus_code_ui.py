@@ -3,10 +3,39 @@ from datetime import datetime
 from io import StringIO
 
 import pytest
+from prompt_toolkit.document import Document
 from rich.console import Console
 
 from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
-from marcus_code.ui import _APPROVAL_PROMPT, TerminalUI
+from marcus_code.ui import _APPROVAL_PROMPT, SlashCommandAutoSuggest, TerminalUI
+
+
+@pytest.mark.asyncio
+async def test_slash_command_auto_suggest_filters_and_limits_to_seven():
+    suggester = SlashCommandAutoSuggest()
+    fake_buffer = None
+
+    async def suggest(text: str) -> str | None:
+        doc = Document(text, len(text))
+        suggestion = await suggester.get_suggestion_async(fake_buffer, doc)
+        return suggestion.text if suggestion else None
+
+    assert await suggest("/") == "  |  ".join(
+        [
+            "/help",
+            "/?",
+            "/model",
+            "/usage",
+            "/steps",
+            "/status",
+            "/compact",
+        ]
+    )
+    assert await suggest("/m") == "  |  ".join(["/model", "/mode"])
+    assert await suggest("/c") == "  |  ".join(["/compact", "/continue", "/clear", "/config"])
+    assert await suggest("/exit") == "/exit"
+    assert await suggest("/zzz") is None
+    assert await suggest("hello") is None
 
 
 def test_approval_prompt_uses_pastel_orange_and_red_sections():
@@ -219,7 +248,7 @@ async def test_prompt_user_uses_async_prompt_session():
 
     ui, _stream = _capturing_ui()
     session = _FakePromptSession()
-    ui._prompt_session = session
+    ui._prompt_session = session  # type: ignore[assignment]
 
     result = await ui.prompt_user()
 
@@ -247,7 +276,7 @@ async def test_three_consecutive_ctrl_c_presses_exit():
             raise KeyboardInterrupt
 
     ui, stream = _capturing_ui()
-    ui._prompt_session = _InterruptingPromptSession()
+    ui._prompt_session = _InterruptingPromptSession()  # type: ignore[assignment]
 
     assert await ui.prompt_user() == ""
     assert await ui.prompt_user() == ""
@@ -272,7 +301,7 @@ async def test_normal_input_resets_ctrl_c_counter():
             return result
 
     ui, _stream = _capturing_ui()
-    ui._prompt_session = _SequencePromptSession()
+    ui._prompt_session = _SequencePromptSession()  # type: ignore[assignment]
 
     assert await ui.prompt_user() == ""
     assert await ui.prompt_user() == "hello"
@@ -295,7 +324,7 @@ async def test_ui_close_cancels_prompt_background_tasks():
 
     ui, _stream = _capturing_ui()
     session = _Session()
-    ui._prompt_session = session
+    ui._prompt_session = session  # type: ignore[assignment]
 
     await ui.aclose()
 
@@ -335,3 +364,20 @@ def test_banner_shows_provider_next_to_model_and_profile_email(tmp_path):
     assert "Profile" in output and "user@example.com" in output
     assert "gpt-oss:120b         |  Provider" in output
     assert "agent                |  Profile" in output
+
+
+def test_banner_shows_version_when_provided(tmp_path):
+    ui, stream = _capturing_ui()
+
+    ui.print_banner(
+        tmp_path,
+        model="gpt-oss:120b",
+        provider_url="https://ollama.com/v1",
+        profile_email="user@example.com",
+        mode="agent",
+        session_name="session",
+        marcus_version="1.2.3",
+    )
+
+    output = stream.getvalue()
+    assert "Version" in output and "1.2.3" in output

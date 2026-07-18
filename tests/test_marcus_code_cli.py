@@ -1,8 +1,262 @@
+import json
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
 import pytest
 
 from harness.config import Settings
 from harness.llm.types import LLMResponse, Usage
 from marcus_code import cli
+
+
+def test_main_update_flag_prints_local_dev_instructions(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr("sys.argv", ["marcus", "--update"])
+    # The repo marker (pyproject.toml next to marcus_code package) exists in the
+    # test checkout, so update should report local-dev instructions.
+    monkeypatch.setattr(cli, "_version_string", lambda: "Marcus Code 1.0.0")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "local source tree" in output
+    assert "git pull" in output
+
+
+def test_main_update_subcommand_prints_local_dev_instructions(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr("sys.argv", ["marcus", "update"])
+    monkeypatch.setattr(cli, "_version_string", lambda: "Marcus Code 1.0.0")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "local source tree" in output
+
+
+def test_main_update_subcommand_accepts_target_version(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr("sys.argv", ["marcus", "update", "1.2.3", "--yes"])
+    monkeypatch.setattr(cli, "_detect_install_method", lambda: "uv_tool")
+    monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
+    monkeypatch.setattr(cli, "_latest_release_info", lambda **kwargs: {"tag_name": "v1.2.3"})
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    executed: list[list[str]] = []
+
+    def _fake_run(command, **kwargs):
+        executed.append(command)
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    assert any("marcus==1.2.3" in arg for args in executed for arg in args)
+
+
+def test_main_update_yes_flag_skips_confirmation(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr("sys.argv", ["marcus", "--update", "--yes"])
+    monkeypatch.setattr(cli, "_detect_install_method", lambda: "uv_tool")
+    monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
+    monkeypatch.setattr(cli, "_latest_release_info", lambda **kwargs: {"tag_name": "v1.2.3"})
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    executed: list[list[str]] = []
+
+    def _fake_run(command, **kwargs):
+        executed.append(command)
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    assert "Updating Marcus from 1.0.0 to 1.2.3" in capsys.readouterr().out
+    assert executed
+
+
+def test_update_command_pin_target_version():
+    assert cli._update_command("uv_tool", target_version="1.2.3") == [
+        "uv", "tool", "install", "--force", "marcus==1.2.3"
+    ]
+    assert cli._update_command("pipx", target_version="1.2.3") == [
+        "pipx", "upgrade", "--include-injected", "marcus==1.2.3"
+    ]
+    assert cli._update_command("pip", target_version="1.2.3") == [
+        sys.executable, "-m", "pip", "install", "--upgrade", "marcus==1.2.3"
+    ]
+
+
+def test_confirm_update_respects_yes_flag(monkeypatch, capsys):
+    info = {"body": "- Fix bug\n- Add feature"}
+    assert cli._confirm_update("1.0.0", "1.1.0", "uv_tool", info, assume_yes=True) is True
+    # With assume_yes no input is read.
+
+
+def test_confirm_update_cancels_on_no(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    assert cli._confirm_update("1.0.0", "1.1.0", "uv_tool", None, assume_yes=False) is False
+    assert "Update cancelled" in capsys.readouterr().out
+
+
+def test_print_release_notes_trims_long_bodies(capsys):
+    info = {"body": "\n".join(f"Line {i}" for i in range(12))}
+    cli._print_release_notes("1.1.0", info)
+    output = capsys.readouterr().out
+    assert "Release notes:" in output
+    assert "Line 0" in output
+    assert "Line 7" in output
+    assert "Line 8" not in output
+    assert "4 more line(s)" in output
+
+
+def test_main_rejects_unknown_subcommand(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr("sys.argv", ["marcus", "foo"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 2
+    assert "unrecognized arguments: foo" in capsys.readouterr().err
+
+
+def test_version_cache_is_used_when_fresh(monkeypatch, tmp_path):
+    cache_file = tmp_path / "version-check.json"
+    monkeypatch.setattr(cli, "_version_cache_file", lambda: cache_file)
+    now = datetime.now().timestamp()
+    cache_file.write_text(json.dumps({"version": "9.9.9", "checked_at": now}), encoding="utf-8")
+
+    assert cli._latest_release_version() == "9.9.9"
+
+
+    def test_version_cache_ignores_stale_cache_and_returns_latest(monkeypatch, tmp_path):
+        cache_file = tmp_path / "version-check.json"
+        monkeypatch.setattr(cli, "_version_cache_file", lambda: cache_file)
+        old = (datetime.now() - timedelta(days=2)).timestamp()
+        cache_file.write_text(json.dumps({"version": "0.0.1", "checked_at": old}), encoding="utf-8")
+
+        class _Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"tag_name": "v1.2.3"}
+
+        monkeypatch.setattr(cli.httpx, "get", lambda **kwargs: _Response())
+
+        assert cli._latest_release_version() == "1.2.3"
+        assert json.loads(cache_file.read_text(encoding="utf-8"))["version"] == "1.2.3"
+
+
+def test_version_cache_falls_back_to_stale_cache_when_network_fails(monkeypatch, tmp_path):
+    cache_file = tmp_path / "version-check.json"
+    monkeypatch.setattr(cli, "_version_cache_file", lambda: cache_file)
+    old = (datetime.now() - timedelta(days=2)).timestamp()
+    cache_file.write_text(json.dumps({"version": "0.0.1", "checked_at": old}), encoding="utf-8")
+
+    def raise_error(**kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(cli.httpx, "get", raise_error)
+
+    assert cli._latest_release_version() == "0.0.1"
+
+
+def test_update_command_for_uv_tool():
+    assert cli._update_command("uv_tool") == ["uv", "tool", "install", "--force", "marcus"]
+
+
+def test_update_command_for_pipx():
+    assert cli._update_command("pipx") == ["pipx", "upgrade", "marcus"]
+
+
+def test_update_command_for_pip():
+    command = cli._update_command("pip")
+    assert command[:3] == [sys.executable, "-m", "pip"]
+    assert command[3:] == ["install", "--upgrade", "marcus"]
+
+
+def test_update_command_for_unknown_is_empty():
+    assert cli._update_command("unknown") == []
+
+
+def test_version_is_newer_compares_numeric_and_prerelease_suffixes():
+    assert cli._version_is_newer("1.1.0", "1.0.0") is True
+    assert cli._version_is_newer("1.0.1", "1.0.0") is True
+    assert cli._version_is_newer("1.0.0", "1.0.0") is False
+    assert cli._version_is_newer("0.9.9", "1.0.0") is False
+    assert cli._version_is_newer("1.0.0", "1.0.0a1") is True
+    assert cli._version_is_newer("1.0.0b1", "1.0.0a1") is True
+
+
+def test_notify_if_update_available_prints_when_newer(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
+    monkeypatch.setattr(cli, "_latest_release_version", lambda **kwargs: "1.1.0")
+
+    cli._notify_if_update_available()
+
+    output = capsys.readouterr().out
+    assert "[update available]" in output
+    assert "1.1.0" in output
+    assert "marcus --update" in output
+
+
+def test_notify_if_update_available_is_silent_when_up_to_date(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_current_version", lambda: "1.1.0")
+    monkeypatch.setattr(cli, "_latest_release_version", lambda **kwargs: "1.1.0")
+
+    cli._notify_if_update_available()
+
+    assert capsys.readouterr().out == ""
+
+
+def test_notify_if_update_available_is_silent_when_check_fails(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
+    monkeypatch.setattr(cli, "_latest_release_version", lambda **kwargs: None)
+
+    cli._notify_if_update_available()
+
+    assert capsys.readouterr().out == ""
+
+
+def test_run_update_skips_when_already_up_to_date(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
+    monkeypatch.setattr(cli, "_latest_release_info", lambda **kwargs: {"tag_name": "v1.0.0"})
+    monkeypatch.setattr(cli, "_detect_install_method", lambda: "uv_tool")
+
+    code = cli._run_update(assume_yes=True)
+
+    assert code == 0
+    output = capsys.readouterr().out
+    assert "already up to date" in output
+
+
+def test_run_update_local_dev_ignores_version_check(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
+    monkeypatch.setattr(cli, "_detect_install_method", lambda: "local_dev")
+
+    code = cli._run_update()
+
+    assert code == 0
+    assert "local source tree" in capsys.readouterr().out
+
+
+def test_detect_install_method_finds_uv_tool(monkeypatch):
+    fake_path = Path("/home/user/.local/share/uv/tools/marcus/bin/python")
+    monkeypatch.setattr(cli.sys, "executable", str(fake_path))
+    monkeypatch.setenv("UV_TOOL_DIR", "/home/user/.local/share/uv/tools")
+    assert cli._detect_install_method() == "uv_tool"
+
+
+def test_detect_install_method_finds_pipx(monkeypatch):
+    fake_path = Path.home() / ".local" / "pipx" / "venvs" / "marcus" / "bin" / "python"
+    monkeypatch.setattr(cli.sys, "executable", str(fake_path))
+    assert cli._detect_install_method() == "pipx"
 
 
 @pytest.mark.parametrize("flag", ["-v", "--version"])
@@ -18,7 +272,7 @@ def test_main_prints_version(flag, monkeypatch, capsys):
 
 
 class _FakeUI:
-    instances = []
+    instances: list["_FakeUI"] = []
 
     def __init__(self):
         self.inputs = iter(["/exit"])
@@ -44,7 +298,7 @@ class _FakeUI:
 
 
 class _FakeGateway:
-    instances = []
+    instances: list["_FakeGateway"] = []
 
     def __init__(self, *args, **kwargs):
         self.closed = False

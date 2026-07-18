@@ -98,7 +98,7 @@ async def test_read_only_tool_executes_without_approval_prompt():
 
 
 @pytest.mark.asyncio
-async def test_only_first_tool_call_in_a_batch_executes():
+async def test_read_only_tool_calls_execute_in_parallel():
     batched = LLMResponse(
         content=None,
         tool_calls=[
@@ -114,14 +114,14 @@ async def test_only_first_tool_call_in_a_batch_executes():
     ui = _FakeUI()
     loop = MarcusLoop(llm, [_read_only_tool(), _read_only_tool("peek_two")], ui)
 
-    await loop.run_turn("inspect sequentially")
+    await loop.run_turn("inspect in parallel")
 
-    assert ui.tool_calls == [("peek", {})]
-    assert any("one tool call" in error for _name, error in ui.errors)
-    policy_message = next(
-        message for message in loop.state.history if message.tool_call_id == "second"
-    )
-    assert "POLICY_DENIED" in (policy_message.content or "")
+    assert sorted(ui.tool_calls, key=lambda t: t[0]) == [
+        ("peek", {}),
+        ("peek_two", {}),
+    ]
+    assert ui.errors == []
+    assert ui.assistant_messages == ["done"]
 
 
 @pytest.mark.asyncio
@@ -181,7 +181,16 @@ async def test_cosmetic_argument_changes_with_same_error_stop_as_no_progress():
 
 @pytest.mark.asyncio
 async def test_requested_verification_blocks_unsupported_success_claim():
-    llm = ScriptedLLMGateway([text_response("tests passed"), text_response("still passed")])
+    # With max_finalization_repairs=3 the loop gets three repair chances
+    # before the guardrail finally stops the turn.
+    llm = ScriptedLLMGateway(
+        [
+            text_response("tests passed"),
+            text_response("still passed"),
+            text_response("really passed"),
+            text_response("trust me"),
+        ]
+    )
     ui = _FakeUI()
     loop = MarcusLoop(llm, [], ui)
 
@@ -538,3 +547,60 @@ async def test_context_over_limit_stops_before_llm_call():
 
     assert llm.calls == []
     assert any("context window" in reason for reason in ui.guardrail_stops)
+
+
+@pytest.mark.asyncio
+async def test_prior_turns_are_summarized_not_replayed_to_new_question():
+    llm = ScriptedLLMGateway([text_response("old answer")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [], ui, max_history_messages=8, system_prompt="system")
+
+    await loop.run_turn("first question")
+
+    # Simulate a second turn with enough tool/assistant traffic to trigger trim.
+    loop.state.history.extend(
+        [
+            LLMMessage(role="user", content="second question"),
+            LLMMessage(role="assistant", content="step 1"),
+            LLMMessage(role="tool", tool_call_id="1", name="peek", content='{"ok": true}'),
+            LLMMessage(role="assistant", content="step 2"),
+            LLMMessage(role="tool", tool_call_id="2", name="peek", content='{"ok": true}'),
+            LLMMessage(role="assistant", content="step 3"),
+            LLMMessage(role="tool", tool_call_id="3", name="peek", content='{"ok": true}'),
+        ]
+    )
+
+    # Next request should see only system + summary + latest user, not the full first turn.
+    loop._trim_history()
+
+    assert loop.state.history[0].role == "system"
+    # The latest user message must still be present.
+    assert any(message.role == "user" and message.content == "second question" for message in loop.state.history)
+    # Full first-turn replay should have been summarized away.
+    assert not any(message.role == "assistant" and message.content == "old answer" for message in loop.state.history)
+    # Summary message should exist and mention prior turns.
+    summary = next((message for message in loop.state.history if message.role == "system" and message != loop.state.history[0]), None)
+    assert summary is not None
+    assert "Prior turns summarized" in summary.content
+
+
+@pytest.mark.asyncio
+async def test_current_turn_kept_intact_when_under_budget():
+    llm = ScriptedLLMGateway([text_response("done")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [], ui, max_history_messages=20, system_prompt="system")
+
+    await loop.run_turn("question")
+    loop.state.history.extend(
+        [
+            LLMMessage(role="user", content="follow up"),
+            LLMMessage(role="assistant", content="thinking"),
+            LLMMessage(role="tool", tool_call_id="1", name="peek", content='{"ok": true}'),
+        ]
+    )
+
+    loop._trim_history()
+
+    # Both user messages retained while under budget.
+    assert [message.content for message in loop.state.history if message.role == "user"] == ["question", "follow up"]
+    assert loop.state.history[0].role == "system"
