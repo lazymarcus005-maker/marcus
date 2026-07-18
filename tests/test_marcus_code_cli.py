@@ -1,5 +1,8 @@
+import base64
 import json
+import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -43,6 +46,7 @@ def test_main_update_subcommand_accepts_target_version(monkeypatch, capsys, tmp_
     monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
     monkeypatch.setattr(cli, "_latest_release_info", lambda **kwargs: {"tag_name": "v1.2.3"})
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli, "_should_defer_windows_update", lambda method: False)
     executed: list[list[str]] = []
 
     def _fake_run(command, **kwargs):
@@ -64,6 +68,7 @@ def test_main_update_yes_flag_skips_confirmation(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
     monkeypatch.setattr(cli, "_latest_release_info", lambda **kwargs: {"tag_name": "v1.2.3"})
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli, "_should_defer_windows_update", lambda method: False)
     executed: list[list[str]] = []
 
     def _fake_run(command, **kwargs):
@@ -78,6 +83,117 @@ def test_main_update_yes_flag_skips_confirmation(monkeypatch, capsys, tmp_path):
     assert exc_info.value.code == 0
     assert "Updating Marcus from 1.0.0 to 1.2.3" in capsys.readouterr().out
     assert executed
+
+
+def test_run_update_defers_uv_tool_replacement_on_windows(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cli, "_detect_install_method", lambda: "uv_tool")
+    monkeypatch.setattr(cli, "_current_version", lambda: "1.0.0")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"C:/bin/{name}.exe")
+    monkeypatch.setattr(cli, "_should_defer_windows_update", lambda method: True)
+    scheduled: list[tuple[list[str], str]] = []
+
+    def _fake_schedule(command: list[str], target: str) -> Path:
+        scheduled.append((command, target))
+        return tmp_path / "update.log"
+
+    monkeypatch.setattr(cli, "_schedule_windows_update", _fake_schedule)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("a deferred update must not run in Marcus"),
+    )
+
+    code = cli._run_update("1.2.3", assume_yes=True)
+
+    assert code == 0
+    assert scheduled and scheduled[0][1] == "1.2.3"
+    output = capsys.readouterr().out
+    assert "Update scheduled" in output
+    assert "will now exit" in output
+
+
+def test_schedule_windows_update_uses_external_hidden_helper(monkeypatch, tmp_path):
+    result_file = tmp_path / "update-result.json"
+    log_file = tmp_path / "update.log"
+    monkeypatch.setattr(cli, "_deferred_update_files", lambda: (result_file, log_file))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "C:/Windows/PowerShell.exe")
+    launches: list[tuple[list[str], dict]] = []
+
+    def _fake_popen(command: list[str], **kwargs):
+        launches.append((command, kwargs))
+        return object()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", _fake_popen)
+
+    command = ["uv", "tool", "install", "--force", "git+repo@v1.2.3"]
+    assert cli._schedule_windows_update(command, "1.2.3") == log_file
+
+    pending = json.loads(result_file.read_text(encoding="utf-8"))
+    assert pending["status"] == "pending"
+    assert pending["target_version"] == "1.2.3"
+    launched_command, options = launches[0]
+    assert "-NonInteractive" in launched_command
+    encoded_script = launched_command[launched_command.index("-EncodedCommand") + 1]
+    script = base64.b64decode(encoded_script).decode("utf-16-le")
+    assert "Get-Process" in script
+    assert "access is denied" in script.lower()
+    assert options["stdin"] is cli.subprocess.DEVNULL
+    assert options["stdout"] is cli.subprocess.DEVNULL
+    assert options["stderr"] is cli.subprocess.DEVNULL
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell integration test")
+def test_windows_update_helper_runs_command_after_parent_exits(monkeypatch, tmp_path):
+    if cli.shutil.which("powershell.exe") is None and cli.shutil.which("pwsh.exe") is None:
+        pytest.skip("PowerShell is not installed")
+    result_file = tmp_path / "update-result.json"
+    log_file = tmp_path / "update.log"
+    monkeypatch.setattr(cli, "_deferred_update_files", lambda: (result_file, log_file))
+    monkeypatch.setattr(cli.os, "getpid", lambda: 2_147_483_647)
+    command = [cli.shutil.which("cmd.exe") or "cmd.exe", "/d", "/c", "exit", "0"]
+
+    assert cli._schedule_windows_update(command, "test") == log_file
+
+    deadline = time.monotonic() + 15
+    result = {"status": "pending"}
+    while time.monotonic() < deadline and result.get("status") == "pending":
+        time.sleep(0.1)
+        result = json.loads(result_file.read_text(encoding="utf-8-sig"))
+    assert result["status"] == "success"
+    assert log_file.is_file()
+
+
+def test_report_deferred_update_blocks_while_pending(monkeypatch, capsys, tmp_path):
+    result_file = tmp_path / "update-result.json"
+    log_file = tmp_path / "update.log"
+    monkeypatch.setattr(cli, "_deferred_update_files", lambda: (result_file, log_file))
+    result_file.write_text(
+        json.dumps(
+            {
+                "status": "pending",
+                "target_version": "1.2.3",
+                "started_at": datetime.now().timestamp(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert cli._report_deferred_update_result() is True
+    assert result_file.exists()
+    assert "still running" in capsys.readouterr().out
+
+
+def test_report_deferred_update_consumes_success(monkeypatch, capsys, tmp_path):
+    result_file = tmp_path / "update-result.json"
+    log_file = tmp_path / "update.log"
+    monkeypatch.setattr(cli, "_deferred_update_files", lambda: (result_file, log_file))
+    result_file.write_text(
+        json.dumps({"status": "success", "target_version": "1.2.3"}), encoding="utf-8"
+    )
+
+    assert cli._report_deferred_update_result() is False
+    assert not result_file.exists()
+    assert "updated successfully to 1.2.3" in capsys.readouterr().out
 
 
 def test_update_command_pin_target_version():
