@@ -135,7 +135,7 @@ def test_final_answer_has_spacing_heading_and_content():
     ui.print_final_answer("API ทำงานสำเร็จ")
 
     output = stream.getvalue()
-    assert "\nผลการทำงาน\n\n" in output
+    assert "worked 1x step complete" in output
     assert output.rstrip().endswith("API ทำงานสำเร็จ")
 
 
@@ -157,13 +157,15 @@ def test_success_collapses_steps_and_steps_command_restores_details():
 
     ui.finish_steps(success=True)
     collapsed = stream.getvalue()
-    assert "งานสำเร็จ · 1 ขั้นตอน" in collapsed
-    assert "/steps" in collapsed
+    assert "worked 1x step complete" in collapsed
+    assert "Ctrl+E expand" in collapsed
+    assert "Ctrl+R collapse" in collapsed
 
     ui.print_steps()
     expanded = stream.getvalue()
     assert "run_cli(command='pytest -q')" in expanded
     assert "10 passed" in expanded
+    assert "Ctrl+R to collapse" in expanded
 
 
 def test_working_box_keeps_latest_lines_visible_when_terminal_is_short():

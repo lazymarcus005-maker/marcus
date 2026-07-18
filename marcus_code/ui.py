@@ -247,6 +247,8 @@ class TerminalUI:
         self._interrupt_count = 0
         self._input_history = FileHistory(str(_history_path()))
         self._prompt_session: PromptSession[str] | None = None
+        self._steps_collapsed: bool = True
+        self._guardrail_collapsed: bool = True
         self._build_prompt_style()
         self._completer = NestedCompleter.from_nested_dict(
             {
@@ -684,8 +686,6 @@ class TerminalUI:
             self.console.print(Markdown(text))
             return
         self.console.print()
-        self.console.print(f"[bold {self.theme.accent}]ผลการทำงาน[/bold {self.theme.accent}]")
-        self.console.print()
         self.console.print(Markdown(text))
 
     def print_assistant_delta(self, text: str) -> None:
@@ -722,14 +722,21 @@ class TerminalUI:
     def print_guardrail_stop(self, reason: str) -> None:
         self.finish_steps(success=False)
         self._last_guardrail = reason
+        self._guardrail_collapsed = True
         hint = "Try /continue to resume, /retry to start over, or /last to see this message again."
+        content = (
+            f"[{self.theme.error}] stopped: {escape(reason)}[/]\n\n"
+            f"[{self.theme.muted}]{hint}[/{self.theme.muted}]"
+        )
         self.console.print(
             Panel(
-                f"[{self.theme.error}] stopped: {escape(reason)}[/]\n\n"
-                f"[{self.theme.muted}]{hint}[/{self.theme.muted}]",
+                content,
                 title="Guardrail Stop",
                 border_style=self.theme.error,
             )
+        )
+        self.console.print(
+            f"[{self.theme.muted}]↳ Ctrl+E expand · Ctrl+R collapse[/{self.theme.muted}]"
         )
 
     def print_interrupted(self) -> None:
@@ -896,9 +903,10 @@ class TerminalUI:
         self._last_step_lines = list(self._step_lines)
         self._stop_live()
         if success:
+            self._steps_collapsed = True
             self.console.print(
-                f"[{self.theme.success}]{self.theme.success_glyph} งานสำเร็จ · {self._tool_count} ขั้นตอน[/{self.theme.success}] "
-                f"[{self.theme.muted}](ใช้ /steps เพื่อดูรายละเอียด)[/{self.theme.muted}]"
+                f"[{self.theme.info}]↳ worked {self._tool_count}x step complete[/{self.theme.info}] "
+                f"[{self.theme.muted}](Ctrl+E expand · Ctrl+R collapse)[/{self.theme.muted}]"
             )
         else:
             self.console.print(self._steps_renderable())
@@ -910,8 +918,13 @@ class TerminalUI:
         if not lines:
             self.print_info("No completed task steps in this session yet.")
             return
+        self._steps_collapsed = False
         self.console.print(
-            Panel("\n".join(escape(line) for line in lines), title="Last task steps")
+            Panel(
+                "\n".join(escape(line) for line in lines),
+                title="Last task steps · Ctrl+R to collapse",
+                border_style=self.theme.border,
+            )
         )
 
     def _steps_renderable(self) -> Panel:
@@ -929,7 +942,7 @@ class TerminalUI:
             lines = [f"… {hidden} earlier line(s) hidden; use /steps"] + lines[-(max_lines - 1) :]
         return Panel(
             "\n".join(escape(line) for line in lines),
-            title=f"Working · {self._tool_count} step(s)",
+            title=f"Working · {self._tool_count} step(s) · Ctrl+R collapse",
             border_style=self.theme.border,
         )
 

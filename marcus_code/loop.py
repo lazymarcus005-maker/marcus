@@ -172,6 +172,8 @@ class MarcusLoop:
         finalization_repairs = 0
         retried_after_timeout = False
         outcome_fingerprints: list[tuple[str, str]] = []
+        identical_call_recovery_attempts = 0
+        identical_call_last_key: tuple[str, str] | None = None
 
         for _ in range(self.max_steps):
             self._trim_history()
@@ -342,18 +344,43 @@ class MarcusLoop:
             observations = await self._execute_selected_calls(selected_calls)
 
             # Process results in response order so guardrails remain sequential.
+            force_rethink = False
             for call, observation in observations:
                 key = (call.name, call.arguments)
                 recent_calls.append(key)
                 if len(recent_calls) >= REPEATED_CALL_WINDOW and all(
                     c == key for c in recent_calls[-REPEATED_CALL_WINDOW:]
                 ):
+                    if identical_call_recovery_attempts < 2:
+                        identical_call_recovery_attempts += 1
+                        identical_call_last_key = key
+                        recovery_message = (
+                            f"Guardrail: tool {call.name!r} has been called with "
+                            f"the same arguments {REPEATED_CALL_WINDOW} times in a row. "
+                            f"You are now in recovery attempt "
+                            f"{identical_call_recovery_attempts}/2. "
+                            "Stop repeating that call; analyze the situation and choose a "
+                            "different tool or different arguments before proceeding."
+                        )
+                        if hasattr(self.ui, "print_recovery"):
+                            self.ui.print_recovery(recovery_message)
+                        self.state.history.append(
+                            LLMMessage(role="system", content=recovery_message)
+                        )
+                        force_rethink = True
+                        break  # stop processing further observations and force a rethink
                     self.state.last_turn_guardrail = (
                         f"tool {call.name!r} called with identical arguments "
-                        f"{REPEATED_CALL_WINDOW} times in a row"
+                        f"{REPEATED_CALL_WINDOW} times in a row; "
+                        f"recovery budget exhausted ({identical_call_recovery_attempts}/2)"
                     )
                     self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
                     return
+
+                if key == identical_call_last_key:
+                    # The rest of this step's observations are skipped because we
+                    # are forcing a rethink after a repeated identical call.
+                    continue
 
                 if is_verification_evidence(call.name, call.arguments, observation):
                     verification_succeeded = True
@@ -368,11 +395,22 @@ class MarcusLoop:
                 if len(outcome_fingerprints) >= 3 and all(
                     item == fingerprint for item in outcome_fingerprints[-3:]
                 ):
-                    self.state.last_turn_guardrail = (
-                        f"no progress after 3 calls to {call.name!r}; stopped to prevent a loop"
-                    )
-                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
-                    return
+                    # During identical-call recovery the LLM is being given a chance
+                    # to change strategy, so a single non-identical outcome should
+                    # reset the no-progress counter rather than stop immediately.
+                    if (
+                        identical_call_last_key is not None
+                        and key != identical_call_last_key
+                    ):
+                        outcome_fingerprints.clear()
+                        outcome_fingerprints.append(fingerprint)
+                    else:
+                        self.state.last_turn_guardrail = (
+                            f"no progress after 3 calls to {call.name!r}; stopped to prevent a loop"
+                        )
+                        self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                        return
+
                 if observation.get("code") == "INVALID_ARGUMENT":
                     argument_failures[call.name] = argument_failures.get(call.name, 0) + 1
                     if argument_failures[call.name] > self.max_argument_repairs:
@@ -394,6 +432,13 @@ class MarcusLoop:
                     consecutive_tool_failures += 1
                 else:
                     consecutive_tool_failures = 0
+
+                if force_rethink:
+                    # The identical-call guardrail forced a rethink; do not append
+                    # this observation as a normal tool result because the LLM should
+                    # see only the recovery system message and choose a new strategy.
+                    break
+
                 # Compress verbose tool results before storing to save tokens.
                 compressed = summarize_tool_result(orjson.dumps(observation).decode())
                 self.state.history.append(

@@ -45,12 +45,26 @@ async def _cmd_help(ctx: CommandContext, args: str) -> None:
 
 
 async def _cmd_model(ctx: CommandContext, args: str) -> None:
+    from marcus_code.config import has_llm_credentials, save_user_config
+
     name = args.strip()
     if not name:
         ctx.ui.print_info(f"Current model: {ctx.loop.model or ctx.settings.llm_model}")
         return
     ctx.loop.model = name
-    ctx.ui.print_info(f"Model switched to {name!r} for this session.")
+    # Persist the override to ~/.marcus/config.toml so it becomes the default
+    # for future sessions. Preserve the existing base URL and API key.
+    api_key = ctx.settings.llm_api_key if has_llm_credentials(ctx.settings) else ""
+    try:
+        save_user_config(
+            api_key=api_key,
+            base_url=ctx.settings.llm_base_url,
+            model=name,
+        )
+    except ValueError as exc:
+        ctx.ui.print_error(f"Model switched for this session, but could not save default: {exc}")
+        return
+    ctx.ui.print_info(f"Model switched to {name!r} and saved as default.")
 
 
 async def _cmd_usage(ctx: CommandContext, args: str) -> None:

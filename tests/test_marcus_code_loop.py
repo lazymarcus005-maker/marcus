@@ -19,6 +19,7 @@ class _FakeUI:
         self.errors: list[tuple[str, str]] = []
         self.declined: list[str] = []
         self.guardrail_stops: list[str] = []
+        self.recoveries: list[str] = []
         self.finished_steps: list[bool] = []
 
     def print_assistant(self, text):
@@ -35,6 +36,9 @@ class _FakeUI:
 
     def print_guardrail_stop(self, reason):
         self.guardrail_stops.append(reason)
+
+    def print_recovery(self, message):
+        self.recoveries.append(message)
 
     def print_interrupted(self):
         pass
@@ -291,21 +295,53 @@ async def test_unknown_tool_call_returns_error_without_crashing():
 
 
 @pytest.mark.asyncio
-async def test_repeated_identical_call_stops_the_loop():
+async def test_repeated_identical_call_triggers_recovery_then_stops():
     llm = ScriptedLLMGateway(
         [
+            # Three identical calls in a row should trigger the first recovery hint.
             tool_call_response("peek", {"q": "x"}),
+            tool_call_response("peek", {"q": "x"}),
+            tool_call_response("peek", {"q": "x"}),
+            # The LLM tries the same call two more times while in recovery,
+            # exhausting the recovery budget.
             tool_call_response("peek", {"q": "x"}),
             tool_call_response("peek", {"q": "x"}),
         ]
     )
     ui = _FakeUI()
-    loop = MarcusLoop(llm, [_read_only_tool()], ui)
+    loop = MarcusLoop(llm, [_read_only_tool()], ui, max_steps=20)
 
     await loop.run_turn("keep looking")
 
+    assert len(ui.recoveries) == 2
+    assert all("recovery attempt" in r for r in ui.recoveries)
     assert len(ui.guardrail_stops) == 1
     assert "identical arguments" in ui.guardrail_stops[0]
+    assert "recovery budget exhausted" in ui.guardrail_stops[0]
+
+
+@pytest.mark.asyncio
+async def test_repeated_identical_call_recovers_when_llm_changes_strategy():
+    llm = ScriptedLLMGateway(
+        [
+            # Three identical calls trigger one recovery hint.
+            tool_call_response("peek", {"q": "x"}),
+            tool_call_response("peek", {"q": "x"}),
+            tool_call_response("peek", {"q": "x"}),
+            # After the recovery hint, the LLM switches to a different query.
+            tool_call_response("peek", {"q": "y"}),
+            text_response("done"),
+        ]
+    )
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [_read_only_tool()], ui, max_steps=20)
+
+    await loop.run_turn("keep looking")
+
+    assert len(ui.recoveries) == 1
+    assert "recovery attempt 1/2" in ui.recoveries[0]
+    assert ui.assistant_messages == ["done"]
+    assert len(ui.guardrail_stops) == 0
 
 
 @pytest.mark.asyncio
