@@ -150,7 +150,12 @@ def test_windows_update_helper_runs_command_after_parent_exits(monkeypatch, tmp_
     log_file = tmp_path / "update.log"
     monkeypatch.setattr(cli, "_deferred_update_files", lambda: (result_file, log_file))
     monkeypatch.setattr(cli.os, "getpid", lambda: 2_147_483_647)
-    command = [cli.shutil.which("cmd.exe") or "cmd.exe", "/d", "/c", "exit", "0"]
+    command = [
+        cli.shutil.which("cmd.exe") or "cmd.exe",
+        "/d",
+        "/c",
+        "echo normal-native-stderr 1>&2 & exit /b 0",
+    ]
 
     assert cli._schedule_windows_update(command, "test") == log_file
 
@@ -161,6 +166,7 @@ def test_windows_update_helper_runs_command_after_parent_exits(monkeypatch, tmp_
         result = json.loads(result_file.read_text(encoding="utf-8-sig"))
     assert result["status"] == "success"
     assert log_file.is_file()
+    assert "normal-native-stderr" in log_file.read_text(encoding="utf-8-sig")
 
 
 def test_report_deferred_update_blocks_while_pending(monkeypatch, capsys, tmp_path):

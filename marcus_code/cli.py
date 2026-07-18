@@ -162,7 +162,9 @@ def _schedule_windows_update(command: list[str], target_version: str) -> Path | 
         "ascii"
     )
     script = r"""
-$ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 wraps native stderr as non-terminating error records.
+# uv writes normal progress to stderr, so rely on $LASTEXITCODE instead.
+$ErrorActionPreference = "Continue"
 $configurationJson = [Text.Encoding]::UTF8.GetString(
     [Convert]::FromBase64String("__CONFIGURATION__")
 )
