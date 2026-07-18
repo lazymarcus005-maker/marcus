@@ -55,7 +55,7 @@ def test_main_update_subcommand_accepts_target_version(monkeypatch, capsys, tmp_
         cli.main()
 
     assert exc_info.value.code == 0
-    assert any("marcus==1.2.3" in arg for args in executed for arg in args)
+    assert any("v1.2.3" in arg for args in executed for arg in args)
 
 
 def test_main_update_yes_flag_skips_confirmation(monkeypatch, capsys, tmp_path):
@@ -86,7 +86,14 @@ def test_update_command_pin_target_version():
         "tool",
         "install",
         "--force",
-        "marcus==1.2.3",
+        "git+https://github.com/lazymarcus005-maker/marcus.git@v1.2.3",
+    ]
+    assert cli._update_command("uv_tool") == [
+        "uv",
+        "tool",
+        "install",
+        "--force",
+        "git+https://github.com/lazymarcus005-maker/marcus.git",
     ]
     assert cli._update_command("pipx", target_version="1.2.3") == [
         "pipx",
@@ -179,11 +186,17 @@ def test_version_cache_falls_back_to_stale_cache_when_network_fails(monkeypatch,
 
 
 def test_update_command_for_uv_tool():
-    assert cli._update_command("uv_tool") == ["uv", "tool", "install", "--force", "marcus"]
+    assert cli._update_command("uv_tool") == [
+        "uv",
+        "tool",
+        "install",
+        "--force",
+        "git+https://github.com/lazymarcus005-maker/marcus.git",
+    ]
 
 
 def test_update_command_for_pipx():
-    assert cli._update_command("pipx") == ["pipx", "upgrade", "marcus"]
+    assert cli._update_command("pipx") == ["pipx", "upgrade", "--include-injected", "marcus"]
 
 
 def test_update_command_for_pip():

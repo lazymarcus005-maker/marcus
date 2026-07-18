@@ -111,15 +111,18 @@ def _update_command(install_method: str, target_version: str | None = None) -> l
     """Return the command to run to update marcus for the given install method.
 
     If ``target_version`` is given, pin the install to that release.
+    Marcus releases are published as GitHub tags, not to PyPI, so non-pip
+    methods install directly from the git repository.
     """
-    specifier = f"marcus=={target_version}" if target_version else "marcus"
+    repo_url = "https://github.com/lazymarcus005-maker/marcus.git"
     if install_method == "uv_tool":
-        return ["uv", "tool", "install", "--force", specifier]
+        ref = f"@v{target_version}" if target_version else ""
+        return ["uv", "tool", "install", "--force", f"git+{repo_url}{ref}"]
     if install_method == "pipx":
-        if target_version:
-            return ["pipx", "upgrade", "--include-injected", specifier]
-        return ["pipx", "upgrade", "marcus"]
+        specifier = f"marcus=={target_version}" if target_version else "marcus"
+        return ["pipx", "upgrade", "--include-injected", specifier]
     if install_method == "pip":
+        specifier = f"marcus=={target_version}" if target_version else "marcus"
         return [sys.executable, "-m", "pip", "install", "--upgrade", specifier]
     return []
 
