@@ -113,8 +113,9 @@ def test_working_view_is_one_minimal_box_for_phase_thinking_and_steps():
     ui.console.print(ui._working_renderable())
 
     output = stream.getvalue()
-    assert output.count("┌") == 1
-    assert output.count("└") == 1
+    # Rich may select square or rounded borders depending on the platform.
+    assert output.count("┌") + output.count("╭") == 1
+    assert output.count("└") + output.count("╰") == 1
     assert "ดำเนินการ" in output
     assert "app.py" in output
     assert "thinking" in output
