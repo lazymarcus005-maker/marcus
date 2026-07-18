@@ -274,7 +274,7 @@ def test_main_prints_version(flag, monkeypatch, capsys):
 class _FakeUI:
     instances: list["_FakeUI"] = []
 
-    def __init__(self):
+    def __init__(self, *, no_color: bool = False):
         self.inputs = iter(["/exit"])
         self.setup_result = None
         self.assistant = []
@@ -414,7 +414,7 @@ async def test_amain_first_time_setup_saves_config(monkeypatch, tmp_path):
     _FakeGateway.instances.clear()
     ui = _FakeUI()
     ui.setup_result = ("sk-new", "https://api.example.com/v1", "model-new")
-    monkeypatch.setattr(cli, "TerminalUI", lambda: ui)
+    monkeypatch.setattr(cli, "TerminalUI", lambda **kwargs: ui)
     monkeypatch.setattr(cli, "LLMGateway", _FakeGateway)
     monkeypatch.setattr(cli, "build_marcus_tools", lambda root, settings: [])
     monkeypatch.setattr(cli, "load_project_instructions", lambda root: None)

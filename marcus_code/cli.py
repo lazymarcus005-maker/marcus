@@ -363,9 +363,9 @@ def _run_update(target_version: str | None = None, *, assume_yes: bool = False) 
     return 0
 
 
-async def _amain(prompt: str | None = None, mode: AgentMode | None = None) -> None:
+async def _amain(prompt: str | None = None, mode: AgentMode | None = None, *, no_color: bool = False) -> None:
     root = Path.cwd()
-    ui = TerminalUI()
+    ui = TerminalUI(no_color=no_color)
     settings = resolve_settings()
     if mode is None:
         try:
@@ -486,6 +486,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mode", choices=[mode.value for mode in AgentMode])
     parser.add_argument("-p", "--prompt", help="run one prompt non-interactively")
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="disable colored output and use ASCII characters for progress bars",
+    )
     return parser
 
 
@@ -503,7 +508,13 @@ def main() -> None:
         parser.error(f"unrecognized arguments: {' '.join(remaining)}")
 
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(_amain(args.prompt, AgentMode(args.mode) if args.mode else None))
+        asyncio.run(
+            _amain(
+                args.prompt,
+                AgentMode(args.mode) if args.mode else None,
+                no_color=args.no_color,
+            )
+        )
 
 
 if __name__ == "__main__":

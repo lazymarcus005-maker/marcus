@@ -1,9 +1,12 @@
 import difflib
 import math
+import os
 import re
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import orjson
@@ -11,7 +14,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import NestedCompleter
 from prompt_toolkit.document import Document
-from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console, Group
 from rich.live import Live
@@ -21,33 +24,24 @@ from rich.measure import Measurement
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
 from harness.config import Settings
 from harness.runtime.tools import Tool
 from marcus_code.banner import render_banner
+from marcus_code.command_info import all_commands, command_categories, command_description
+from marcus_code.command_warnings import command_warning, risk_level
+from marcus_code.config import USER_CONFIG_DIR
+from marcus_code.todo_tracker import Phase, TodoTracker
 from marcus_code.tools import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME
 
 if TYPE_CHECKING:
     from marcus_code.loop import UsageStats
     from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
 
-_SLASH_COMMANDS: tuple[str, ...] = (
-    "/help",
-    "/?",
-    "/model",
-    "/usage",
-    "/steps",
-    "/status",
-    "/compact",
-    "/retry",
-    "/continue",
-    "/clear",
-    "/mode",
-    "/config",
-    "/exit",
-    "/quit",
-)
+_SLASH_COMMANDS: tuple[str, ...] = all_commands()
+
 
 class SlashCommandAutoSuggest(AutoSuggest):
     """Auto-suggest slash commands as the user types.
@@ -66,8 +60,19 @@ class SlashCommandAutoSuggest(AutoSuggest):
         prefix = text.lower()
         matches = [cmd for cmd in _SLASH_COMMANDS if cmd.lower().startswith(prefix)]
         if not matches:
+            # Fuzzy fallback for simple typos like /hepl -> /help
+            matches = [
+                cmd
+                for cmd in _SLASH_COMMANDS
+                if len(prefix) >= 2
+                and sum(1 for ch in prefix if ch in cmd.lower()) >= len(prefix) - 1
+            ][: self._MAX_SUGGESTIONS]
+        if not matches:
             return None
-        display = "  |  ".join(matches[: self._MAX_SUGGESTIONS])
+        display = "  |  ".join(
+            f"{cmd} — {command_description(cmd)}" if len(matches) <= 3 else cmd
+            for cmd in matches[: self._MAX_SUGGESTIONS]
+        )
         return Suggestion(display)
 
     def get_suggestion(self, buffer, document: Document) -> Suggestion | None:
@@ -85,10 +90,112 @@ class SlashCommandAutoSuggest(AutoSuggest):
 
 ApprovalDecision = Literal["yes", "no", "always"]
 
-_APPROVAL_PROMPT = (
-    "[#F2B880]Allow this tool call? (y)es / (n)o /[/#F2B880] "
-    "[#F28B82](a)lways for this session[/#F28B82]: "
-)
+ThemeName = Literal["dark", "light", "high-contrast", "no-color"]
+
+
+@dataclass
+class Theme:
+    """Named styles used by TerminalUI instead of hard-coded markup colors."""
+
+    info: str = "cyan"
+    error: str = "red"
+    success: str = "green"
+    warning: str = "yellow"
+    accent: str = "bold cyan"
+    muted: str = "dim"
+    prompt: str = "bold #5fd7ff"
+    border: str = "cyan"
+    toolbar_bg: str = "#1f1f1f"
+    toolbar_fg: str = "#c8c8c8"
+    approval_prompt: str = "#F2B880"
+    approval_always: str = "#F28B82"
+    status_good: str = "green"
+    status_warn: str = "yellow"
+    status_caution: str = "#F2B880"
+    status_bad: str = "#F28B82"
+    bar_fill: str = "█"
+    bar_empty: str = "░"
+    success_glyph: str = "✓"
+    fail_glyph: str = "x"
+
+    @classmethod
+    def dark(cls) -> "Theme":
+        return cls()
+
+    @classmethod
+    def light(cls) -> "Theme":
+        return cls(
+            prompt="bold #0066cc",
+            border="blue",
+            toolbar_bg="#e8e8e8",
+            toolbar_fg="#222222",
+        )
+
+    @classmethod
+    def high_contrast(cls) -> "Theme":
+        return cls(
+            info="white on black",
+            error="black on red",
+            success="black on green",
+            warning="black on yellow",
+            accent="bold white on black",
+            muted="dim white",
+            prompt="bold white",
+            border="white",
+            toolbar_bg="#000000",
+            toolbar_fg="#ffffff",
+            status_good="green",
+            status_warn="yellow",
+            status_caution="orange3",
+            status_bad="red",
+        )
+
+    @classmethod
+    def no_color(cls) -> "Theme":
+        theme = cls(
+            info="default",
+            error="default",
+            success="default",
+            warning="default",
+            accent="default",
+            muted="default",
+            prompt="default",
+            border="default",
+            toolbar_bg="",
+            toolbar_fg="",
+            approval_prompt="default",
+            approval_always="default",
+            status_good="default",
+            status_warn="default",
+            status_caution="default",
+            status_bad="default",
+            bar_fill="#",
+            bar_empty="-",
+            success_glyph="*",
+            fail_glyph="x",
+        )
+        return theme
+
+
+DEFAULT_THEME = Theme.dark()
+
+
+def _theme_from_env() -> ThemeName | None:
+    """Return a theme name requested via NO_COLOR env var."""
+    if os.environ.get("NO_COLOR"):
+        return "no-color"
+    return None
+
+
+def _detect_no_color() -> bool:
+    """True when colors should be disabled (NO_COLOR set)."""
+    return bool(os.environ.get("NO_COLOR"))
+
+
+def _history_path() -> Path:
+    path = USER_CONFIG_DIR / "history"
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 class TerminalUI:
@@ -98,7 +205,9 @@ class TerminalUI:
     and collects one decision per call.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, no_color: bool = False) -> None:
+        self._no_color = no_color or _detect_no_color()
+        self.theme = Theme.no_color() if self._no_color else Theme.dark()
         if sys.platform == "win32":
             # Rich's legacy Windows console path writes through a fixed
             # codepage (cp1252 here) and mangles/crashes on anything outside
@@ -119,25 +228,26 @@ class TerminalUI:
                 )
             except (AttributeError, ValueError):
                 pass
-        self.console = Console(legacy_windows=False)
+        self.console = Console(
+            legacy_windows=False,
+            color_system=None if self._no_color else "auto",
+            no_color=self._no_color,
+        )
         self.mode = "agent"
         self._step_lines: list[str] = []
         self._last_step_lines: list[str] = []
         self._tool_count = 0
+        self._thinking: bool = False
+        self._thinking_start: float = 0.0
+        self._todo: TodoTracker | None = None
+        self._last_guardrail: str | None = None
+        self._stream_buffer: str = ""
         self._live: Live | None = None
         self._status_provider: Callable[[], dict[str, Any]] | None = None
         self._interrupt_count = 0
-        self._input_history = InMemoryHistory()
+        self._input_history = FileHistory(str(_history_path()))
         self._prompt_session: PromptSession[str] | None = None
-        self._prompt_style = Style.from_dict(
-            {
-                "prompt": "bold #5fd7ff",
-                # prompt_toolkit's default toolbar style is `reverse`, which
-                # turns a dark-terminal toolbar white unless explicitly reset.
-                "bottom-toolbar": "noreverse bg:#1f1f1f #c8c8c8",
-                "bottom-toolbar.text": "noreverse bg:#1f1f1f #c8c8c8",
-            }
-        )
+        self._build_prompt_style()
         self._completer = NestedCompleter.from_nested_dict(
             {
                 "/help": None,
@@ -152,9 +262,62 @@ class TerminalUI:
                 "/continue": None,
                 "/clear": {"--all": None},
                 "/config": {"show": None, "edit": None},
+                "/theme": {"dark": None, "light": None, "high-contrast": None, "no-color": None},
+                "/edit": None,
+                "/last": None,
+                "/save": None,
                 "/exit": None,
                 "/quit": None,
             }
+        )
+
+    def _build_prompt_style(self) -> None:
+        toolbar_bg = self.theme.toolbar_bg or "#1f1f1f"
+        toolbar_fg = self.theme.toolbar_fg or "#c8c8c8"
+        self._prompt_style = Style.from_dict(
+            {
+                "prompt": self.theme.prompt,
+                # prompt_toolkit's default toolbar style is `reverse`, which
+                # turns a dark-terminal toolbar white unless explicitly reset.
+                "bottom-toolbar": f"noreverse bg:{toolbar_bg} {toolbar_fg}",
+                "bottom-toolbar.text": f"noreverse bg:{toolbar_bg} {toolbar_fg}",
+            }
+        )
+
+    def set_theme(self, name: ThemeName) -> None:
+        """Switch the active color theme and rebuild dependent UI state."""
+        if name == "no-color":
+            self.theme = Theme.no_color()
+            self._no_color = True
+            if hasattr(self, "console"):
+                self.console._color_system = None
+                self.console.no_color = True
+        elif name == "light":
+            self.theme = Theme.light()
+            self._no_color = False
+            if hasattr(self, "console"):
+                self.console._color_system = "auto"
+                self.console.no_color = False
+        elif name == "high-contrast":
+            self.theme = Theme.high_contrast()
+            self._no_color = False
+            if hasattr(self, "console"):
+                self.console._color_system = "truecolor"
+                self.console.no_color = False
+        else:
+            self.theme = Theme.dark()
+            self._no_color = False
+            if hasattr(self, "console"):
+                self.console._color_system = "auto"
+                self.console.no_color = False
+        if hasattr(self, "_build_prompt_style"):
+            self._build_prompt_style()
+
+    @property
+    def _approval_prompt(self) -> str:
+        return (
+            f"[{self.theme.approval_prompt}]Allow this tool call? (y)es / (n)o /[/{self.theme.approval_prompt}] "
+            f"[{self.theme.approval_always}](a)lways for this session[/{self.theme.approval_always}]: "
         )
 
     def print_banner(
@@ -187,7 +350,7 @@ class TerminalUI:
             else ""
         )
         info = Text.from_markup(
-            "[dim]AI-powered coding agent   (Harness Recipe via Marcus)[/dim]\n\n"
+            f"[{self.theme.muted}]AI-powered coding agent   (Harness Recipe via Marcus)[/{self.theme.muted}]\n\n"
             f"[bold]Workspace[/bold] : {escape(str(root))}\n"
             f"[bold]Model[/bold]     : {escape(model.ljust(20))} |  "
             f"[bold]Provider[/bold] : {escape(provider_url)}\n"
@@ -208,35 +371,56 @@ class TerminalUI:
                 body,
                 title="Marcus Code",
                 title_align="left",
-                border_style="cyan",
+                border_style=self.theme.border,
                 width=panel_width,
             )
         )
         self.console.print("Type a task or /help for commands.")
 
     def print_help(self) -> None:
+        table = Table(title="Slash Commands", border_style=self.theme.border, show_lines=True)
+        table.add_column("Command", style=self.theme.accent, no_wrap=True)
+        table.add_column("Arguments", style=self.theme.muted)
+        table.add_column("Description", style="default")
+
+        # Map simple commands to their category display order.
+        for category, names in command_categories().items():
+            table.add_row(f"[bold]{category}[/bold]", "", "", style=self.theme.muted)
+            for name in names:
+                desc = command_description(name)
+                args = ""
+                if name == "/model":
+                    args = "[name]"
+                elif name == "/usage":
+                    args = "[login|logout]"
+                elif name == "/clear":
+                    args = "[--all]"
+                elif name == "/mode":
+                    args = "[ask|agent|auto|yolo]"
+                elif name == "/config":
+                    args = "[edit]"
+                elif name == "/theme":
+                    args = "[dark|light|high-contrast|no-color]"
+                elif name == "/save":
+                    args = "[path]"
+                table.add_row(f"  {name}", args, desc)
+
+        self.console.print(table)
         self.console.print(
-            "Commands:\n"
-            "  /help              Show this help\n"
-            "  /model [name]      Show or switch the active model for this session\n"
-            "  /usage [login]     Show tokens; Ollama Cloud quota when configured\n"
-            "  /steps             Show details from the last completed task\n"
-            "  /status            Show session, context, model, and workspace status\n"
-            "  /compact           Compact retained conversation context now\n"
-            "  /clear [--all]     Clear context; --all also clears approvals\n"
-            "  /mode [name]       Show or switch mode (ask, agent, auto, yolo)\n"
-            "  /config [edit]     View, or edit, the current LLM config\n"
-            "  /exit, /quit       Quit Marcus Code\n"
-            "\n"
-            "Otherwise, just type what you want done — Marcus will read/search/edit "
-            "files in the working directory and ask before anything risky."
+            f"[{self.theme.muted}]Otherwise, just type what you want done — Marcus will "
+            "read/search/edit files in the working directory and ask before anything risky.["
+            + self.theme.muted + "]"
         )
 
     def print_info(self, message: str) -> None:
-        self.console.print(f"[cyan]{escape(message)}[/cyan]")
+        self.console.print(f"[{self.theme.info}]{escape(message)}[/{self.theme.info}]")
 
     def print_error(self, message: str) -> None:
-        self.console.print(f"[red]{escape(message)}[/red]")
+        self.console.print(f"[{self.theme.error}]{escape(message)}[/{self.theme.error}]")
+
+    def clear_screen(self) -> None:
+        """Clear the terminal screen (ANSI clear + home cursor)."""
+        self.console.clear()
 
     def print_config(self, settings: Settings) -> None:
         key = settings.llm_api_key
@@ -246,10 +430,10 @@ class TerminalUI:
                 f"[bold]Base URL[/bold] : {escape(settings.llm_base_url)}\n"
                 f"[bold]Model[/bold]    : {escape(settings.llm_model)}\n"
                 f"[bold]API key[/bold]  : {escape(masked)}\n\n"
-                "[dim]Use /config edit to change these for this session "
-                "(saved to ~/.marcus/config.toml).[/dim]",
+                f"[{self.theme.muted}]Use /config edit to change these for this session "
+                "(saved to ~/.marcus/config.toml).[/" + self.theme.muted + "]",
                 title="Current Config",
-                border_style="cyan",
+                border_style=self.theme.border,
             )
         )
 
@@ -264,7 +448,7 @@ class TerminalUI:
             Panel.fit(
                 "Edit LLM configuration. Press Enter to keep the current value.",
                 title="Edit Config",
-                border_style="cyan",
+                border_style=self.theme.border,
             )
         )
         try:
@@ -279,7 +463,7 @@ class TerminalUI:
                 or current_model
             )
         except (KeyboardInterrupt, EOFError):
-            self.console.print("\n[yellow]edit cancelled[/yellow]")
+            self.console.print(f"\n[{self.theme.warning}]edit cancelled[/{self.theme.warning}]")
             return None
         return (api_key or None, base_url, model)
 
@@ -309,7 +493,7 @@ class TerminalUI:
                 f"[bold]Throughput[/bold]        : {stats.tokens_per_second:.1f} tok/s\n"
                 f"[bold]Session time[/bold]      : {elapsed:.0f}s",
                 title="Usage",
-                border_style="cyan",
+                border_style=self.theme.border,
             )
         )
 
@@ -318,12 +502,12 @@ class TerminalUI:
             Panel.fit(
                 "\n".join(
                     (
-                        _format_cloud_usage_line("Session", usage.session),
-                        _format_cloud_usage_line("Weekly", usage.weekly),
+                        _format_cloud_usage_line("Session", usage.session, theme=self.theme),
+                        _format_cloud_usage_line("Weekly", usage.weekly, theme=self.theme),
                     )
                 ),
                 title="Ollama Cloud Usage",
-                border_style="cyan",
+                border_style=self.theme.border,
             )
         )
 
@@ -341,7 +525,7 @@ class TerminalUI:
                 "Let's set one up — saved to ~/.marcus/config.toml for future runs.\n"
                 "Press Ctrl+C to skip and rely on env vars instead.",
                 title="First-time setup",
-                border_style="cyan",
+                border_style=self.theme.border,
             )
         )
         try:
@@ -354,16 +538,38 @@ class TerminalUI:
             )
             api_key = self.console.input("LLM API key: ").strip()
             if not api_key:
-                self.console.print("[yellow]no API key entered — skipping setup[/yellow]")
+                self.console.print(
+                    f"[{self.theme.warning}]no API key entered — skipping setup[/{self.theme.warning}]"
+                )
                 return None
             model = (
                 self.console.input(f"LLM model (default: {escape(default_model)}): ").strip()
                 or default_model
             )
         except (KeyboardInterrupt, EOFError):
-            self.console.print("\n[yellow]setup cancelled[/yellow]")
+            self.console.print(f"\n[{self.theme.warning}]setup cancelled[/{self.theme.warning}]")
             return None
         return api_key, base_url, model
+
+    def prompt_multiline(self) -> str | None:
+        """Collect multi-line input from the user until a blank line is entered.
+
+        Returns the joined text, or None if the user cancelled with Ctrl+C.
+        """
+        self.console.print(
+            "Entering multi-line mode. Type a blank line to finish, Ctrl+C to cancel."
+        )
+        lines: list[str] = []
+        try:
+            while True:
+                line = self.console.input("")
+                if line == "":
+                    break
+                lines.append(line)
+        except (KeyboardInterrupt, EOFError):
+            self.console.print(f"[{self.theme.warning}]multi-line input cancelled[/{self.theme.warning}]")
+            return None
+        return "\n".join(lines)
 
     async def prompt_user(self) -> str | None:
         # Defensive lifecycle boundary: prompt_toolkit and Rich Live must
@@ -392,6 +598,7 @@ class TerminalUI:
                 bottom_toolbar=self._bottom_toolbar if self._status_provider else None,
                 refresh_interval=1,
                 style=self._prompt_style,
+                multiline=False,
             )
             self._interrupt_count = 0
             return result
@@ -411,7 +618,7 @@ class TerminalUI:
         limit = max(1, status["context_limit"])
         ratio = min(1.0, used / limit)
         filled = round(ratio * 20)
-        bar = "█" * filled + "░" * (20 - filled)
+        bar = self.theme.bar_fill * filled + self.theme.bar_empty * (20 - filled)
         line_one = (
             f"Session {hours:02d}:{minutes:02d}:{seconds:02d} │ "
             f"Context [{bar}] ~{_format_tokens(used)}/{_format_tokens(limit)}"
@@ -429,7 +636,7 @@ class TerminalUI:
         ]
 
     def print_recovery(self, message: str) -> None:
-        self.console.print(f"[yellow]↻ {escape(message)}[/yellow]")
+        self.console.print(f"[{self.theme.warning}]↻ {escape(message)}[/{self.theme.warning}]")
 
     async def aclose(self) -> None:
         self._stop_live()
@@ -453,7 +660,7 @@ class TerminalUI:
 
     def confirm_yolo_mode(self) -> bool:
         self.console.print(
-            "[bold red]YOLO mode executes tools without approval.[/bold red] "
+            f"[bold {self.theme.error}]YOLO mode executes tools without approval.[/bold {self.theme.error}] "
             "Hard safety guardrails remain active."
         )
         try:
@@ -474,7 +681,7 @@ class TerminalUI:
             self.console.print(Markdown(text))
             return
         self.console.print()
-        self.console.print("[bold cyan]ผลการทำงาน[/bold cyan]")
+        self.console.print(f"[bold {self.theme.accent}]ผลการทำงาน[/bold {self.theme.accent}]")
         self.console.print()
         self.console.print(Markdown(text))
 
@@ -511,11 +718,22 @@ class TerminalUI:
 
     def print_guardrail_stop(self, reason: str) -> None:
         self.finish_steps(success=False)
-        self.console.print(f"[red]stopped: {escape(reason)}[/red]")
+        self._last_guardrail = reason
+        hint = "Try /continue to resume, /retry to start over, or /last to see this message again."
+        self.console.print(
+            Panel(
+                f"[{self.theme.error}] stopped: {escape(reason)}[/]\n\n"
+                f"[{self.theme.muted}]{hint}[/{self.theme.muted}]",
+                title="Guardrail Stop",
+                border_style=self.theme.error,
+            )
+        )
 
     def print_interrupted(self) -> None:
         self.finish_steps(success=False)
-        self.console.print("[yellow]interrupted - back to prompt[/yellow]")
+        self.console.print(
+            f"[{self.theme.warning}]interrupted - back to prompt[/{self.theme.warning}]"
+        )
 
     def register_interrupt(self) -> bool:
         """Return True on the third consecutive Ctrl+C, signaling CLI exit."""
@@ -523,11 +741,13 @@ class TerminalUI:
         self._interrupt_count += 1
         remaining = 3 - self._interrupt_count
         if remaining <= 0:
-            self.console.print("[yellow]Ctrl+C pressed 3 times - exiting Marcus.[/yellow]")
+            self.console.print(
+                f"[{self.theme.warning}]Ctrl+C pressed 3 times - exiting Marcus.[/{self.theme.warning}]"
+            )
             return True
         self.console.print(
-            f"[yellow]interrupted - press Ctrl+C {remaining} more "
-            f"time{'s' if remaining != 1 else ''} to exit[/yellow]"
+            f"[{self.theme.warning}]interrupted - press Ctrl+C {remaining} more "
+            f"time{'s' if remaining != 1 else ''} to exit[/{self.theme.warning}]"
         )
         return False
 
@@ -535,6 +755,127 @@ class TerminalUI:
         self._stop_live()
         self._step_lines = []
         self._tool_count = 0
+        self._thinking = False
+        self._thinking_start = 0.0
+        self._todo = None
+        self._stream_buffer = ""
+
+    def update_todo(self, todo: TodoTracker) -> None:
+        """Update the workflow tracker rendered in the live panel."""
+        self._todo = todo
+        self.refresh_status()
+
+    def _todo_renderable(self) -> Text:
+        """Render the current workflow phase pipeline."""
+        text = Text()
+        if self._todo is None:
+            return text
+        order = list(Phase)
+        labels = {
+            Phase.receive: "รับคำสั่ง",
+            Phase.analyze: "วิเคราะห์",
+            Phase.plan: "วางแผน",
+            Phase.implement: "ดำเนินการ",
+            Phase.validate: "ตรวจสอบ",
+            Phase.deliver: "ส่งมอบ",
+        }
+        for index, phase in enumerate(order):
+            label = labels.get(phase, phase.value)
+            if self._todo.is_done(phase):
+                if self._todo.current == phase and not self._todo.finished:
+                    text.append(f"[{label}]", style=f"bold {self.theme.accent}")
+                else:
+                    text.append(f"[{label}]", style=f"{self.theme.muted}")
+            else:
+                text.append(f"[{label}]", style=self.theme.muted)
+            if index < len(order) - 1:
+                text.append(" → ", style=self.theme.muted)
+        return text
+
+    def start_thinking(self) -> None:
+        """Show a live 'think...' indicator while the LLM is working."""
+        self._thinking = True
+        self._thinking_start = datetime.now().timestamp()
+        if self.console.is_terminal:
+            self._refresh_steps()
+        else:
+            self.console.print(f"[{self.theme.muted}]think...[/{self.theme.muted}]", end="")
+            self.console.file.flush()
+
+    def stop_thinking(self, elapsed_seconds: float) -> None:
+        """Finalize the thinking indicator timing in the step panel."""
+        if not self._thinking:
+            return
+        self._thinking = False
+        if self.console.is_terminal:
+            self._step_lines.append(f"💭 thought: {elapsed_seconds:.2f}s")
+            self._refresh_steps()
+        else:
+            self.console.print(
+                f"\r\x1b[K[{self.theme.muted}]thought: {elapsed_seconds:.2f}s[/{self.theme.muted}]"
+            )
+            self.console.file.flush()
+
+    def print_last_guardrail(self) -> None:
+        """Show the last guardrail stop reason, if any."""
+        if self._last_guardrail is None:
+            self.print_info("No guardrail stop in this session yet.")
+            return
+        self.console.print(
+            Panel(
+                f"[{self.theme.error}]{escape(self._last_guardrail)}[/{self.theme.error}]",
+                title="Last Guardrail Stop",
+                border_style=self.theme.error,
+            )
+        )
+
+    def start_stream(self) -> None:
+        """Pause live panel and prepare to collect streamed assistant text."""
+        self._pause_live()
+        self._stream_buffer = ""
+        self.console.print(f"[{self.theme.muted}]streaming...[/]", end="")
+        self.console.file.flush()
+
+    def stream_delta(self, text: str) -> None:
+        """Accumulate a streamed delta for later rendering."""
+        self._stream_buffer += text
+
+    def end_stream(self) -> None:
+        """Erase the streaming placeholder and render the complete Markdown."""
+        # Clear the "streaming..." line using ANSI escape codes.
+        self.console.print("\r\x1b[K", end="")
+        self.console.file.flush()
+        content = self._stream_buffer
+        self._stream_buffer = ""
+        if content:
+            self.console.print(Markdown(content))
+        self._resume_live()
+
+    def save_turn(self, path: Path, *, user_input: str | None = None, final_answer: str = "", usage: "UsageStats | None" = None, guardrail: str | None = None) -> None:
+        """Write the last turn's details to a Markdown file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# Marcus Turn Summary\n",
+            f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        ]
+        if user_input:
+            lines.extend(["\n## User Request\n", f"```text\n{user_input}\n```\n"])
+        if self._last_step_lines:
+            lines.extend(["\n## Steps\n"] + [f"- {line}" for line in self._last_step_lines] + ["\n"])
+        if final_answer:
+            lines.extend(["\n## Final Answer\n", f"{final_answer}\n"])
+        if guardrail:
+            lines.extend(["\n## Guardrail Stop\n", f"```text\n{guardrail}\n```\n"])
+        if usage:
+            lines.extend(
+                [
+                    "\n## Usage\n",
+                    f"- LLM calls: {usage.llm_calls}\n",
+                    f"- Tokens: {usage.total_tokens:,}\n",
+                    f"- Time: {usage.elapsed_seconds:.1f}s\n",
+                ]
+            )
+        path.write_text("".join(lines), encoding="utf-8")
 
     def finish_steps(self, *, success: bool) -> None:
         if not self._step_lines:
@@ -543,8 +884,8 @@ class TerminalUI:
         self._stop_live()
         if success:
             self.console.print(
-                f"[green]✓ งานสำเร็จ · {self._tool_count} ขั้นตอน[/green] "
-                "[dim](ใช้ /steps เพื่อดูรายละเอียด)[/dim]"
+                f"[{self.theme.success}]{self.theme.success_glyph} งานสำเร็จ · {self._tool_count} ขั้นตอน[/{self.theme.success}] "
+                f"[{self.theme.muted}](ใช้ /steps เพื่อดูรายละเอียด)[/{self.theme.muted}]"
             )
         else:
             self.console.print(self._steps_renderable())
@@ -576,7 +917,7 @@ class TerminalUI:
         return Panel(
             "\n".join(escape(line) for line in lines),
             title=f"Working · {self._tool_count} step(s)",
-            border_style="cyan",
+            border_style=self.theme.border,
         )
 
     def _status_renderable(self) -> Text:
@@ -590,16 +931,8 @@ class TerminalUI:
         limit = max(1, status["context_limit"])
         ratio = min(1.0, used / limit)
         filled = round(ratio * 20)
-        bar = "█" * filled + "░" * (20 - filled)
-        color = (
-            "green"
-            if ratio < 0.7
-            else "yellow"
-            if ratio < 0.85
-            else "#F2B880"
-            if ratio < 0.95
-            else "#F28B82"
-        )
+        bar = self.theme.bar_fill * filled + self.theme.bar_empty * (20 - filled)
+        color = self._status_color(ratio)
         text = Text()
         text.append(f"Session {hours:02d}:{minutes:02d}:{seconds:02d} │ Context ")
         text.append(f"[{bar}]", style=color)
@@ -608,11 +941,29 @@ class TerminalUI:
             f"Model {status['model']} │ Used {_format_tokens(status['total_tokens'])} tok │ "
             f"{status['tokens_per_second']:.1f} tok/s │ Mode {status['mode']}\n"
         )
-        text.append(f"Workspace {status['workspace']}", style="dim")
+        text.append(f"Workspace {status['workspace']}", style=self.theme.muted)
         return text
 
+    def _status_color(self, ratio: float) -> str:
+        if ratio < 0.7:
+            return self.theme.status_good
+        if ratio < 0.85:
+            return self.theme.status_warn
+        if ratio < 0.95:
+            return self.theme.status_caution
+        return self.theme.status_bad
+
     def _working_renderable(self) -> Group:
-        return Group(self._steps_renderable(), self._status_renderable())
+        parts: list[Any] = []
+        if self._thinking:
+            elapsed = datetime.now().timestamp() - self._thinking_start
+            parts.append(Text(f"💭 thinking... {elapsed:.1f}s", style=self.theme.muted))
+        if self._todo is not None:
+            parts.append(self._todo_renderable())
+        if self._step_lines:
+            parts.append(self._steps_renderable())
+        parts.append(self._status_renderable())
+        return Group(*parts)
 
     def _refresh_steps(self) -> None:
         renderable = self._working_renderable()
@@ -640,19 +991,41 @@ class TerminalUI:
 
     def confirm_tool_call(self, tool: Tool, arguments: dict) -> ApprovalDecision:
         self._pause_live()
+        summary = _summarize_arguments(arguments)
+        risk = "low"
+        warning: str | None = None
+        if tool.name in {RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME}:
+            command = str(arguments.get("command", ""))
+            risk = risk_level(command)
+            warning = _command_warning(command)
+
+        content_lines = [
+            f"Tool: {tool.name}",
+            f"Risk: {risk}",
+        ]
+        if summary:
+            content_lines.append(f"Arguments: {summary}")
+        if warning:
+            content_lines.append(f"Warning: {warning}")
+
+        border = self.theme.error if risk == "high" else self.theme.warning if risk == "medium" else self.theme.border
+        self.console.print(
+            Panel(
+                "\n".join(content_lines),
+                title="Allow this tool call? (y)es / (n)o / (a)lways for this session",
+                border_style=border,
+            )
+        )
+
         if tool.name == EDIT_FILE_TOOL_NAME:
             self._print_edit_diff(arguments)
-        if tool.name in {RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME}:
-            warning = _command_warning(str(arguments.get("command", "")))
-            if warning:
-                self.console.print(f"[bold red]WARNING:[/bold red] {escape(warning)}")
 
         while True:
-            # Note: avoid literal square brackets in text passed through
-            # Console.input/print — Rich parses "[...]" as markup tags, so
-            # e.g. "[y]es" silently vanishes instead of printing.
-            answer = self.console.input(_APPROVAL_PROMPT).strip().lower()
-            self._clear_approval_prompt(answer)
+            try:
+                answer = self.console.input("Answer: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                self._resume_live()
+                return "no"
             if answer in ("y", "yes"):
                 self._resume_live()
                 return "yes"
@@ -662,12 +1035,12 @@ class TerminalUI:
             if answer in ("a", "always"):
                 self._resume_live()
                 return "always"
-            self.console.print("[dim]please answer y, n, or a[/dim]")
+            self.console.print(f"[{self.theme.muted}]please answer y, n, or a[/{self.theme.muted}]")
 
     def _clear_approval_prompt(self, answer: str) -> None:
         if not self.console.is_terminal:
             return
-        plain_prompt = Text.from_markup(_APPROVAL_PROMPT).plain
+        plain_prompt = Text.from_markup(self._approval_prompt).plain
         width = max(1, self.console.size.width)
         visual_lines = max(1, math.ceil((len(plain_prompt) + len(answer)) / width))
         for _ in range(visual_lines):
@@ -762,23 +1135,14 @@ def _format_tokens(value: int) -> str:
     return str(value)
 
 
-def _format_cloud_usage_line(label: str, period: "UsagePeriod | None") -> str:
+def _format_cloud_usage_line(label: str, period: "UsagePeriod | None", *, theme: Theme) -> str:
     if period is None or period.percent is None:
         return f"{label:<7} [N/A]"
     percent = min(100.0, max(0.0, period.percent))
     width = 30
     filled = round(percent * width / 100)
-    bar = "█" * filled + "░" * (width - filled)
+    bar = theme.bar_fill * filled + theme.bar_empty * (width - filled)
     reset = f"  reset {period.resets_in}" if period.resets_in else ""
     return f"{label:<7} [{bar}] {percent:g}%{reset}"
 
 
-def _command_warning(command: str) -> str | None:
-    lowered = command.lower()
-    if re.search(r"rm\s+(-\w*f|--force).*\s-r|rm\s+-r[f\s]|rmdir\s+/s", lowered):
-        return "recursive deletion or forced removal"
-    if re.search(r"git\s+push\b.*--force|git\s+reset\b.*--hard", lowered):
-        return "irreversible or remote Git history rewrite"
-    if re.search(r"\b(drop|truncate)\s+(table|database)\b|delete\s+from\b", lowered):
-        return "destructive database operation"
-    return None

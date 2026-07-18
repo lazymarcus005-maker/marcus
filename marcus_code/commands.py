@@ -133,11 +133,69 @@ async def _cmd_clear(ctx: CommandContext, args: str) -> None:
     ctx.loop.clear_history(clear_all=action == "--all")
     detail = "context and approval preferences" if action == "--all" else "conversation context"
     ctx.ui.print_info(f"Cleared {detail}.")
+    ctx.ui.clear_screen()
+
+
+async def _cmd_last(ctx: CommandContext, args: str) -> None:
+    if hasattr(ctx.ui, "print_last_guardrail"):
+        ctx.ui.print_last_guardrail()
+
+
+async def _cmd_save(ctx: CommandContext, args: str) -> None:
+    from datetime import datetime
+    from pathlib import Path
+
+    path_arg = args.strip()
+    default = (
+        Path.home()
+        / ".marcus"
+        / "sessions"
+        / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.md"
+    )
+    path = Path(path_arg) if path_arg else default
+    if hasattr(ctx.ui, "save_turn"):
+        ctx.ui.save_turn(
+            path,
+            user_input=ctx.loop.state.last_turn_input,
+            final_answer="",
+            usage=ctx.loop.usage,
+            guardrail=ctx.loop.state.last_turn_guardrail,
+        )
+    ctx.ui.print_info(f"Turn saved to {path}")
 
 
 async def _cmd_status(ctx: CommandContext, args: str) -> None:
     if hasattr(ctx.ui, "print_status"):
         ctx.ui.print_status()
+
+
+async def _cmd_theme(ctx: CommandContext, args: str) -> None:
+    value = args.strip().lower()
+    valid = {"dark", "light", "high-contrast", "no-color"}
+    if not value:
+        current = "no-color" if getattr(ctx.ui, "_no_color", False) else "dark"
+        ctx.ui.print_info(f"Current theme: {current} (available: dark, light, high-contrast, no-color)")
+        return
+    if value not in valid:
+        ctx.ui.print_error(f"unknown theme: {value!r} (choose: {', '.join(valid)})")
+        return
+    if not hasattr(ctx.ui, "set_theme"):
+        ctx.ui.print_error("theme switching is not supported by this UI")
+        return
+    ctx.ui.set_theme(value)  # type: ignore[attr-defined]
+    ctx.ui.print_info(f"Theme switched to {value!r}.")
+
+
+async def _cmd_edit(ctx: CommandContext, args: str) -> None:
+    if not hasattr(ctx.ui, "prompt_multiline"):
+        ctx.ui.print_error("multi-line input is not supported by this UI")
+        return
+    text = ctx.ui.prompt_multiline()
+    if text is None or text.strip() == "":
+        ctx.ui.print_info("Multi-line input cancelled or empty.")
+        return
+    ctx.ui.print_info(f"Multi-line input submitted ({len(text)} characters).")
+    await ctx.loop.run_turn(text)
 
 
 async def _cmd_mode(ctx: CommandContext, args: str) -> None:
@@ -166,6 +224,10 @@ async def _cmd_mode(ctx: CommandContext, args: str) -> None:
     if hasattr(ctx.ui, "set_mode"):
         ctx.ui.set_mode(mode.value)
     ctx.ui.print_info(f"Mode switched to {mode.value!r} for this session.\nHint: {mode_hint(mode)}")
+
+
+async def _cmd_exit(ctx: CommandContext, args: str) -> None:
+    """Placeholder so /exit and /quit appear in help."""
 
 
 async def _cmd_config(ctx: CommandContext, args: str) -> None:
@@ -208,10 +270,17 @@ COMMANDS: dict[str, CommandHandler] = {
     "/continue": _cmd_continue,
     "/compact": _cmd_compact,
     "/clear": _cmd_clear,
+    "/last": _cmd_last,
+    "/save": _cmd_save,
     "/status": _cmd_status,
     "/mode": _cmd_mode,
     "/config": _cmd_config,
+    "/theme": _cmd_theme,
+    "/edit": _cmd_edit,
+    "/exit": _cmd_exit,
+    "/quit": _cmd_exit,
 }
+
 
 
 async def dispatch(ctx: CommandContext, raw: str) -> bool:

@@ -7,7 +7,7 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 
 from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
-from marcus_code.ui import _APPROVAL_PROMPT, SlashCommandAutoSuggest, TerminalUI
+from marcus_code.ui import SlashCommandAutoSuggest, TerminalUI, Theme, _history_path
 
 
 @pytest.mark.asyncio
@@ -31,16 +31,21 @@ async def test_slash_command_auto_suggest_filters_and_limits_to_seven():
             "/compact",
         ]
     )
-    assert await suggest("/m") == "  |  ".join(["/model", "/mode"])
+    assert await suggest("/m") == "  |  ".join(
+        ["/model — Show or switch the active model", "/mode — Show or switch mode (ask, agent, auto, yolo)"]
+    )
+    # With many matches we show just the command names to keep the line short.
     assert await suggest("/c") == "  |  ".join(["/compact", "/continue", "/clear", "/config"])
-    assert await suggest("/exit") == "/exit"
+    assert await suggest("/exit") == "/exit — Quit Marcus Code"
     assert await suggest("/zzz") is None
     assert await suggest("hello") is None
 
 
 def test_approval_prompt_uses_pastel_orange_and_red_sections():
-    assert "[#F2B880]Allow this tool call? (y)es / (n)o /" in _APPROVAL_PROMPT
-    assert "[#F28B82](a)lways for this session" in _APPROVAL_PROMPT
+    ui = TerminalUI()
+    prompt = ui._approval_prompt
+    assert "[#F2B880]Allow this tool call? (y)es / (n)o /" in prompt
+    assert "[#F28B82](a)lways for this session" in prompt
 
 
 def test_clear_approval_prompt_erases_every_wrapped_terminal_line(monkeypatch):
@@ -64,6 +69,18 @@ def _capturing_ui(*, height: int | None = None) -> tuple[TerminalUI, StringIO]:
         file=stream, force_terminal=False, color_system=None, width=120, height=height
     )
     return ui, stream
+
+
+def test_thinking_indicator_prints_and_replaces_with_timing():
+    ui, stream = _capturing_ui()
+
+    ui.start_thinking()
+    output = stream.getvalue()
+    assert "think..." in output
+
+    ui.stop_thinking(1.234)
+    output = stream.getvalue()
+    assert "thought: 1.23s" in output
 
 
 def test_tool_call_shows_action_and_exact_invocation():
@@ -381,3 +398,83 @@ def test_banner_shows_version_when_provided(tmp_path):
 
     output = stream.getvalue()
     assert "Version" in output and "1.2.3" in output
+
+
+def test_theme_dataclass_exposes_named_styles():
+    theme = Theme.dark()
+    assert theme.info == "cyan"
+    assert theme.error == "red"
+    assert theme.success == "green"
+    assert theme.warning == "yellow"
+    assert theme.accent == "bold cyan"
+    assert theme.muted == "dim"
+
+
+def test_no_color_theme_replaces_unicode_bar_with_ascii():
+    theme = Theme.no_color()
+    assert theme.bar_fill == "#"
+    assert theme.bar_empty == "-"
+    assert theme.success_glyph == "*"
+
+
+def test_terminal_ui_defaults_to_dark_theme():
+    ui = TerminalUI()
+    assert ui.theme == Theme.dark()
+    assert ui.theme.info == "cyan"
+
+
+def test_terminal_ui_no_color_flag_uses_no_color_theme():
+    ui = TerminalUI(no_color=True)
+    assert ui._no_color is True
+    assert ui.theme.bar_fill == "#"
+    assert ui.console.no_color is True
+
+
+def test_terminal_ui_detects_no_color_env_var(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    ui = TerminalUI()
+    assert ui._no_color is True
+    assert ui.theme.bar_fill == "#"
+
+
+def test_set_theme_switches_named_styles():
+    ui = TerminalUI()
+    ui.set_theme("light")
+    assert ui.theme == Theme.light()
+    assert ui.theme.prompt == "bold #0066cc"
+
+    ui.set_theme("high-contrast")
+    assert ui.theme == Theme.high_contrast()
+    assert ui.theme.info == "white on black"
+
+    ui.set_theme("no-color")
+    assert ui.theme == Theme.no_color()
+    assert ui._no_color is True
+
+
+def test_status_renderable_uses_ascii_bars_in_no_color_mode():
+    ui, _stream = _capturing_ui()
+    ui.set_theme("no-color")
+    ui.bind_status(
+        lambda: {
+            "session_started_at": datetime.now(),
+            "model": "model",
+            "mode": "agent",
+            "workspace": "workspace",
+            "context_tokens": 10,
+            "context_limit": 100,
+            "total_tokens": 1,
+            "tokens_per_second": 1.0,
+        }
+    )
+    text = ui._status_renderable()
+    assert "[##------------------]" in text.plain
+    assert "\u2588" not in text.plain
+    assert "\u2591" not in text.plain
+
+
+def test_history_path_creates_user_config_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("marcus_code.ui.USER_CONFIG_DIR", tmp_path / ".marcus")
+    path = _history_path()
+    assert path.parent.exists()
+    assert path.name == "history"

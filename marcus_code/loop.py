@@ -184,21 +184,34 @@ class MarcusLoop:
                 return
             try:
                 start = time.perf_counter()
+                if hasattr(self.ui, "start_thinking"):
+                    self.ui.start_thinking()
                 use_stream = hasattr(self.llm, "complete_stream") and hasattr(
-                    self.ui, "print_assistant_delta"
+                    self.ui, "stream_delta"
                 )
                 async with asyncio.timeout(self.llm_recovery_timeout_seconds):
                     if use_stream:
                         try:
+                            if hasattr(self.ui, "start_stream"):
+                                self.ui.start_stream()
+
+                            def _on_delta(delta_text: str) -> None:
+                                if hasattr(self.ui, "stream_delta"):
+                                    self.ui.stream_delta(delta_text)
+
                             response = await self.llm.complete_stream(
                                 self.state.history,
                                 tools=self.tool_specs,
                                 model=self.model,
                                 # One retry here, then one bounded standard fallback.
                                 max_retries=1,
-                                on_delta=None,
+                                on_delta=_on_delta,
                             )
+                            if hasattr(self.ui, "end_stream"):
+                                self.ui.end_stream()
                         except LLMTransientError:
+                            if hasattr(self.ui, "end_stream"):
+                                self.ui.end_stream()
                             if hasattr(self.ui, "print_recovery"):
                                 self.ui.print_recovery(
                                     "Streaming failed; recovering with a standard request."
@@ -216,12 +229,23 @@ class MarcusLoop:
                             model=self.model,
                             max_retries=1,
                         )
-                self.usage.record(response.usage, time.perf_counter() - start)
+                duration = time.perf_counter() - start
+                if hasattr(self.ui, "stop_thinking"):
+                    self.ui.stop_thinking(duration)
+                self.usage.record(response.usage, duration)
                 self._update_ui_status()
             except LLMError as exc:
+                if hasattr(self.ui, "end_stream"):
+                    self.ui.end_stream()
+                if hasattr(self.ui, "stop_thinking"):
+                    self.ui.stop_thinking(0.0)
                 self.ui.print_guardrail_stop(f"LLM call failed: {exc}")
                 return
             except TimeoutError:
+                if hasattr(self.ui, "end_stream"):
+                    self.ui.end_stream()
+                if hasattr(self.ui, "stop_thinking"):
+                    self.ui.stop_thinking(0.0)
                 if not retried_after_timeout:
                     retried_after_timeout = True
                     self.compact_history()

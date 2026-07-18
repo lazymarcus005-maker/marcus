@@ -49,6 +49,24 @@ class _FakeUI:
     def print_ollama_cloud_usage(self, usage):
         self.ollama_usage.append(usage)
 
+    def clear_screen(self):
+        self.screen_cleared = True
+
+    def set_theme(self, name):
+        self.theme = name
+
+    def prompt_multiline(self):
+        return getattr(self, "multiline_input", None)
+
+    def print_assistant(self, text):
+        self.info.append(text)
+
+    def print_final_answer(self, text):
+        self.info.append(text)
+
+    def begin_turn(self):
+        pass
+
 
 def _point_user_config_at(monkeypatch, tmp_path):
     config_dir = tmp_path / "home" / ".marcus"
@@ -310,9 +328,11 @@ async def test_clear_command_clears_context_and_all_clears_approvals():
     await dispatch(ctx, "/clear")
     assert not any(message.role == "user" for message in ctx.loop.state.history)
     assert ctx.loop.state.always_allowed == {"run_cli"}
+    assert ui.screen_cleared is True
 
     await dispatch(ctx, "/clear --all")
     assert ctx.loop.state.always_allowed == set()
+    assert ui.screen_cleared is True
 
 
 @pytest.mark.asyncio
@@ -323,3 +343,48 @@ async def test_compact_command_reports_before_and_after():
     await dispatch(ctx, "/compact")
 
     assert "estimated tokens" in ui.info[-1]
+
+
+@pytest.mark.asyncio
+async def test_theme_command_shows_and_switches_theme():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/theme")
+    await dispatch(ctx, "/theme no-color")
+
+    assert "Current theme" in ui.info[0]
+    assert "no-color" in ui.info[0]
+    assert ui.info[1] == "Theme switched to 'no-color'."
+
+
+@pytest.mark.asyncio
+async def test_theme_command_rejects_unknown_theme():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/theme neon")
+
+    assert "unknown theme" in ui.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_edit_command_submits_multiline_input_to_loop():
+    ui = _FakeUI()
+    ui.multiline_input = "line one\nline two"
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/edit")
+
+    assert "submitted" in ui.info[0]
+
+
+@pytest.mark.asyncio
+async def test_edit_command_cancels_when_input_empty():
+    ui = _FakeUI()
+    ui.multiline_input = ""
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/edit")
+
+    assert "cancelled" in ui.info[0]
