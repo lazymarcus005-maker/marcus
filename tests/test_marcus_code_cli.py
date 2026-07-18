@@ -148,22 +148,43 @@ def test_windows_update_helper_runs_command_after_parent_exits(monkeypatch, tmp_
         pytest.skip("PowerShell is not installed")
     result_file = tmp_path / "update-result.json"
     log_file = tmp_path / "update.log"
+    tool_scripts = tmp_path / "tool" / "Scripts"
+    tool_scripts.mkdir(parents=True)
+    blocker_executable = tool_scripts / "marcus-blocker.exe"
+    cli.shutil.copy2(cli.shutil.which("cmd.exe") or "cmd.exe", blocker_executable)
     monkeypatch.setattr(cli, "_deferred_update_files", lambda: (result_file, log_file))
     monkeypatch.setattr(cli.os, "getpid", lambda: 2_147_483_647)
+    monkeypatch.setattr(cli.sys, "executable", str(tool_scripts / "python.exe"))
     command = [
         cli.shutil.which("cmd.exe") or "cmd.exe",
         "/d",
         "/c",
         "echo normal-native-stderr 1>&2 & exit /b 0",
     ]
-
-    assert cli._schedule_windows_update(command, "test") == log_file
-
-    deadline = time.monotonic() + 15
+    blocker = cli.subprocess.Popen(
+        [str(blocker_executable), "/d", "/c", "ping -n 3 127.0.0.1 >nul"],
+        stdin=cli.subprocess.DEVNULL,
+        stdout=cli.subprocess.DEVNULL,
+        stderr=cli.subprocess.DEVNULL,
+        creationflags=getattr(cli.subprocess, "CREATE_NO_WINDOW", 0),
+    )
     result = {"status": "pending"}
-    while time.monotonic() < deadline and result.get("status") == "pending":
-        time.sleep(0.1)
-        result = json.loads(result_file.read_text(encoding="utf-8-sig"))
+
+    try:
+        assert cli._schedule_windows_update(command, "test") == log_file
+        time.sleep(0.5)
+        pending = json.loads(result_file.read_text(encoding="utf-8-sig"))
+        assert pending["status"] == "pending"
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and result.get("status") == "pending":
+            time.sleep(0.1)
+            result = json.loads(result_file.read_text(encoding="utf-8-sig"))
+    finally:
+        with cli.contextlib.suppress(cli.subprocess.TimeoutExpired):
+            blocker.wait(timeout=1)
+        if blocker.poll() is None:
+            blocker.terminate()
     assert result["status"] == "success"
     assert log_file.is_file()
     assert "normal-native-stderr" in log_file.read_text(encoding="utf-8-sig")

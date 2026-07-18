@@ -155,6 +155,7 @@ def _schedule_windows_update(command: list[str], target_version: str) -> Path | 
         "parent_pid": os.getpid(),
         "command": command,
         "target_version": target_version,
+        "tool_environment": str(Path(sys.executable).resolve().parent.parent),
         "result_path": str(result_file),
         "log_path": str(log_file),
     }
@@ -176,6 +177,23 @@ $outputText = ""
 $exitCode = 1
 $attempt = 0
 
+function Test-ToolEnvironmentInUse([string]$prefix) {
+    foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
+        try {
+            $processPath = $process.Path
+        } catch {
+            continue
+        }
+        if ($processPath -and $processPath.StartsWith(
+            $prefix,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            return $true
+        }
+    }
+    return $false
+}
+
 try {
     $deadline = (Get-Date).AddMinutes(2)
     while ($null -ne (Get-Process -Id ([int]$configuration.parent_pid) -ErrorAction SilentlyContinue)) {
@@ -185,6 +203,14 @@ try {
         Start-Sleep -Milliseconds 200
     }
     Start-Sleep -Milliseconds 500
+
+    $environmentDeadline = (Get-Date).AddMinutes(30)
+    while (Test-ToolEnvironmentInUse ([string]$configuration.tool_environment)) {
+        if ((Get-Date) -ge $environmentDeadline) {
+            throw "Timed out waiting for other Marcus sessions to exit."
+        }
+        Start-Sleep -Milliseconds 500
+    }
 
     for ($attempt = 1; $attempt -le 10; $attempt++) {
         $outputLines = @(& $executable @arguments 2>&1)
@@ -281,7 +307,7 @@ def _report_deferred_update_result() -> bool:
     target = result.get("target_version", "the requested version")
     if status == "pending":
         started_at = result.get("started_at", 0)
-        if isinstance(started_at, (int, float)) and datetime.now().timestamp() - started_at < 600:
+        if isinstance(started_at, (int, float)) and datetime.now().timestamp() - started_at < 1860:
             print(f"Marcus update to {target} is still running. Try again in a few seconds.")
             return True
         print("A previous Marcus update did not finish. You can run 'marcus --update' again.")
@@ -522,6 +548,7 @@ def _run_update(target_version: str | None = None, *, assume_yes: bool = False) 
             print(f"Close Marcus, then run manually: {' '.join(command)}")
             return 1
         print("Update scheduled. Marcus will now exit so Windows can replace its files.")
+        print("Close any other Marcus sessions; the updater will wait for them safely.")
         print(f"Progress log: {log_file}")
         return 0
 
