@@ -5,13 +5,28 @@ from __future__ import annotations
 import re
 
 _DANGEROUS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"rm\s+(-\w*f|--force).*\s-r|rm\s+-r[f\s]|rmdir\s+/s"), "recursive deletion or forced removal"),
-    (re.compile(r"git\s+push\b.*--force|git\s+reset\b.*--hard"), "irreversible or remote Git history rewrite"),
-    (re.compile(r"\b(drop|truncate)\s+(table|database)\b|delete\s+from\b"), "destructive database operation"),
+    (
+        re.compile(r"rm\s+(-\w*f|--force).*\s-r|rm\s+-r[f\s]|rmdir\s+/s"),
+        "recursive deletion or forced removal",
+    ),
+    (
+        re.compile(r"git\s+push\b.*--force|git\s+reset\b.*--hard"),
+        "irreversible or remote Git history rewrite",
+    ),
+    (
+        re.compile(r"\b(drop|truncate)\s+(table|database)\b|delete\s+from\b"),
+        "destructive database operation",
+    ),
     (re.compile(r"\bdd\b.*if=|mkfs\."), "disk or filesystem operation"),
     (re.compile(r"chmod\s+(-R|--recursive).*\s/"), "recursive permission change on root"),
-    (re.compile(r"\u003e\s*/dev/[sh]d[a-z]|\u003e\s*/"), "writing directly to a device or root filesystem"),
-    (re.compile(r"curl\s+.*\|\s*(sh|bash|zsh|fish)|wget\s+.*\|\s*(sh|bash|zsh|fish)"), "remote code execution via pipe"),
+    (
+        re.compile(r"\u003e\s*/dev/[sh]d[a-z]|\u003e\s*/"),
+        "writing directly to a device or root filesystem",
+    ),
+    (
+        re.compile(r"curl\s+.*\|\s*(sh|bash|zsh|fish)|wget\s+.*\|\s*(sh|bash|zsh|fish)"),
+        "remote code execution via pipe",
+    ),
     (re.compile(r"sudo\s+rm|sudo\s+dd|sudo\s+mkfs"), "privileged destructive operation"),
     (re.compile(r"shutdown|reboot|poweroff|halt"), "system shutdown or reboot"),
     (re.compile(r"killall\s+|pkill\s+-9"), "mass process termination"),

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from typing import Any
 
@@ -44,6 +45,29 @@ from harness.skills.usage import record_skill_usage_for_run
 
 # Control results returned by _process_tool_calls, consumed by _execute_step.
 ControlResult = tuple[str, dict[str, Any]] | None
+
+
+def _build_deferred_tool(original: Tool | None, error_message: str) -> Tool:
+    """Build a policy-denied placeholder tool for deferred batched calls.
+
+    Defined outside the loop so Ruff's B023 closure check is satisfied.
+    """
+
+    async def deny_batched_call(arguments: dict[str, Any]) -> dict[str, Any]:
+        raise ToolRuntimeError(
+            error_message,
+            code=ToolErrorCode.policy_denied,
+            retryable=True,
+        )
+
+    return Tool(
+        name=original.name if original else "unknown",
+        description="Deferred batched tool call.",
+        parameters=original.parameters if original else {"type": "object"},
+        handler=deny_batched_call,
+        risk_tier=original.risk_tier if original else RiskTier.read_only,
+        idempotent=True,
+    )
 
 
 async def _unused_meta_tool_handler(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -205,23 +229,28 @@ class RunEngine:
 
         control_result = await self._process_tool_calls(run, step_no, tool_calls_payload)
 
+        field_updates: dict[str, Any] = {
+            "current_step": step_no + 1,
+            "tokens_used": tokens_used,
+            "tool_calls_used": run.tool_calls_used + len(tool_calls_payload),
+        }
+
         if control_result is not None and control_result[0] == "waiting_approval":
+            # Compute how many calls actually executed vs how many were
+            # deferred so the budget reflects reality after resume.
+            executed_count = control_result[1].get("executed_count", 0)
+            field_updates["tool_calls_used"] = run.tool_calls_used + executed_count
+            field_updates["current_step"] = step_no  # do not advance
             # Unlike every other branch, current_step must NOT advance: on
             # resume the engine has to replay this exact step_no's persisted
             # tool_calls (already-executed calls short-circuit via their
             # idempotency keys, the just-decided one now resolves, and any
             # calls after it in the batch proceed normally). See issue #17.
             run = await self.repo.checkpoint(
-                run, status=RunStatus.waiting_approval, tokens_used=tokens_used
+                run, status=RunStatus.waiting_approval, **field_updates
             )
             await self.session.commit()
             return run
-
-        field_updates: dict[str, Any] = {
-            "current_step": step_no + 1,
-            "tokens_used": tokens_used,
-            "tool_calls_used": run.tool_calls_used + len(tool_calls_payload),
-        }
 
         if control_result is None:
             run = await self.repo.checkpoint(run, **field_updates)
@@ -381,165 +410,242 @@ class RunEngine:
             )
         self._mcp_tools_loaded = True
 
+    def _plan_tool_calls(
+        self, tool_calls_payload: list[dict]
+    ) -> tuple[list[tuple[int, dict]], list[tuple[int, dict]]]:
+        """Select calls to execute now vs defer.
+
+        Read-only calls may run concurrently up to ``run_max_tool_calls_per_step``
+        when they appear first. Mutation calls run one at a time; any calls
+        after the first mutation (or beyond the read-only concurrency limit)
+        are deferred with a policy-denied observation.
+        """
+        if not tool_calls_payload:
+            return [], []
+
+        first_call = tool_calls_payload[0]
+        first_name = first_call.get("name", "")
+        first_tool = self.tools_by_name.get(first_name)
+        if first_tool is None or first_tool.risk_tier != RiskTier.read_only:
+            # First call is not read-only: execute only it now.
+            return [(0, first_call)], [
+                (idx, call) for idx, call in enumerate(tool_calls_payload) if idx != 0
+            ]
+
+        selected: list[tuple[int, dict]] = []
+        deferred: list[tuple[int, dict]] = []
+        for idx, raw_call in enumerate(tool_calls_payload):
+            name = raw_call.get("name", "")
+            tool = self.tools_by_name.get(name)
+            if tool is None or tool.risk_tier != RiskTier.read_only:
+                deferred.append((idx, raw_call))
+                continue
+            if len(selected) < self.settings.run_max_tool_calls_per_step:
+                selected.append((idx, raw_call))
+            else:
+                deferred.append((idx, raw_call))
+        return selected, deferred
+
     async def _process_tool_calls(
         self, run: AgentRun, step_no: int, tool_calls_payload: list[dict]
     ) -> ControlResult:
-        for call_index, raw_call in enumerate(tool_calls_payload):
+        selected, deferred = self._plan_tool_calls(tool_calls_payload)
+
+        # Record policy-denied observations for deferred calls up front.
+        for call_index, raw_call in deferred:
             call = ToolCall(
                 id=raw_call["id"], name=raw_call["name"], arguments=raw_call["arguments"]
             )
 
-            if call_index >= self.settings.run_max_tool_calls_per_step:
+            original = self.tools_by_name.get(call.name)
+            is_read_only = original is not None and original.risk_tier == RiskTier.read_only
+            error_message = (
+                f"up to {self.settings.run_max_tool_calls_per_step} read-only tool calls "
+                "are allowed per reasoning step"
+                if is_read_only
+                else (
+                    "only one mutation tool call is allowed per reasoning step; "
+                    "inspect its result before choosing the next action"
+                )
+            )
+            denied_tool = _build_deferred_tool(original, error_message)
+            await self.tool_executor.execute(run, step_no, call_index, call, tool=denied_tool)
 
-                async def deny_batched_call(arguments: dict[str, Any]) -> dict[str, Any]:
-                    raise ToolRuntimeError(
-                        "only one tool call is allowed per reasoning step; "
-                        "inspect its result before choosing the next action",
-                        code=ToolErrorCode.policy_denied,
-                        retryable=True,
-                    )
+        # Execute selected calls. Read-only calls can run concurrently; the
+        # rest are sequential. Meta/control tools are always sequential.
+        executed_count = 0
+        read_only_calls: list[tuple[int, ToolCall]] = []
+        sequential_calls: list[tuple[int, ToolCall]] = []
+        for call_index, raw_call in selected:
+            call = ToolCall(
+                id=raw_call["id"], name=raw_call["name"], arguments=raw_call["arguments"]
+            )
+            tool = self.tools_by_name.get(call.name)
+            if tool is not None and tool.risk_tier == RiskTier.read_only:
+                read_only_calls.append((call_index, call))
+            else:
+                sequential_calls.append((call_index, call))
 
-                original = self.tools_by_name.get(call.name)
-                denied_tool = Tool(
-                    name=call.name,
-                    description="Denied batched tool call.",
-                    parameters=original.parameters if original else {"type": "object"},
-                    handler=deny_batched_call,
-                    risk_tier=original.risk_tier if original else RiskTier.read_only,
+        async def _run_read_only(pair: tuple[int, ToolCall]) -> tuple[int, Any]:
+            call_index, call = pair
+            return call_index, await self._execute_single_tool_call(run, step_no, call_index, call)
+
+        if read_only_calls:
+            read_only_results = await asyncio.gather(
+                *(_run_read_only(pair) for pair in read_only_calls), return_exceptions=True
+            )
+            for item in read_only_results:
+                if isinstance(item, BaseException):
+                    # Should not happen because _execute_single_tool_call
+                    # captures its own exceptions, but guard just in case.
+                    continue
+                _, control = item
+                if control is not None and control[0] == "waiting_approval":
+                    return "waiting_approval", {"executed_count": executed_count}
+                executed_count += 1
+
+        for call_index, call in sequential_calls:
+            control = await self._execute_single_tool_call(run, step_no, call_index, call)
+            if control is not None:
+                if control[0] == "waiting_approval":
+                    return "waiting_approval", {"executed_count": executed_count}
+                return control[0], {**control[1], "executed_count": executed_count}
+            executed_count += 1
+
+        return None
+
+    async def _execute_single_tool_call(
+        self, run: AgentRun, step_no: int, call_index: int, call: ToolCall
+    ) -> ControlResult:
+        if call.name == FINISH_TOOL_NAME:
+            evidence_error = await self._finish_evidence_error(run, call.arguments)
+            finish_tool = self._finish_tool
+            if evidence_error:
+
+                async def reject_finish(
+                    arguments: dict[str, Any], error: str = evidence_error
+                ) -> dict[str, Any]:
+                    raise ValueError(error)
+
+                finish_tool = Tool(
+                    name=self._finish_tool.name,
+                    description=self._finish_tool.description,
+                    parameters=self._finish_tool.parameters,
+                    handler=reject_finish,
+                    risk_tier=self._finish_tool.risk_tier,
                     idempotent=True,
                 )
-                await self.tool_executor.execute(run, step_no, call_index, call, tool=denied_tool)
-                continue
+            outcome = await self.tool_executor.execute(
+                run, step_no, call_index, call, tool=finish_tool
+            )
+            if "error" not in outcome.observation:
+                return "completed", outcome.observation
+            return None
 
-            if call.name == FINISH_TOOL_NAME:
-                evidence_error = await self._finish_evidence_error(run, call.arguments)
-                finish_tool = self._finish_tool
-                if evidence_error:
+        if call.name == ASK_USER_TOOL_NAME:
+            outcome = await self.tool_executor.execute(
+                run, step_no, call_index, call, tool=self._ask_user_tool
+            )
+            if "error" not in outcome.observation:
+                return "waiting_user_input", outcome.observation
+            return None
 
-                    async def reject_finish(
-                        arguments: dict[str, Any], error: str = evidence_error
-                    ) -> dict[str, Any]:
-                        raise ValueError(error)
+        if call.name == LIST_TOOL_DOMAINS_NAME:
+            await self.tool_executor.execute(
+                run, step_no, call_index, call, tool=self._build_list_domains_tool(run)
+            )
+            return None
 
-                    finish_tool = Tool(
-                        name=self._finish_tool.name,
-                        description=self._finish_tool.description,
-                        parameters=self._finish_tool.parameters,
-                        handler=reject_finish,
-                        risk_tier=self._finish_tool.risk_tier,
-                        idempotent=True,
-                    )
-                outcome = await self.tool_executor.execute(
-                    run, step_no, call_index, call, tool=finish_tool
+        if call.name == LIST_DOMAIN_TOOLS_NAME:
+            await self.tool_executor.execute(
+                run, step_no, call_index, call, tool=self._build_list_domain_tools_tool(run)
+            )
+            return None
+
+        if call.name == LOAD_TOOL_NAME:
+            outcome = await self.tool_executor.execute(
+                run, step_no, call_index, call, tool=self._build_load_tool_tool(run)
+            )
+            loaded_name = outcome.observation.get("name")
+            if loaded_name and loaded_name not in run.active_tool_names:
+                run = await self.repo.checkpoint(
+                    run, active_tool_names=[*run.active_tool_names, loaded_name]
                 )
-                if "error" not in outcome.observation:
-                    return "completed", outcome.observation
-                continue
+            return None
 
-            if call.name == ASK_USER_TOOL_NAME:
-                outcome = await self.tool_executor.execute(
-                    run, step_no, call_index, call, tool=self._ask_user_tool
+        if call.name == USE_SKILL_NAME:
+            outcome = await self.tool_executor.execute(
+                run, step_no, call_index, call, tool=self._build_use_skill_tool(run)
+            )
+            revision_id = outcome.observation.get("revision_id")
+            required_tools = outcome.observation.get("required_tools", [])
+            if revision_id and "error" not in outcome.observation:
+                active_tool_names = list(run.active_tool_names)
+                for tool_name in required_tools:
+                    if tool_name not in active_tool_names:
+                        active_tool_names.append(tool_name)
+                run = await self.repo.checkpoint(
+                    run,
+                    active_skill_revision_id=uuid.UUID(revision_id),
+                    active_tool_names=active_tool_names,
                 )
-                if "error" not in outcome.observation:
-                    return "waiting_user_input", outcome.observation
-                continue
+            return None
 
-            if call.name == LIST_TOOL_DOMAINS_NAME:
-                await self.tool_executor.execute(
-                    run, step_no, call_index, call, tool=self._build_list_domains_tool(run)
-                )
-                continue
+        tool = self.tools_by_name.get(call.name)
 
-            if call.name == LIST_DOMAIN_TOOLS_NAME:
-                await self.tool_executor.execute(
-                    run, step_no, call_index, call, tool=self._build_list_domain_tools_tool(run)
-                )
-                continue
+        if (
+            tool is not None
+            and tool.mcp_server_id is not None
+            and call.name not in run.active_tool_names
+        ):
+            # Hallucinated call to an MCP tool that exists but hasn't been
+            # unlocked via load_tool yet (issue #15) — its full schema was
+            # never sent to the LLM, so treat it as not-yet-callable
+            # rather than actually invoking it.
+            guard_tool = Tool(
+                name=tool.name,
+                description=tool.description,
+                parameters=tool.parameters,
+                handler=_not_loaded_handler,
+            )
+            await self.tool_executor.execute(run, step_no, call_index, call, tool=guard_tool)
+            return None
 
-            if call.name == LOAD_TOOL_NAME:
-                outcome = await self.tool_executor.execute(
-                    run, step_no, call_index, call, tool=self._build_load_tool_tool(run)
-                )
-                loaded_name = outcome.observation.get("name")
-                if loaded_name and loaded_name not in run.active_tool_names:
-                    run = await self.repo.checkpoint(
-                        run, active_tool_names=[*run.active_tool_names, loaded_name]
-                    )
-                continue
-
-            if call.name == USE_SKILL_NAME:
-                outcome = await self.tool_executor.execute(
-                    run, step_no, call_index, call, tool=self._build_use_skill_tool(run)
-                )
-                revision_id = outcome.observation.get("revision_id")
-                required_tools = outcome.observation.get("required_tools", [])
-                if revision_id and "error" not in outcome.observation:
-                    active_tool_names = list(run.active_tool_names)
-                    for tool_name in required_tools:
-                        if tool_name not in active_tool_names:
-                            active_tool_names.append(tool_name)
-                    run = await self.repo.checkpoint(
-                        run,
-                        active_skill_revision_id=uuid.UUID(revision_id),
-                        active_tool_names=active_tool_names,
-                    )
-                continue
-
-            tool = self.tools_by_name.get(call.name)
-
-            if (
-                tool is not None
-                and tool.mcp_server_id is not None
-                and call.name not in run.active_tool_names
-            ):
-                # Hallucinated call to an MCP tool that exists but hasn't been
-                # unlocked via load_tool yet (issue #15) — its full schema was
-                # never sent to the LLM, so treat it as not-yet-callable
-                # rather than actually invoking it.
-                guard_tool = Tool(
-                    name=tool.name,
-                    description=tool.description,
-                    parameters=tool.parameters,
-                    handler=_not_loaded_handler,
-                )
-                await self.tool_executor.execute(run, step_no, call_index, call, tool=guard_tool)
-                continue
-
-            if tool is not None:
-                try:
-                    await guardrails.check_repeated_calls(
-                        self.session, run.id, tool.name, call.arguments
-                    )
-                except guardrails.GuardrailViolation as violation:
-                    return "failed", {"error": violation.reason}
-
-            outcome = await self.tool_executor.execute(run, step_no, call_index, call, tool=tool)
-            if outcome.needs_approval:
-                return "waiting_approval", {}
-            if outcome.fatal:
-                return "failed", {"error": outcome.fatal_reason}
-            if outcome.observation.get("code") == "INVALID_ARGUMENT":
-                result = await self.session.execute(
-                    sa.select(sa.func.count())
-                    .select_from(ToolExecution)
-                    .where(
-                        ToolExecution.run_id == run.id,
-                        ToolExecution.tool_name == call.name,
-                        ToolExecution.error.like("INVALID_ARGUMENT%"),
-                    )
-                )
-                failures = result.scalar_one()
-                if failures > self.settings.run_max_argument_repairs:
-                    return "failed", {
-                        "error": (
-                            f"argument repair budget exhausted for {call.name!r} "
-                            f"({self.settings.run_max_argument_repairs})"
-                        )
-                    }
+        if tool is not None:
             try:
-                await guardrails.check_no_progress(self.session, run.id)
+                await guardrails.check_repeated_calls(
+                    self.session, run.id, tool.name, call.arguments
+                )
             except guardrails.GuardrailViolation as violation:
                 return "failed", {"error": violation.reason}
+
+        outcome = await self.tool_executor.execute(run, step_no, call_index, call, tool=tool)
+        if outcome.needs_approval:
+            return "waiting_approval", {}
+        if outcome.fatal:
+            return "failed", {"error": outcome.fatal_reason}
+        if outcome.observation.get("code") == "INVALID_ARGUMENT":
+            result = await self.session.execute(
+                sa.select(sa.func.count())
+                .select_from(ToolExecution)
+                .where(
+                    ToolExecution.run_id == run.id,
+                    ToolExecution.tool_name == call.name,
+                    ToolExecution.error.like("INVALID_ARGUMENT%"),
+                )
+            )
+            failures = result.scalar_one()
+            if failures > self.settings.run_max_argument_repairs:
+                return "failed", {
+                    "error": (
+                        f"argument repair budget exhausted for {call.name!r} "
+                        f"({self.settings.run_max_argument_repairs})"
+                    )
+                }
+        try:
+            await guardrails.check_no_progress(self.session, run.id)
+        except guardrails.GuardrailViolation as violation:
+            return "failed", {"error": violation.reason}
 
         return None
 

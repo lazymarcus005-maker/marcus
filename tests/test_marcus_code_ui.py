@@ -32,7 +32,10 @@ async def test_slash_command_auto_suggest_filters_and_limits_to_seven():
         ]
     )
     assert await suggest("/m") == "  |  ".join(
-        ["/model — Show or switch the active model", "/mode — Show or switch mode (ask, agent, auto, yolo)"]
+        [
+            "/model — Show or switch the active model",
+            "/mode — Show or switch mode (ask, agent, auto, yolo)",
+        ]
     )
     # With many matches we show just the command names to keep the line short.
     assert await suggest("/c") == "  |  ".join(["/compact", "/continue", "/clear", "/config"])

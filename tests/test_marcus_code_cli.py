@@ -82,13 +82,25 @@ def test_main_update_yes_flag_skips_confirmation(monkeypatch, capsys, tmp_path):
 
 def test_update_command_pin_target_version():
     assert cli._update_command("uv_tool", target_version="1.2.3") == [
-        "uv", "tool", "install", "--force", "marcus==1.2.3"
+        "uv",
+        "tool",
+        "install",
+        "--force",
+        "marcus==1.2.3",
     ]
     assert cli._update_command("pipx", target_version="1.2.3") == [
-        "pipx", "upgrade", "--include-injected", "marcus==1.2.3"
+        "pipx",
+        "upgrade",
+        "--include-injected",
+        "marcus==1.2.3",
     ]
     assert cli._update_command("pip", target_version="1.2.3") == [
-        sys.executable, "-m", "pip", "install", "--upgrade", "marcus==1.2.3"
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "marcus==1.2.3",
     ]
 
 
@@ -132,7 +144,6 @@ def test_version_cache_is_used_when_fresh(monkeypatch, tmp_path):
     cache_file.write_text(json.dumps({"version": "9.9.9", "checked_at": now}), encoding="utf-8")
 
     assert cli._latest_release_version() == "9.9.9"
-
 
     def test_version_cache_ignores_stale_cache_and_returns_latest(monkeypatch, tmp_path):
         cache_file = tmp_path / "version-check.json"

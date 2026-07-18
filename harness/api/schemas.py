@@ -317,6 +317,8 @@ class SkillRevisionResponse(BaseModel):
     output_schema: dict[str, Any]
     required_tools: list[str]
     change_reason: str
+    evaluation_status: str | None
+    evaluation_result: dict[str, Any] | None
     created_from_run_id: uuid.UUID | None
     created_at: datetime
 
@@ -328,6 +330,25 @@ class SkillRevisionUsageStatsResponse(BaseModel):
     success_rate: float | None
     avg_latency_ms: float | None
     avg_tokens: float | None
+
+
+class SkillEvaluationRequest(BaseModel):
+    status: str = Field(pattern=r"^(passed|failed|pending)$")
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillExportResponse(BaseModel):
+    name: str
+    description: str
+    status: SkillStatus
+    revisions: list[SkillRevisionResponse]
+
+
+class SkillImportRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str = Field(default="", max_length=10_000)
+    owner_user_id: uuid.UUID | None = None
+    revisions: list[SkillRevisionCreateRequest] = Field(default_factory=list, max_length=100)
 
 
 class LlmSettingsUpdateRequest(BaseModel):

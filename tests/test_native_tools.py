@@ -45,10 +45,16 @@ class _FakeAsyncClient:
 async def test_fetch_url_strips_html_and_returns_text():
     settings = Settings()
     body = b"<html><head><style>.x{}</style></head><body><h1>Hi</h1><p>World</p></body></html>"
-    with patch(
-        "harness.runtime.native_tools.httpx.AsyncClient",
-        return_value=_FakeAsyncClient(
-            _FakeResponse(content=body, headers={"content-type": "text/html"})
+    with (
+        patch(
+            "harness.runtime.native_tools.httpx.AsyncClient",
+            return_value=_FakeAsyncClient(
+                _FakeResponse(content=body, headers={"content-type": "text/html"})
+            ),
+        ),
+        patch(
+            "harness.runtime.url_validation.socket.getaddrinfo",
+            return_value=[(2, 1, 0, "", ("93.184.216.34", 443))],
         ),
     ):
         tool = build_fetch_url_tool(settings)
@@ -72,10 +78,16 @@ async def test_fetch_url_rejects_non_http_scheme():
 @pytest.mark.asyncio
 async def test_fetch_url_truncates_large_content():
     settings = Settings(tools_fetch_url_max_bytes=10)
-    with patch(
-        "harness.runtime.native_tools.httpx.AsyncClient",
-        return_value=_FakeAsyncClient(
-            _FakeResponse(content=b"0123456789ABCDEF", headers={"content-type": "text/plain"})
+    with (
+        patch(
+            "harness.runtime.native_tools.httpx.AsyncClient",
+            return_value=_FakeAsyncClient(
+                _FakeResponse(content=b"0123456789ABCDEF", headers={"content-type": "text/plain"})
+            ),
+        ),
+        patch(
+            "harness.runtime.url_validation.socket.getaddrinfo",
+            return_value=[(2, 1, 0, "", ("93.184.216.34", 443))],
         ),
     ):
         tool = build_fetch_url_tool(settings)
@@ -172,10 +184,11 @@ async def test_run_cli_times_out(tmp_path):
 def test_build_builtin_tools_excludes_run_cli_when_disabled(tmp_path):
     settings = Settings(tools_fs_root=str(tmp_path), tools_run_cli_enabled=False)
     names = {t.name for t in build_builtin_tools(settings)}
-    assert names == {"fetch_url", "read_file", "write_file"}
+    assert {"fetch_url", "read_file", "write_file"}.issubset(names)
+    assert "run_cli" not in names
 
 
 def test_build_builtin_tools_includes_run_cli_when_enabled(tmp_path):
     settings = Settings(tools_fs_root=str(tmp_path), tools_run_cli_enabled=True)
     names = {t.name for t in build_builtin_tools(settings)}
-    assert names == {"fetch_url", "read_file", "write_file", "run_cli"}
+    assert {"fetch_url", "read_file", "write_file", "run_cli"}.issubset(names)

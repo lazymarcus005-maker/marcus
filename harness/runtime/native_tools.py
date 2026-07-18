@@ -1,8 +1,7 @@
 import asyncio
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin
 
 import httpx
 
@@ -10,6 +9,8 @@ from harness.config import Settings
 from harness.db.enums import RiskTier
 from harness.runtime.command_policy import inspect_shell_command
 from harness.runtime.file_writes import atomic_write_text
+from harness.runtime.html_utils import strip_html as _strip_html
+from harness.runtime.path_utils import resolve_scoped_path
 from harness.runtime.processes import (
     close_process_transport,
     process_group_kwargs,
@@ -17,6 +18,7 @@ from harness.runtime.processes import (
 )
 from harness.runtime.redaction import redact_secrets
 from harness.runtime.tools import Tool, ToolHandler
+from harness.runtime.url_validation import validate_public_url
 
 FINISH_TOOL_NAME = "finish"
 ASK_USER_TOOL_NAME = "ask_user"
@@ -247,45 +249,12 @@ RUN_CLI_SCHEMA = {
 }
 
 
-class _HTMLTextExtractor(HTMLParser):
-    """Minimal tag-stripper for fetch_url — avoids pulling in a full HTML
-    parsing dependency just to get readable text out of a web page."""
-
-    _SKIP_TAGS = frozenset({"script", "style", "noscript"})
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._skipping = 0
-        self.chunks: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in self._SKIP_TAGS:
-            self._skipping += 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in self._SKIP_TAGS and self._skipping:
-            self._skipping -= 1
-
-    def handle_data(self, data: str) -> None:
-        if not self._skipping:
-            stripped = data.strip()
-            if stripped:
-                self.chunks.append(stripped)
-
-
-def _strip_html(html: str) -> str:
-    extractor = _HTMLTextExtractor()
-    extractor.feed(html)
-    return "\n".join(extractor.chunks)
-
-
 def _resolve_sandboxed_path(root: str, relative_path: str) -> Path:
-    base = Path(root).resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    candidate = (base / relative_path).resolve()
-    if not candidate.is_relative_to(base):
-        raise ValueError(f"path {relative_path!r} escapes the sandboxed tools directory")
-    return candidate
+    return resolve_scoped_path(Path(root), relative_path)
+
+
+# Re-export for extra tools to avoid circular imports.
+resolve_sandboxed_path = _resolve_sandboxed_path
 
 
 def build_fetch_url_tool(settings: Settings) -> Tool:
@@ -293,13 +262,21 @@ def build_fetch_url_tool(settings: Settings) -> Tool:
         url = arguments.get("url")
         if not url:
             raise ValueError("fetch_url requires a 'url' field")
-        if urlparse(url).scheme not in ("http", "https"):
-            raise ValueError("fetch_url only supports http:// and https:// URLs")
+        validate_public_url(url)
 
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=settings.tools_fetch_url_timeout_seconds
+            follow_redirects=False, timeout=settings.tools_fetch_url_timeout_seconds
         ) as client:
-            response = await client.get(url)
+            for _ in range(5):
+                response = await client.get(url)
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location")
+                    if not location:
+                        break
+                    url = urljoin(url, location)
+                    validate_public_url(url)
+                    continue
+                break
         response.raise_for_status()
 
         max_bytes = settings.tools_fetch_url_max_bytes
@@ -320,9 +297,9 @@ def build_fetch_url_tool(settings: Settings) -> Tool:
     return Tool(
         name=FETCH_URL_TOOL_NAME,
         description=(
-            "Fetch a web page or URL over HTTP(S) and return its text content "
+            "Fetch a public web page or URL over HTTP(S) and return its text content "
             "(HTML tags stripped). Use this to read documentation, articles, or "
-            "API responses from the web."
+            "API responses from the web. Loopback/private addresses are blocked."
         ),
         parameters=FETCH_URL_SCHEMA,
         handler=handler,
@@ -355,7 +332,8 @@ def build_read_file_tool(settings: Settings) -> Tool:
         name=READ_FILE_TOOL_NAME,
         description=(
             f"Read a text file from the sandboxed tools directory ({settings.tools_fs_root}). "
-            "The path is relative to that root and cannot escape it."
+            "The path is relative to that root and cannot escape it. "
+            "Credentials and private keys are redacted from the returned content."
         ),
         parameters=READ_FILE_SCHEMA,
         handler=handler,
@@ -443,6 +421,8 @@ def build_run_cli_tool(settings: Settings) -> Tool:
 
 
 def build_builtin_tools(settings: Settings) -> list[Tool]:
+    from harness.runtime.native_tools_extra import build_native_extra_tools
+
     tools = [
         build_fetch_url_tool(settings),
         build_read_file_tool(settings),
@@ -450,4 +430,5 @@ def build_builtin_tools(settings: Settings) -> list[Tool]:
     ]
     if settings.tools_run_cli_enabled:
         tools.append(build_run_cli_tool(settings))
+    tools.extend(build_native_extra_tools(settings))
     return tools

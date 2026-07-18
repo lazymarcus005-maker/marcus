@@ -6,6 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from harness.api.deps import AuthPrincipal, require_admin
 from harness.api.schemas import (
     SkillCreateRequest,
+    SkillEvaluationRequest,
+    SkillExportResponse,
+    SkillImportRequest,
     SkillResponse,
     SkillRevisionCreateRequest,
     SkillRevisionResponse,
@@ -219,6 +222,80 @@ async def deprecate_skill(
     skill = await SkillRegistry(session).deprecate_skill(principal.tenant.id, skill_id)
     if skill is None:
         raise HTTPException(status_code=404, detail="skill not found")
+    await session.commit()
+    await session.refresh(skill)
+    return skill
+
+
+@router.post(
+    "/{skill_id}/revisions/{revision_id}/evaluate",
+    response_model=SkillRevisionResponse,
+)
+async def evaluate_revision(
+    skill_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    body: SkillEvaluationRequest,
+    principal: AuthPrincipal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> SkillRevision:
+    await _get_owned_revision(session, principal.tenant, skill_id, revision_id)
+    revision = await SkillRegistry(session).record_evaluation(
+        principal.tenant.id,
+        skill_id,
+        revision_id,
+        status=body.status,
+        result=body.result,
+    )
+    if revision is None:
+        raise HTTPException(status_code=404, detail="skill revision not found")
+    await session.commit()
+    await session.refresh(revision)
+    return revision
+
+
+@router.get("/{skill_id}/export", response_model=SkillExportResponse)
+async def export_skill(
+    skill_id: uuid.UUID,
+    principal: AuthPrincipal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> SkillExportResponse:
+    skill = await _get_owned_skill(session, principal.tenant, skill_id)
+    revisions = await SkillRegistry(session).list_revisions(principal.tenant.id, skill_id)
+    return SkillExportResponse(
+        name=skill.name,
+        description=skill.description,
+        status=skill.status,
+        revisions=[SkillRevisionResponse.model_validate(r) for r in revisions],
+    )
+
+
+@router.post("/import", response_model=SkillResponse, status_code=201)
+async def import_skill(
+    body: SkillImportRequest,
+    principal: AuthPrincipal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> Skill:
+    await _validate_owner(session, principal.tenant, body.owner_user_id)
+    skill = await SkillRegistry(session).create_skill(
+        tenant_id=principal.tenant.id,
+        name=body.name,
+        description=body.description,
+        owner_user_id=body.owner_user_id,
+    )
+    for revision_body in body.revisions:
+        revision = await SkillRegistry(session).create_revision(
+            tenant_id=principal.tenant.id,
+            skill_id=skill.id,
+            instruction=revision_body.instruction,
+            change_reason=revision_body.change_reason,
+            manifest=revision_body.manifest,
+            input_schema=revision_body.input_schema,
+            output_schema=revision_body.output_schema,
+            required_tools=revision_body.required_tools,
+            created_from_run_id=revision_body.created_from_run_id,
+        )
+        if revision is None:
+            raise HTTPException(status_code=404, detail="skill not found")
     await session.commit()
     await session.refresh(skill)
     return skill

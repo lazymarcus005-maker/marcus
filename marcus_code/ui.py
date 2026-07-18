@@ -1,7 +1,6 @@
 import difflib
 import math
 import os
-import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,7 +15,7 @@ from prompt_toolkit.completion import NestedCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
-from rich.console import Console, Group
+from rich.console import ColorSystem, Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape
@@ -79,6 +78,7 @@ class SlashCommandAutoSuggest(AutoSuggest):
         # get_suggestion_async is used by PromptSession's buffer; provide a
         # synchronous fallback in case it is ever called directly.
         import asyncio
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -296,19 +296,19 @@ class TerminalUI:
             self.theme = Theme.light()
             self._no_color = False
             if hasattr(self, "console"):
-                self.console._color_system = "auto"
+                self.console._color_system = ColorSystem.EIGHT_BIT
                 self.console.no_color = False
         elif name == "high-contrast":
             self.theme = Theme.high_contrast()
             self._no_color = False
             if hasattr(self, "console"):
-                self.console._color_system = "truecolor"
+                self.console._color_system = ColorSystem.TRUECOLOR
                 self.console.no_color = False
         else:
             self.theme = Theme.dark()
             self._no_color = False
             if hasattr(self, "console"):
-                self.console._color_system = "auto"
+                self.console._color_system = ColorSystem.EIGHT_BIT
                 self.console.no_color = False
         if hasattr(self, "_build_prompt_style"):
             self._build_prompt_style()
@@ -409,7 +409,8 @@ class TerminalUI:
         self.console.print(
             f"[{self.theme.muted}]Otherwise, just type what you want done — Marcus will "
             "read/search/edit files in the working directory and ask before anything risky.["
-            + self.theme.muted + "]"
+            + self.theme.muted
+            + "]"
         )
 
     def print_info(self, message: str) -> None:
@@ -567,7 +568,9 @@ class TerminalUI:
                     break
                 lines.append(line)
         except (KeyboardInterrupt, EOFError):
-            self.console.print(f"[{self.theme.warning}]multi-line input cancelled[/{self.theme.warning}]")
+            self.console.print(
+                f"[{self.theme.warning}]multi-line input cancelled[/{self.theme.warning}]"
+            )
             return None
         return "\n".join(lines)
 
@@ -851,7 +854,15 @@ class TerminalUI:
             self.console.print(Markdown(content))
         self._resume_live()
 
-    def save_turn(self, path: Path, *, user_input: str | None = None, final_answer: str = "", usage: "UsageStats | None" = None, guardrail: str | None = None) -> None:
+    def save_turn(
+        self,
+        path: Path,
+        *,
+        user_input: str | None = None,
+        final_answer: str = "",
+        usage: "UsageStats | None" = None,
+        guardrail: str | None = None,
+    ) -> None:
         """Write the last turn's details to a Markdown file."""
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
@@ -861,7 +872,9 @@ class TerminalUI:
         if user_input:
             lines.extend(["\n## User Request\n", f"```text\n{user_input}\n```\n"])
         if self._last_step_lines:
-            lines.extend(["\n## Steps\n"] + [f"- {line}" for line in self._last_step_lines] + ["\n"])
+            lines.extend(
+                ["\n## Steps\n"] + [f"- {line}" for line in self._last_step_lines] + ["\n"]
+            )
         if final_answer:
             lines.extend(["\n## Final Answer\n", f"{final_answer}\n"])
         if guardrail:
@@ -997,7 +1010,7 @@ class TerminalUI:
         if tool.name in {RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME}:
             command = str(arguments.get("command", ""))
             risk = risk_level(command)
-            warning = _command_warning(command)
+            warning = command_warning(command)
 
         content_lines = [
             f"Tool: {tool.name}",
@@ -1008,7 +1021,13 @@ class TerminalUI:
         if warning:
             content_lines.append(f"Warning: {warning}")
 
-        border = self.theme.error if risk == "high" else self.theme.warning if risk == "medium" else self.theme.border
+        border = (
+            self.theme.error
+            if risk == "high"
+            else self.theme.warning
+            if risk == "medium"
+            else self.theme.border
+        )
         self.console.print(
             Panel(
                 "\n".join(content_lines),
@@ -1144,5 +1163,3 @@ def _format_cloud_usage_line(label: str, period: "UsagePeriod | None", *, theme:
     bar = theme.bar_fill * filled + theme.bar_empty * (width - filled)
     reset = f"  reset {period.resets_in}" if period.resets_in else ""
     return f"{label:<7} [{bar}] {percent:g}%{reset}"
-
-

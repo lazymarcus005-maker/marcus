@@ -575,11 +575,24 @@ async def test_prior_turns_are_summarized_not_replayed_to_new_question():
 
     assert loop.state.history[0].role == "system"
     # The latest user message must still be present.
-    assert any(message.role == "user" and message.content == "second question" for message in loop.state.history)
+    assert any(
+        message.role == "user" and message.content == "second question"
+        for message in loop.state.history
+    )
     # Full first-turn replay should have been summarized away.
-    assert not any(message.role == "assistant" and message.content == "old answer" for message in loop.state.history)
+    assert not any(
+        message.role == "assistant" and message.content == "old answer"
+        for message in loop.state.history
+    )
     # Summary message should exist and mention prior turns.
-    summary = next((message for message in loop.state.history if message.role == "system" and message != loop.state.history[0]), None)
+    summary = next(
+        (
+            message
+            for message in loop.state.history
+            if message.role == "system" and message != loop.state.history[0]
+        ),
+        None,
+    )
     assert summary is not None
     assert "Prior turns summarized" in summary.content
 
@@ -602,5 +615,8 @@ async def test_current_turn_kept_intact_when_under_budget():
     loop._trim_history()
 
     # Both user messages retained while under budget.
-    assert [message.content for message in loop.state.history if message.role == "user"] == ["question", "follow up"]
+    assert [message.content for message in loop.state.history if message.role == "user"] == [
+        "question",
+        "follow up",
+    ]
     assert loop.state.history[0].role == "system"

@@ -44,16 +44,9 @@ marcus = "marcus_code.cli:main"
 ollama-usage = [
     "playwright>=1.49.0",
 ]
-dev = [
-    "pytest>=8.3.3",
-    "pytest-asyncio>=0.24.0",
-    "pytest-cov>=5.0.0",
-    "ruff>=0.7.0",
-    "mypy>=1.13.0",
-]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.3.3",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",

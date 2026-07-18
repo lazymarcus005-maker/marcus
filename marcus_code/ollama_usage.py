@@ -221,16 +221,21 @@ class OllamaCloudUsageClient:
             )
         executable = executables[0]
         port = _unused_local_port()
-        process_group_args = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
-        )
-        process = await asyncio.create_subprocess_exec(
-            str(executable),
-            *interactive_browser_args(self.profile_dir, port),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            **process_group_args,
-        )
+        if os.name == "nt":
+            process = await asyncio.create_subprocess_exec(
+                str(executable),
+                *interactive_browser_args(self.profile_dir, port),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                str(executable),
+                *interactive_browser_args(self.profile_dir, port),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
         deadline = asyncio.get_running_loop().time() + 30
         while asyncio.get_running_loop().time() < deadline:
             try:
@@ -260,11 +265,14 @@ class OllamaCloudUsageClient:
         for cookie in cookies_raw:
             if not isinstance(cookie, dict) or "ollama.com" not in cookie.get("domain", ""):
                 continue
+            cookie_domain = cookie.get("domain")
+            if not isinstance(cookie_domain, str):
+                continue
             cookies.set(
-                cookie.get("name", ""),
-                cookie.get("value", ""),
-                domain=cookie.get("domain"),
-                path=cookie.get("path", "/"),
+                str(cookie.get("name", "")),
+                str(cookie.get("value", "")),
+                domain=cookie_domain,
+                path=str(cookie.get("path", "/")),
             )
         try:
             async with httpx.AsyncClient(

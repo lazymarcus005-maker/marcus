@@ -324,7 +324,7 @@ async def test_fetch_url_strips_html_and_returns_text():
     body = b"<html><body><h1>Hi</h1></body></html>"
     with (
         patch(
-            "marcus_code.tools.socket.getaddrinfo",
+            "harness.runtime.url_validation.socket.getaddrinfo",
             return_value=[(0, 0, 0, "", ("93.184.216.34", 443))],
         ),
         patch(
@@ -353,7 +353,7 @@ async def test_fetch_url_rejects_non_http_scheme():
 @pytest.mark.asyncio
 async def test_fetch_url_rejects_loopback(monkeypatch):
     monkeypatch.setattr(
-        "marcus_code.tools.socket.getaddrinfo",
+        "harness.runtime.url_validation.socket.getaddrinfo",
         lambda *args, **kwargs: [(0, 0, 0, "", ("127.0.0.1", 80))],
     )
     with pytest.raises(ValueError, match="refuses"):
@@ -363,7 +363,7 @@ async def test_fetch_url_rejects_loopback(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_url_rejects_multiple_dns_addresses(monkeypatch):
     monkeypatch.setattr(
-        "marcus_code.tools.socket.getaddrinfo",
+        "harness.runtime.url_validation.socket.getaddrinfo",
         lambda *args, **kwargs: [
             (0, 0, 0, "", ("93.184.216.34", 80)),
             (0, 0, 0, "", ("93.184.216.35", 80)),

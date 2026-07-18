@@ -191,10 +191,29 @@ class SkillRegistry:
             return None
         if revision.status not in (SkillStatus.approved, SkillStatus.published):
             raise ValueError("skill revision must be approved before publishing")
+        if revision.evaluation_status != "passed":
+            raise ValueError("skill revision must pass evaluation before publishing")
         if revision.status == SkillStatus.approved:
             revision.status = SkillStatus.published
         skill.active_revision_id = revision.id
         skill.status = SkillStatus.published
+        await self.session.flush()
+        return revision
+
+    async def record_evaluation(
+        self,
+        tenant_id: uuid.UUID,
+        skill_id: uuid.UUID,
+        revision_id: uuid.UUID,
+        *,
+        status: str,
+        result: dict | None = None,
+    ) -> SkillRevision | None:
+        revision = await self.get_revision(tenant_id, skill_id, revision_id)
+        if revision is None or revision.skill.tenant_id != tenant_id:
+            return None
+        revision.evaluation_status = status
+        revision.evaluation_result = result or {}
         await self.session.flush()
         return revision
 

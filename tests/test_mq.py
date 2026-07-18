@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uuid
 
@@ -11,8 +12,42 @@ from tests.fakes import get_message_with_wait
 RABBITMQ_URL = os.environ.get("HARNESS_TEST_RABBITMQ_URL", "amqp://harness:harness@localhost:5672/")
 
 
+def _rabbitmq_available() -> bool:
+    """Return True if the configured RabbitMQ broker is reachable."""
+    url = RABBITMQ_URL
+    if os.environ.get("HARNESS_RUN_MQ_TESTS") != "1":
+        return False
+    try:
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 5672
+        with asyncio.runners.Runner() as runner:
+            return runner.run(_can_connect(host, port))
+    except Exception:
+        return False
+
+
+async def _can_connect(host: str, port: int) -> bool:
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="module")
+def mq_available() -> bool:
+    return _rabbitmq_available()
+
+
 @pytest_asyncio.fixture
-async def channel():
+async def channel(mq_available: bool):
+    if not mq_available:
+        pytest.skip("RabbitMQ is not reachable; set HARNESS_RUN_MQ_TESTS=1 to run MQ tests")
     connection = await aio_pika.connect_robust(RABBITMQ_URL)
     async with connection:
         ch = await connection.channel()

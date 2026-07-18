@@ -1,7 +1,5 @@
 import asyncio
-import ipaddress
 import re
-import socket
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -15,7 +13,8 @@ from harness.config import Settings
 from harness.db.enums import RiskTier
 from harness.runtime.command_policy import inspect_shell_command
 from harness.runtime.file_writes import atomic_write_text
-from harness.runtime.native_tools import _strip_html
+from harness.runtime.html_utils import strip_html as _strip_html
+from harness.runtime.path_utils import resolve_scoped_path
 from harness.runtime.processes import (
     close_process_transport,
     process_group_kwargs,
@@ -23,6 +22,7 @@ from harness.runtime.processes import (
 )
 from harness.runtime.redaction import redact_secrets
 from harness.runtime.tools import Tool
+from harness.runtime.url_validation import validate_public_url
 
 READ_FILE_TOOL_NAME = "read_file"
 WRITE_FILE_TOOL_NAME = "write_file"
@@ -58,18 +58,8 @@ _MAX_GREP_FILE_BYTES = 2_000_000  # skip files larger than this when grepping
 
 
 def _resolve_scoped_path(root: Path, relative_path: str) -> Path:
-    """Resolve relative_path under root, refusing any path that escapes it.
-
-    Mirrors harness/runtime/native_tools.py's _resolve_sandboxed_path, but
-    scoped to the CLI's working directory rather than a configured server
-    sandbox — kept as a separate small copy rather than a shared import so
-    marcus_code doesn't couple to harness's server-sandbox semantics.
-    """
-    base = root.resolve()
-    candidate = (base / relative_path).resolve()
-    if not candidate.is_relative_to(base):
-        raise ValueError(f"path {relative_path!r} escapes the working directory")
-    return candidate
+    """Resolve relative_path under root, refusing any path that escapes it."""
+    return resolve_scoped_path(root, relative_path)
 
 
 def _should_skip_dir(path: Path) -> bool:
@@ -131,9 +121,20 @@ def build_read_file_tool(root: Path, *, max_chars: int = DEFAULT_READ_FILE_MAX_C
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path relative to the working directory."},
-                "offset": {"type": "integer", "minimum": 1, "description": "1-based starting line."},
-                "limit": {"type": "integer", "minimum": 1, "description": "Maximum lines to return."},
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the working directory.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based starting line.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum lines to return.",
+                },
             },
             "required": ["path"],
         },
@@ -350,7 +351,7 @@ def build_grep_tool(root: Path) -> Tool:
         name=GREP_TOOL_NAME,
         description=(
             "Search file contents for a regex pattern under the working directory. "
-            f"Skips binary files and common noise directories. "
+            "Skips binary files and common noise directories. "
             "Default max_results is 50; use max_results up to {_MAX_GREP_MATCHES}."
         ),
         parameters={
@@ -675,7 +676,7 @@ def build_fetch_url_tool(settings: Settings) -> Tool:
         url = arguments.get("url")
         if not url:
             raise ValueError("fetch_url requires a 'url' field")
-        _validate_public_url(url)
+        validate_public_url(url)
 
         async with httpx.AsyncClient(
             follow_redirects=False, timeout=settings.tools_fetch_url_timeout_seconds
@@ -687,7 +688,7 @@ def build_fetch_url_tool(settings: Settings) -> Tool:
                     if not location:
                         break
                     url = urljoin(url, location)
-                    _validate_public_url(url)
+                    validate_public_url(url)
                     continue
                 break
         response.raise_for_status()
@@ -726,35 +727,9 @@ def build_fetch_url_tool(settings: Settings) -> Tool:
     )
 
 
-def _validate_public_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("fetch_url only supports public http(s) URLs")
-    try:
-        addresses = {
-            info[4][0]
-            for info in socket.getaddrinfo(
-                parsed.hostname,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
-            )
-        }
-    except OSError as exc:
-        raise ValueError(f"could not resolve URL host: {parsed.hostname}") from exc
-    if not addresses:
-        raise ValueError("URL host has no addresses")
-    if len(addresses) != 1:
-        raise ValueError("fetch_url refuses hosts with multiple DNS addresses")
-    for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if not ip.is_global:
-            raise ValueError(
-                "fetch_url refuses loopback, private, link-local, or reserved addresses"
-            )
-
-
 def build_marcus_tools(root: Path, settings: Settings) -> MarcusTools:
     from marcus_code.skills import build_load_skill_tool
+    from marcus_code.tools_extra import build_marcus_extra_tools
 
     process_manager = BackgroundProcessManager(
         root, max_output_chars=settings.tools_run_cli_max_output_bytes
@@ -770,4 +745,5 @@ def build_marcus_tools(root: Path, settings: Settings) -> MarcusTools:
         build_load_skill_tool(root),
     ]
     tools.extend(build_background_process_tools(process_manager))
+    tools.extend(build_marcus_extra_tools(root, settings))
     return MarcusTools(tools, process_manager)

@@ -2,18 +2,24 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 import orjson
 
 from harness.db.enums import RiskTier
 from harness.llm.gateway import LLMError, LLMGateway, LLMTransientError
-from harness.llm.types import LLMMessage, ToolCall, Usage
+from harness.llm.types import LLMMessage, ToolCall, ToolSpec, Usage
 from harness.runtime.guardrails import REPEATED_CALL_WINDOW
 from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tool_validation import ToolArgumentError, normalize_and_validate_arguments
 from harness.runtime.tools import Tool
 from marcus_code.modes import AgentMode, tool_is_allowed, tool_requires_approval
 from marcus_code.task_contract import TaskKind, derive_task_contract, is_verification_evidence
+from marcus_code.token_utils import (
+    estimate_message_tokens,
+    summarize_tool_result,
+    trim_messages_to_budget,
+)
 from marcus_code.ui import TerminalUI
 
 DEFAULT_MAX_STEPS = 100
@@ -47,6 +53,8 @@ class SessionState:
     always_allowed: set[str] = field(default_factory=set)
     last_turn_input: str | None = None
     last_turn_guardrail: str | None = None
+    # Cache for idempotent read-only tools keyed by (name, sorted-argument JSON).
+    tool_result_cache: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -121,7 +129,7 @@ class MarcusLoop:
     ) -> None:
         self.llm = llm
         self.tools_by_name = {t.name: t for t in tools}
-        self.tool_specs = [t.to_spec() for t in tools]
+        self.all_tool_specs = [t.to_spec() for t in tools]
         self.ui = ui
         self.model = model
         self.max_steps = max_steps
@@ -189,6 +197,7 @@ class MarcusLoop:
                 use_stream = hasattr(self.llm, "complete_stream") and hasattr(
                     self.ui, "stream_delta"
                 )
+                active_specs = self._active_tool_specs(contract.kind)
                 async with asyncio.timeout(self.llm_recovery_timeout_seconds):
                     if use_stream:
                         try:
@@ -201,7 +210,7 @@ class MarcusLoop:
 
                             response = await self.llm.complete_stream(
                                 self.state.history,
-                                tools=self.tool_specs,
+                                tools=active_specs,
                                 model=self.model,
                                 # One retry here, then one bounded standard fallback.
                                 max_retries=1,
@@ -218,14 +227,14 @@ class MarcusLoop:
                                 )
                             response = await self.llm.complete(
                                 self.state.history,
-                                tools=self.tool_specs,
+                                tools=active_specs,
                                 model=self.model,
                                 max_retries=1,
                             )
                     else:
                         response = await self.llm.complete(
                             self.state.history,
-                            tools=self.tool_specs,
+                            tools=active_specs,
                             model=self.model,
                             max_retries=1,
                         )
@@ -385,12 +394,14 @@ class MarcusLoop:
                     consecutive_tool_failures += 1
                 else:
                     consecutive_tool_failures = 0
+                # Compress verbose tool results before storing to save tokens.
+                compressed = summarize_tool_result(orjson.dumps(observation).decode())
                 self.state.history.append(
                     LLMMessage(
                         role="tool",
                         tool_call_id=call.id,
                         name=call.name,
-                        content=orjson.dumps(observation).decode(),
+                        content=compressed,
                     )
                 )
                 self._trim_history()
@@ -405,62 +416,149 @@ class MarcusLoop:
         self.state.last_turn_guardrail = f"exceeded max steps ({self.max_steps})"
         self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
 
+    _TOOL_SETS_BY_TASK_KIND: dict[str, set[str]] = {
+        "explain": {
+            "read_file",
+            "list_files",
+            "grep",
+            "fetch_url",
+            "search_web",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "read_directory_tree",
+            "summarize_text",
+            "compare_files",
+            "ask_user_choice",
+            "load_skill",
+        },
+        "change": {
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_diff",
+            "list_files",
+            "grep",
+            "run_tests",
+            "execute_python",
+            "run_cli",
+            "git_status",
+            "git_diff",
+            "read_directory_tree",
+            "summarize_text",
+            "compare_files",
+            "ask_user_choice",
+            "load_skill",
+            "memory_read",
+            "memory_write",
+            "todo_create",
+            "todo_update",
+            "todo_list",
+        },
+        "operate": {
+            "run_cli",
+            "start_process",
+            "read_process_output",
+            "stop_process",
+            "wait_for_http",
+            "list_processes",
+            "kill_process",
+            "check_url_health",
+            "fetch_url",
+            "read_file",
+            "list_files",
+            "ask_user_choice",
+            "load_skill",
+            "memory_read",
+            "memory_write",
+            "todo_create",
+            "todo_update",
+            "todo_list",
+        },
+    }
+
+    def _active_tool_specs(self, task_kind: TaskKind) -> list[ToolSpec]:
+        """Return the subset of tools disclosed to the model for this task kind."""
+        allowed = self._TOOL_SETS_BY_TASK_KIND.get(task_kind.value)
+        if allowed is None:
+            return list(self.all_tool_specs)
+        return [spec for spec in self.all_tool_specs if spec.name in allowed]
+
     def _trim_history(self) -> None:
-        if len(self.state.history) <= self.max_history_messages:
+        if not self.state.history:
             return
 
-        # Keep the original system prompt and the most recent user request
-        # (plus its tool/assistant turns). Older turns are collapsed into a
-        # compact summary so the model cannot answer stale user questions again.
-        first_system = [self.state.history[0]] if self.state.history[0].role == "system" else []
+        # First: summarize old prior turns before count-cap trimming.
+        if self.history_summary_enabled and len(self.state.history) > self.max_history_messages:
+            first_system = [self.state.history[0]] if self.state.history[0].role == "system" else []
+            latest_user_index = next(
+                (
+                    i
+                    for i in range(len(self.state.history) - 1, -1, -1)
+                    if self.state.history[i].role == "user"
+                ),
+                None,
+            )
+            if latest_user_index is not None and latest_user_index > len(first_system) + 1:
+                prior_turns = self.state.history[len(first_system) : latest_user_index]
+                current_turn = self.state.history[latest_user_index:]
+                summary = self._summarize_prior_turns(prior_turns)
+                if summary:
+                    self.state.history = first_system + [summary] + current_turn
 
-        # Find the latest user message; everything before it is a prior turn.
-        latest_user_index = self._latest_user_index()
-        if latest_user_index is None or latest_user_index == 0:
-            # No user message or only system prompt: fall back to simple tail.
-            tail_size = max(0, self.max_history_messages - len(first_system))
-            tail = self.state.history[-tail_size:]
-            while tail and tail[0].role in {"tool", "assistant"}:
-                tail = tail[1:]
-            self.state.history = first_system + tail
-            return
+        # Second: message-count cap, preserving system + latest user + any summary.
+        if len(self.state.history) > self.max_history_messages:
+            first_system = [self.state.history[0]] if self.state.history[0].role == "system" else []
+            latest_user_index = next(
+                (
+                    i
+                    for i in range(len(self.state.history) - 1, -1, -1)
+                    if self.state.history[i].role == "user"
+                ),
+                None,
+            )
+            # Build a candidate list with system, a summary right after it, and the latest user onward.
+            candidate: list[LLMMessage] = list(first_system)
+            if len(self.state.history) > len(first_system) and self.state.history[
+                len(first_system)
+            ].role in {"system", "assistant"}:
+                candidate.append(self.state.history[len(first_system)])
+            if latest_user_index is not None:
+                candidate.extend(self.state.history[latest_user_index:])
+            # Drop the oldest non-protected assistant/tool messages first to fit the cap,
+            # preserving the system prompt, any summary, and the latest user.
+            while len(candidate) > self.max_history_messages:
+                drop_idx: int | None = None
+                for i in range(len(first_system), len(candidate)):
+                    if i == len(first_system) and candidate[i].role == "system":
+                        continue  # keep summary
+                    if candidate[i].role in {"tool", "assistant"}:
+                        drop_idx = i
+                        break
+                if drop_idx is None:
+                    break
+                candidate.pop(drop_idx)
+            # Last resort: drop the summary if we still cannot fit.
+            while len(candidate) > self.max_history_messages and len(candidate) > len(first_system):
+                candidate.pop(len(first_system))
+            self.state.history = candidate
 
-        prior_turns = self.state.history[len(first_system) : latest_user_index]
-        current_turn = self.state.history[latest_user_index:]
-
-        budget = self.max_history_messages - len(first_system)
-        # Give the current turn most of the budget; leave one slot for the summary.
-        current_budget = max(1, budget - 1)
-        if len(current_turn) > current_budget:
-            # Trim from the front of the current turn but never drop the user message.
-            excess = len(current_turn) - current_budget
-            current_turn = [current_turn[0]] + current_turn[excess + 1 :]
-            while current_turn and current_turn[0].role in {"tool", "assistant"}:
-                current_turn = current_turn[1:]
-
-        summary = self._summarize_prior_turns(prior_turns)
-
-        # Ensure the current turn starts with a message the model can respond to.
-        while current_turn and current_turn[0].role in {"tool", "assistant"}:
-            current_turn = current_turn[1:]
-
-        if summary and len(first_system) + len(current_turn) + 1 <= self.max_history_messages:
-            self.state.history = first_system + [summary] + current_turn
-        else:
-            self.state.history = first_system + current_turn
-
-    def _latest_user_index(self) -> int | None:
-        for index in range(len(self.state.history) - 1, -1, -1):
-            if self.state.history[index].role == "user":
-                return index
-        return None
+        # Third: token-budget trim by importance, preserving system + latest user.
+        token_budget = min(
+            self.context_window_tokens,
+            int(self.context_window_tokens * self.compact_threshold_percent / 100),
+        )
+        self.state.history = trim_messages_to_budget(
+            self.state.history,
+            token_budget,
+            preserve_system=True,
+            preserve_latest_user=True,
+        )
 
     def _summarize_prior_turns(self, messages: list[LLMMessage]) -> LLMMessage | None:
         if not messages or not self.history_summary_enabled:
             return None
         facts = self._extract_facts(messages)
-        # Preserve the last assistant reply from each prior turn so the model
-        # knows the outcome without replaying the whole tool conversation.
         prior_outcomes: list[str] = []
         for message in reversed(messages):
             if message.role == "assistant" and message.content:
@@ -507,9 +605,8 @@ class MarcusLoop:
 
     @property
     def context_tokens(self) -> int:
-        """Conservative estimate of retained messages sent on the next request."""
-        serialized = orjson.dumps([message.to_openai() for message in self.state.history])
-        return max(1, (len(serialized) + 3) // 4)
+        """More accurate per-message token estimate for retained history."""
+        return max(1, sum(estimate_message_tokens(m) for m in self.state.history))
 
     @property
     def context_percent(self) -> float:
@@ -518,20 +615,37 @@ class MarcusLoop:
     def compact_history(self) -> tuple[int, int]:
         before = self.context_tokens
         target = self.context_window_tokens * self.compact_target_percent // 100
-        original_limit = self.max_history_messages
+
+        # First pass: summarize old prior turns into a compact system message.
+        if self.history_summary_enabled and len(self.state.history) > 4:
+            first_system = [self.state.history[0]] if self.state.history[0].role == "system" else []
+            latest_user_index = next(
+                (
+                    i
+                    for i in range(len(self.state.history) - 1, -1, -1)
+                    if self.state.history[i].role == "user"
+                ),
+                None,
+            )
+            if latest_user_index is not None and latest_user_index > len(first_system) + 1:
+                prior_turns = self.state.history[len(first_system) : latest_user_index]
+                current_turn = self.state.history[latest_user_index:]
+                summary = self._summarize_prior_turns(prior_turns)
+                if summary:
+                    self.state.history = first_system + [summary] + current_turn
+
+        # Second pass: importance-based token trimming until we hit target.
         while self.context_tokens > target and len(self.state.history) > 4:
             previous = self.context_tokens
-            # Compaction must be aggressive enough to actually shrink context.
-            # Drop the limit below the current turn size when necessary, but
-            # _trim_history still preserves the system prompt and latest user.
-            self.max_history_messages = max(
-                3, min(self.max_history_messages - 5, len(self.state.history) // 2)
+            self.state.history = trim_messages_to_budget(
+                self.state.history,
+                target,
+                preserve_system=True,
+                preserve_latest_user=True,
             )
-            self._trim_history()
             if self.context_tokens >= previous:
-                # No further reduction possible; stop before looping forever.
                 break
-        self.max_history_messages = original_limit
+
         after = self.context_tokens
         if after < before:
             self.usage.compactions += 1
@@ -561,9 +675,7 @@ class MarcusLoop:
         if hasattr(self.ui, "refresh_status"):
             self.ui.refresh_status()
 
-    def _plan_tool_calls(
-        self, tool_calls: list[ToolCall]
-    ) -> tuple[list[ToolCall], list[ToolCall]]:
+    def _plan_tool_calls(self, tool_calls: list[ToolCall]) -> tuple[list[ToolCall], list[ToolCall]]:
         """Select which tool calls from one LLM response may execute.
 
         Mutation calls run one at a time. Read-only calls may run concurrently
@@ -593,9 +705,7 @@ class MarcusLoop:
                 rejected.append(call)
         return selected, rejected
 
-    def _policy_reason_for_rejected(
-        self, call: ToolCall, selected_calls: list[ToolCall]
-    ) -> str:
+    def _policy_reason_for_rejected(self, call: ToolCall, selected_calls: list[ToolCall]) -> str:
         tool = self.tools_by_name.get(call.name)
         if tool is None:
             return f"unknown tool: {call.name}"
@@ -643,7 +753,19 @@ class MarcusLoop:
         async def _run_read_only(call: ToolCall) -> tuple[str, dict]:
             if call.id in results:
                 return call.id, results[call.id]
+            tool = self.tools_by_name.get(call.name)
+            cache_key: tuple[str, str] | None = None
+            if tool is not None and tool.idempotent:
+                cache_key = (call.name, self._cache_key_for_arguments(call.arguments))
+                cached = self.state.tool_result_cache.get(cache_key)
+                if cached is not None:
+                    self.ui.print_tool_call(call.name, call.arguments)
+                    if hasattr(self.ui, "print_tool_result"):
+                        self.ui.print_tool_result(call.name, cached)
+                    return call.id, cached
             observation = await self._invoke_tool_handler(call)
+            if cache_key is not None:
+                self.state.tool_result_cache[cache_key] = observation
             return call.id, observation
 
         read_only_results = await asyncio.gather(
@@ -662,6 +784,10 @@ class MarcusLoop:
             results[call.id] = await self._process_tool_call(call)
 
         return [(call, results[call.id]) for call in selected_calls]
+
+    @staticmethod
+    def _cache_key_for_arguments(arguments: dict[str, Any]) -> str:
+        return orjson.dumps(arguments, option=orjson.OPT_SORT_KEYS).decode()
 
     async def _invoke_tool_handler(self, call: ToolCall) -> dict:
         """Execute a single tool call without approval or policy checks.

@@ -102,7 +102,9 @@ async def _cmd_retry(ctx: CommandContext, args: str) -> None:
     if not previous:
         ctx.ui.print_error("no previous task to retry")
         return
-    ctx.ui.print_info(f"Retrying previous task: {previous[:80]}{'...' if len(previous) > 80 else ''}")
+    ctx.ui.print_info(
+        f"Retrying previous task: {previous[:80]}{'...' if len(previous) > 80 else ''}"
+    )
     await ctx.loop.run_turn(previous)
 
 
@@ -147,10 +149,7 @@ async def _cmd_save(ctx: CommandContext, args: str) -> None:
 
     path_arg = args.strip()
     default = (
-        Path.home()
-        / ".marcus"
-        / "sessions"
-        / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.md"
+        Path.home() / ".marcus" / "sessions" / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.md"
     )
     path = Path(path_arg) if path_arg else default
     if hasattr(ctx.ui, "save_turn"):
@@ -174,7 +173,9 @@ async def _cmd_theme(ctx: CommandContext, args: str) -> None:
     valid = {"dark", "light", "high-contrast", "no-color"}
     if not value:
         current = "no-color" if getattr(ctx.ui, "_no_color", False) else "dark"
-        ctx.ui.print_info(f"Current theme: {current} (available: dark, light, high-contrast, no-color)")
+        ctx.ui.print_info(
+            f"Current theme: {current} (available: dark, light, high-contrast, no-color)"
+        )
         return
     if value not in valid:
         ctx.ui.print_error(f"unknown theme: {value!r} (choose: {', '.join(valid)})")
@@ -182,8 +183,11 @@ async def _cmd_theme(ctx: CommandContext, args: str) -> None:
     if not hasattr(ctx.ui, "set_theme"):
         ctx.ui.print_error("theme switching is not supported by this UI")
         return
-    ctx.ui.set_theme(value)  # type: ignore[attr-defined]
-    ctx.ui.print_info(f"Theme switched to {value!r}.")
+    from marcus_code.ui import ThemeName
+
+    theme_value: ThemeName = value  # type: ignore[assignment]
+    ctx.ui.set_theme(theme_value)
+    ctx.ui.print_info(f"Theme switched to {theme_value!r}.")
 
 
 async def _cmd_edit(ctx: CommandContext, args: str) -> None:
@@ -280,7 +284,6 @@ COMMANDS: dict[str, CommandHandler] = {
     "/exit": _cmd_exit,
     "/quit": _cmd_exit,
 }
-
 
 
 async def dispatch(ctx: CommandContext, raw: str) -> bool:
