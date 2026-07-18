@@ -723,20 +723,9 @@ class TerminalUI:
         self.finish_steps(success=False)
         self._last_guardrail = reason
         self._guardrail_collapsed = True
-        hint = "Try /continue to resume, /retry to start over, or /last to see this message again."
-        content = (
-            f"[{self.theme.error}] stopped: {escape(reason)}[/]\n\n"
-            f"[{self.theme.muted}]{hint}[/{self.theme.muted}]"
-        )
         self.console.print(
-            Panel(
-                content,
-                title="Guardrail Stop",
-                border_style=self.theme.error,
-            )
-        )
-        self.console.print(
-            f"[{self.theme.muted}]↳ Ctrl+E expand · Ctrl+R collapse[/{self.theme.muted}]"
+            f"[{self.theme.error}]↳ guardrail stop: {escape(reason)}[/{self.theme.error}] "
+            f"[{self.theme.muted}](Ctrl+E expand · Ctrl+R collapse)[/{self.theme.muted}]"
         )
 
     def print_interrupted(self) -> None:
@@ -806,8 +795,13 @@ class TerminalUI:
         """Show a live 'think...' indicator while the LLM is working."""
         self._thinking = True
         self._thinking_start = datetime.now().timestamp()
-        if self.console.is_terminal:
+        if self.console.is_terminal and self._step_lines:
             self._refresh_steps()
+        elif self.console.is_terminal:
+            # No steps yet; just print a transient thinking line that will be
+            # replaced by the working box once the first tool call arrives.
+            self.console.print(f"[{self.theme.muted}]think...[/{self.theme.muted}]", end="\r")
+            self.console.file.flush()
         else:
             self.console.print(f"[{self.theme.muted}]think...[/{self.theme.muted}]", end="")
             self.console.file.flush()
@@ -899,6 +893,9 @@ class TerminalUI:
 
     def finish_steps(self, *, success: bool) -> None:
         if not self._step_lines:
+            # Still stop any active live panel so transient thinking lines don't
+            # leak into the final output.
+            self._stop_live()
             return
         self._last_step_lines = list(self._step_lines)
         self._stop_live()
@@ -909,7 +906,11 @@ class TerminalUI:
                 f"[{self.theme.muted}](Ctrl+E expand · Ctrl+R collapse)[/{self.theme.muted}]"
             )
         else:
-            self.console.print(self._steps_renderable())
+            self._steps_collapsed = True
+            self.console.print(
+                f"[{self.theme.error}]↳ stopped after {self._tool_count}x step[/{self.theme.error}] "
+                f"[{self.theme.muted}](Ctrl+E expand · Ctrl+R collapse)[/{self.theme.muted}]"
+            )
         self._step_lines = []
         self._tool_count = 0
 
@@ -919,15 +920,22 @@ class TerminalUI:
             self.print_info("No completed task steps in this session yet.")
             return
         self._steps_collapsed = False
+        # Temporarily swap in the saved lines so _steps_renderable can reuse its
+        # truncation-aware layout logic, then restore the running state.
+        saved_step_lines = list(self._step_lines)
+        saved_tool_count = self._tool_count
+        self._step_lines = list(lines)
+        self._tool_count = len([line for line in lines if line.startswith(("→ ", "✓ ", "x "))])
         self.console.print(
-            Panel(
-                "\n".join(escape(line) for line in lines),
-                title="Last task steps · Ctrl+R to collapse",
-                border_style=self.theme.border,
-            )
+            self._steps_renderable(title="Last task steps · Ctrl+R to collapse")
         )
+        self.console.print(
+            f"[{self.theme.muted}]↳ Ctrl+R collapse[/{self.theme.muted}]"
+        )
+        self._step_lines = saved_step_lines
+        self._tool_count = saved_tool_count
 
-    def _steps_renderable(self) -> Panel:
+    def _steps_renderable(self, *, title: str | None = None) -> Panel:
         lines: list[str] = []
         max_width = max(20, self.console.size.width - 8)
         for entry in self._step_lines:
@@ -940,9 +948,10 @@ class TerminalUI:
         hidden = max(0, len(lines) - max_lines)
         if hidden:
             lines = [f"… {hidden} earlier line(s) hidden; use /steps"] + lines[-(max_lines - 1) :]
+        panel_title = title or f"Working · {self._tool_count} step(s) · Ctrl+R collapse"
         return Panel(
             "\n".join(escape(line) for line in lines),
-            title=f"Working · {self._tool_count} step(s) · Ctrl+R collapse",
+            title=panel_title,
             border_style=self.theme.border,
         )
 
@@ -993,13 +1002,14 @@ class TerminalUI:
 
     def _refresh_steps(self) -> None:
         renderable = self._working_renderable()
-        if self._live is None:
-            self._live = Live(
-                renderable, console=self.console, refresh_per_second=8, transient=True
-            )
-            self._live.start()
-        else:
-            self._live.update(renderable, refresh=True)
+        # Ensure we never stack multiple Live instances on top of each other.
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+        self._live = Live(
+            renderable, console=self.console, refresh_per_second=8, transient=True
+        )
+        self._live.start()
 
     def _pause_live(self) -> None:
         if self._live is not None:

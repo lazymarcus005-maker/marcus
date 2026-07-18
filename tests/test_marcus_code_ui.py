@@ -86,20 +86,22 @@ def test_thinking_indicator_prints_and_replaces_with_timing():
     assert "thought: 1.23s" in output
 
 
-def test_tool_call_shows_action_and_exact_invocation():
+def test_tool_call_collapses_when_finished_unsuccessfully():
     ui, stream = _capturing_ui()
 
     ui.print_tool_call("run_cli", {"command": "curl http://localhost:5234/"})
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "Run command" in output
-    assert "run_cli(command='curl http://localhost:5234/')" in output
+    assert "stopped after 1x step" in output
+    assert "Ctrl+E expand" in output
+    assert "Ctrl+R collapse" in output
 
 
-def test_command_result_shows_exit_code_and_stdout_evidence():
+def test_command_result_collapses_and_steps_expands():
     ui, stream = _capturing_ui()
 
+    ui.print_tool_call("run_cli", {"command": "echo '{\"usd\":100,\"thb\":3550}'"})
     ui.print_tool_result(
         "run_cli",
         {"exit_code": 0, "stdout": '{"usd":100,"thb":3550}', "stderr": ""},
@@ -107,24 +109,36 @@ def test_command_result_shows_exit_code_and_stdout_evidence():
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "Command finished with exit code 0" in output
-    assert '"usd":100' in output
-    assert '"thb":3550' in output
+    assert "stopped after 1x step" in output
+    assert "Ctrl+E expand" in output
+
+    ui.print_steps()
+    expanded = stream.getvalue()
+    assert "Command finished with exit code 0" in expanded
+    assert '"usd":100' in expanded
+    assert '"thb":3550' in expanded
 
 
-def test_process_results_show_identifiers_and_status():
+def test_process_results_collapses_and_steps_expands():
     ui, stream = _capturing_ui()
 
+    ui.print_tool_call("start_process", {"command": "node server.js"})
     ui.print_tool_result(
         "start_process",
         {"status": "running", "process_id": "abc123def456", "pid": 42},
     )
+    ui.print_tool_call("stop_process", {"process_id": "abc123def456"})
     ui.print_tool_result("stop_process", {"process_id": "abc123def456", "status": "stopped"})
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "process abc123def456, PID 42" in output
-    assert "Service stopped (process abc123def456)" in output
+    assert "stopped after 2x step" in output
+    assert "Ctrl+E expand" in output
+
+    ui.print_steps()
+    expanded = stream.getvalue()
+    assert "process abc123def456, PID 42" in expanded
+    assert "Service stopped (process abc123def456)" in expanded
 
 
 def test_final_answer_has_spacing_heading_and_content():
@@ -166,6 +180,7 @@ def test_success_collapses_steps_and_steps_command_restores_details():
     assert "run_cli(command='pytest -q')" in expanded
     assert "10 passed" in expanded
     assert "Ctrl+R to collapse" in expanded
+    assert "Ctrl+R collapse" in expanded
 
 
 def test_working_box_keeps_latest_lines_visible_when_terminal_is_short():
@@ -177,8 +192,12 @@ def test_working_box_keeps_latest_lines_visible_when_terminal_is_short():
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "earlier line(s) hidden; use /steps" in output
-    assert "file-7.txt" in output
+    assert "stopped after 8x step" in output
+
+    ui.print_steps()
+    expanded = stream.getvalue()
+    assert "earlier line(s) hidden; use /steps" in expanded
+    assert "file-7.txt" in expanded
 
 
 def test_status_bar_shows_retained_context_usage_and_session_details():
