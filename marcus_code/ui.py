@@ -95,8 +95,12 @@ ThemeName = Literal["dark", "light", "high-contrast", "no-color"]
 
 @dataclass
 class Theme:
-    """Named styles used by TerminalUI instead of hard-coded markup colors."""
+    """Design tokens for TerminalUI — semantic colors + a small glyph
+    vocabulary. All surfaces pull styling from here so switching themes
+    (dark/light/high-contrast/no-color) stays visually consistent.
+    """
 
+    # Semantic colors
     info: str = "cyan"
     error: str = "red"
     success: str = "green"
@@ -104,7 +108,9 @@ class Theme:
     accent: str = "bold cyan"
     muted: str = "dim"
     prompt: str = "bold #5fd7ff"
-    border: str = "cyan"
+    # Softer border for surrounding panels — the previous "cyan" competed
+    # with content colors; grey37 recedes so eyes land on data first.
+    border: str = "grey37"
     toolbar_bg: str = "#1f1f1f"
     toolbar_fg: str = "#c8c8c8"
     approval_prompt: str = "#F2B880"
@@ -113,10 +119,20 @@ class Theme:
     status_warn: str = "yellow"
     status_caution: str = "#F2B880"
     status_bad: str = "#F28B82"
+
+    # Glyph vocabulary — all UI ideograms come from here so no-color mode
+    # falls back cleanly to ASCII without per-callsite branching.
     bar_fill: str = "█"
     bar_empty: str = "░"
     success_glyph: str = "✓"
-    fail_glyph: str = "x"
+    fail_glyph: str = "×"
+    arrow: str = "▸"
+    bullet: str = "•"
+    active_dot: str = "●"
+    pending_dot: str = "○"
+    spinner: str = "⋯"
+    sep: str = "·"
+    rule: str = "─"
 
     @classmethod
     def dark(cls) -> "Theme":
@@ -126,7 +142,7 @@ class Theme:
     def light(cls) -> "Theme":
         return cls(
             prompt="bold #0066cc",
-            border="blue",
+            border="grey58",
             toolbar_bg="#e8e8e8",
             toolbar_fg="#222222",
         )
@@ -173,6 +189,13 @@ class Theme:
             bar_empty="-",
             success_glyph="*",
             fail_glyph="x",
+            arrow=">",
+            bullet="-",
+            active_dot="*",
+            pending_dot=".",
+            spinner="...",
+            sep="|",
+            rule="-",
         )
         return theme
 
@@ -345,79 +368,114 @@ class TerminalUI:
         # marcus_code/banner.py's module docstring for why that distinction
         # matters here).
         logo = Text.from_ansi(render_banner())
-        # ~10px-equivalent margin around the logo art (terminal cells have no
-        # true px, so 1 row / 2 columns is the closest analogue); the bottom
-        # pad also does the job the old blank Text("") separator did.
         logo_padded = Padding(logo, (1, 2))
         profile = profile_email or "(run /usage login)"
-        version_line = (
-            f"[bold]Version[/bold] : {escape(marcus_version.ljust(20))} |  "
-            if marcus_version
-            else ""
-        )
+
+        # Single-column key/value block, aligned by longest label. Reads
+        # top-to-bottom instead of the old two-column table that broke on
+        # narrow terminals and forced awkward ljust(20) padding.
+        rows: list[tuple[str, str]] = [
+            ("Workspace", str(root)),
+            ("Model", model),
+            ("Provider", provider_url),
+            ("Mode", mode),
+            ("Profile", profile),
+            ("Session", session_name),
+        ]
+        label_width = max(len(label) for label, _ in rows)
+        info_lines = [
+            f"[bold]{label.ljust(label_width)}[/bold]  {escape(value)}"
+            for label, value in rows
+        ]
         info = Text.from_markup(
-            f"[{self.theme.muted}]AI-powered coding agent   (Harness Recipe via Marcus)[/{self.theme.muted}]\n\n"
-            f"[bold]Workspace[/bold] : {escape(str(root))}\n"
-            f"[bold]Model[/bold]     : {escape(model.ljust(20))} |  "
-            f"[bold]Provider[/bold] : {escape(provider_url)}\n"
-            f"{version_line}"
-            f"[bold]Mode[/bold]      : {escape(mode.ljust(20))} |  "
-            f"[bold]Profile[/bold]  : {escape(profile)}\n"
-            f"[bold]Session[/bold]   : {escape(session_name)}"
+            f"[{self.theme.muted}]AI-powered coding agent {self.theme.sep} "
+            f"Harness Recipe via Marcus[/{self.theme.muted}]\n\n"
+            + "\n".join(info_lines)
         )
         body = Group(logo_padded, info)
+        panel_title = "Marcus Code"
+        if marcus_version:
+            panel_title = f"Marcus Code (V{marcus_version})"
 
-        # Panel.fit sizes exactly to content; measure that natural size and
-        # widen the box by 10% on top of it per user request.
+        # Fit-then-nudge: measure natural width, add breathing room, and
+        # never overflow the terminal. Prior implementation multiplied by
+        # 1.1 which added padding proportional to logo width; a fixed
+        # +4 gutter reads the same on wide/narrow terminals.
         measurement = Measurement.get(self.console, self.console.options, body)
-        natural_panel_width = measurement.maximum + 4  # 1-char border + (0,1) padding, each side
-        panel_width = min(round(natural_panel_width * 1.1), self.console.width)
+        panel_width = min(measurement.maximum + 8, self.console.width)
         self.console.print(
             Panel(
                 body,
-                title="Marcus Code",
+                title=panel_title,
                 title_align="left",
                 border_style=self.theme.border,
                 width=panel_width,
+                padding=(0, 2),
             )
         )
-        self.console.print("Type a task or /help for commands.")
+        self.console.print(
+            f"[{self.theme.muted}]  Type a task, or /help for commands.[/{self.theme.muted}]"
+        )
 
     def print_help(self) -> None:
-        table = Table(title="Slash Commands", border_style=self.theme.border, show_lines=True)
-        table.add_column("Command", style=self.theme.accent, no_wrap=True)
-        table.add_column("Arguments", style=self.theme.muted)
-        table.add_column("Description", style="default")
+        arg_hints: dict[str, str] = {
+            "/model": "[name]",
+            "/usage": "[login|logout]",
+            "/clear": "[--all]",
+            "/mode": "[ask|agent|auto|yolo]",
+            "/config": "[edit]",
+            "/theme": "[dark|light|high-contrast|no-color]",
+            "/save": "[path]",
+        }
+        categories = command_categories()
 
-        # Map simple commands to their category display order.
-        for category, names in command_categories().items():
-            table.add_row(f"[bold]{category}[/bold]", "", "", style=self.theme.muted)
+        # Rich Table with no visible borders — gives us adaptive column
+        # widths and clean wrap behavior when the description overflows,
+        # instead of the previous ljust approach that only worked when the
+        # widest hint fit inside the terminal.
+        table = Table.grid(padding=(0, 3), pad_edge=False)
+        # Signature column stays on one line so each command keeps its own
+        # row; the description column takes the remaining terminal width and
+        # wraps with a hanging indent.
+        table.add_column(justify="left", no_wrap=True)
+        table.add_column(justify="left", overflow="fold", ratio=1)
+
+        first_category = True
+        for category, names in categories.items():
+            if not first_category:
+                table.add_row("", "")
+            first_category = False
+            table.add_row(
+                Text.from_markup(f"[{self.theme.accent}]{category}[/{self.theme.accent}]"),
+                "",
+            )
             for name in names:
+                hint = arg_hints.get(name, "")
+                signature = f"{name} {hint}" if hint else name
                 desc = command_description(name)
-                args = ""
-                if name == "/model":
-                    args = "[name]"
-                elif name == "/usage":
-                    args = "[login|logout]"
-                elif name == "/clear":
-                    args = "[--all]"
-                elif name == "/mode":
-                    args = "[ask|agent|auto|yolo]"
-                elif name == "/config":
-                    args = "[edit]"
-                elif name == "/theme":
-                    args = "[dark|light|high-contrast|no-color]"
-                elif name == "/save":
-                    args = "[path]"
-                table.add_row(f"  {name}", args, desc)
+                table.add_row(
+                    Text.from_markup(f"  {escape(signature)}"),
+                    Text.from_markup(
+                        f"[{self.theme.muted}]{escape(desc)}[/{self.theme.muted}]"
+                    ),
+                )
 
-        self.console.print(table)
-        self.console.print(
-            f"[{self.theme.muted}]Otherwise, just type what you want done — Marcus will "
-            "read/search/edit files in the working directory and ask before anything risky.["
-            + self.theme.muted
-            + "]"
-        )
+        blocks: list[Any] = [
+            Text.from_markup(
+                f"[bold]Slash commands[/bold] "
+                f"[{self.theme.muted}]{self.theme.sep} "
+                f"prefix any input with / to run a command[/{self.theme.muted}]"
+            ),
+            Text(""),
+            table,
+            Text(""),
+            Text.from_markup(
+                f"[{self.theme.muted}]Otherwise, type a task — Marcus will read, search, "
+                f"and edit files in the working directory, asking before anything "
+                f"risky.[/{self.theme.muted}]"
+            ),
+        ]
+        self.console.print(Group(*blocks))
 
     def print_info(self, message: str) -> None:
         self.console.print(f"[{self.theme.info}]{escape(message)}[/{self.theme.info}]")
@@ -432,15 +490,27 @@ class TerminalUI:
     def print_config(self, settings: Settings) -> None:
         key = settings.llm_api_key
         masked = f"{'*' * 8}{key[-4:]}" if len(key) > 4 else "(not set)"
+        rows = [
+            ("Base URL", settings.llm_base_url),
+            ("Model", settings.llm_model),
+            ("API key", masked),
+        ]
+        label_width = max(len(label) for label, _ in rows)
+        body = "\n".join(
+            f"[bold]{label.ljust(label_width)}[/bold]  {escape(value)}"
+            for label, value in rows
+        )
+        hint = (
+            f"\n\n[{self.theme.muted}]Use /config edit to change these for this session "
+            f"(saved to ~/.marcus/config.toml).[/{self.theme.muted}]"
+        )
         self.console.print(
             Panel.fit(
-                f"[bold]Base URL[/bold] : {escape(settings.llm_base_url)}\n"
-                f"[bold]Model[/bold]    : {escape(settings.llm_model)}\n"
-                f"[bold]API key[/bold]  : {escape(masked)}\n\n"
-                f"[{self.theme.muted}]Use /config edit to change these for this session "
-                "(saved to ~/.marcus/config.toml).[/" + self.theme.muted + "]",
-                title="Current Config",
+                body + hint,
+                title="Current config",
+                title_align="left",
                 border_style=self.theme.border,
+                padding=(0, 2),
             )
         )
 
@@ -488,19 +558,29 @@ class TerminalUI:
             if max_total_tokens is None
             else f"{max(0, max_total_tokens - stats.total_tokens):,}"
         )
+        rows = [
+            ("LLM calls", str(stats.llm_calls)),
+            ("Prompt tokens", f"{stats.prompt_tokens:,}"),
+            ("Completion tokens", f"{stats.completion_tokens:,}"),
+            ("Total tokens", f"{stats.total_tokens:,}"),
+            ("Token budget", budget),
+            ("Remaining tokens", remaining),
+            ("LLM time", f"{stats.elapsed_seconds:.1f}s"),
+            ("Throughput", f"{stats.tokens_per_second:.1f} tok/s"),
+            ("Session time", f"{elapsed:.0f}s"),
+        ]
+        label_width = max(len(label) for label, _ in rows)
+        body = "\n".join(
+            f"[bold]{label.ljust(label_width)}[/bold]  {escape(value)}"
+            for label, value in rows
+        )
         self.console.print(
             Panel.fit(
-                f"[bold]LLM calls[/bold]         : {stats.llm_calls}\n"
-                f"[bold]Prompt tokens[/bold]     : {stats.prompt_tokens:,}\n"
-                f"[bold]Completion tokens[/bold] : {stats.completion_tokens:,}\n"
-                f"[bold]Total tokens[/bold]      : {stats.total_tokens:,}\n"
-                f"[bold]Token budget[/bold]      : {budget}\n"
-                f"[bold]Remaining tokens[/bold]  : {remaining}\n"
-                f"[bold]LLM time[/bold]          : {stats.elapsed_seconds:.1f}s\n"
-                f"[bold]Throughput[/bold]        : {stats.tokens_per_second:.1f} tok/s\n"
-                f"[bold]Session time[/bold]      : {elapsed:.0f}s",
+                body,
                 title="Usage",
+                title_align="left",
                 border_style=self.theme.border,
+                padding=(0, 2),
             )
         )
 
@@ -514,7 +594,9 @@ class TerminalUI:
                     )
                 ),
                 title="Ollama Cloud Usage",
+                title_align="left",
                 border_style=self.theme.border,
+                padding=(0, 2),
             )
         )
 
@@ -626,30 +708,42 @@ class TerminalUI:
         used = status["context_tokens"]
         limit = max(1, status["context_limit"])
         ratio = min(1.0, used / limit)
-        filled = round(ratio * 20)
-        bar = self.theme.bar_fill * filled + self.theme.bar_empty * (20 - filled)
+        # Narrower bar (14 cells vs 20) — the numeric ratio next to it
+        # already carries the precision, so the visual bar just has to say
+        # "roughly how full."
+        filled = round(ratio * 14)
+        bar = self.theme.bar_fill * filled + self.theme.bar_empty * (14 - filled)
+        sep = "  "
+        # Two lines instead of three. Session + context + mode on top,
+        # model + throughput + workspace below. Same information density,
+        # fewer rows anchored to the prompt.
         line_one = (
-            f"Session {hours:02d}:{minutes:02d}:{seconds:02d} │ "
-            f"Context [{bar}] ~{_format_tokens(used)}/{_format_tokens(limit)}"
+            f"Session {hours:02d}:{minutes:02d}:{seconds:02d}{sep}"
+            f"Context [{bar}] ~{_format_tokens(used)}/{_format_tokens(limit)}{sep}"
+            f"Mode {status['mode']}"
         )
         line_two = (
-            f"Model {status['model']} │ Used {_format_tokens(status['total_tokens'])} tok │ "
-            f"{status['tokens_per_second']:.1f} tok/s │ Mode {status['mode']}"
+            f"Model {status['model']}{sep}"
+            f"Used {_format_tokens(status['total_tokens'])} tok{sep}"
+            f"{status['tokens_per_second']:.1f} tok/s{sep}"
+            f"Workspace {status['workspace']}"
         )
-        line_three = f"Workspace {status['workspace']}"
         return [
             (
                 "class:bottom-toolbar.text",
-                f"\n{line_one}\n{line_two}\n{line_three}",
+                f"\n{line_one}\n{line_two}",
             )
         ]
 
     def print_recovery(self, message: str) -> None:
+        glyph = "↻" if not self._no_color else "~"
         if self._turn_active:
-            self._working_lines.append(f"↻ {self._compact_line(message, 180)}")
+            self._working_lines.append(f"{glyph} {self._compact_line(message, 180)}")
             self._refresh_steps()
             return
-        self.console.print(f"[{self.theme.warning}]↻ {escape(message)}[/{self.theme.warning}]")
+        self.console.print(
+            f"[{self.theme.warning}]{glyph} {escape(message)}[/{self.theme.warning}]"
+        )
 
     async def aclose(self) -> None:
         self._stop_live()
@@ -686,7 +780,7 @@ class TerminalUI:
         if self._turn_active:
             label = "plan" if text.lstrip().lower().startswith("plan") else "note"
             compact = self._compact_line(text, 180)
-            self._working_lines.append(f"• {label}: {compact}")
+            self._working_lines.append(f"{self.theme.bullet} {label}: {compact}")
             self._step_lines.append(f"{label}: {text}")
             self._refresh_steps()
             return
@@ -710,16 +804,18 @@ class TerminalUI:
         summary = _summarize_arguments(arguments)
         action = _tool_action(tool_name)
         self._tool_count += 1
-        self._step_lines.extend([f"→ {action}", f"  {tool_name}({summary})"])
+        arrow = self.theme.arrow
+        self._step_lines.extend([f"{arrow} {action}", f"  {tool_name}({summary})"])
         compact_args = self._compact_line(summary, 120)
-        suffix = f" · {compact_args}" if compact_args else ""
+        suffix = f" {self.theme.sep} {compact_args}" if compact_args else ""
         self._working_lines.append(f"{self._tool_count}. {action}{suffix}")
         self._refresh_steps()
 
     def print_tool_result(self, tool_name: str, result: dict) -> None:
         summary = _tool_result_summary(tool_name, result)
-        self._step_lines.append(f"✓ {summary}")
-        self._working_lines.append(f"   ✓ {self._compact_line(summary, 160)}")
+        glyph = self.theme.success_glyph
+        self._step_lines.append(f"{glyph} {summary}")
+        self._working_lines.append(f"   {glyph} {self._compact_line(summary, 160)}")
         for label in ("stdout", "stderr"):
             output = result.get(label)
             if not output:
@@ -731,25 +827,35 @@ class TerminalUI:
         self._refresh_steps()
 
     def print_tool_error(self, tool_name: str, error: str) -> None:
-        self._step_lines.append(f"x {tool_name}: {error}")
-        self._working_lines.append(f"   × {tool_name}: {self._compact_line(error, 140)}")
+        glyph = self.theme.fail_glyph
+        self._step_lines.append(f"{glyph} {tool_name}: {error}")
+        self._working_lines.append(
+            f"   {glyph} {tool_name}: {self._compact_line(error, 140)}"
+        )
         self._refresh_steps()
 
     def print_tool_declined(self, tool_name: str) -> None:
-        self._step_lines.append(f"x {tool_name} declined by user")
-        self._working_lines.append(f"   × {tool_name} declined")
+        glyph = self.theme.fail_glyph
+        self._step_lines.append(f"{glyph} {tool_name} declined by user")
+        self._working_lines.append(f"   {glyph} {tool_name} declined")
         self._refresh_steps()
 
     def print_guardrail_stop(self, reason: str) -> None:
         self.finish_steps(success=False)
         self._last_guardrail = reason
         self._guardrail_collapsed = True
-        self.console.print(f"[{self.theme.error}]guardrail: {escape(reason)}[/{self.theme.error}]")
+        glyph = self.theme.fail_glyph
+        self.console.print(
+            f"[{self.theme.error}]{glyph} guardrail {self.theme.sep} "
+            f"{escape(reason)}[/{self.theme.error}]"
+        )
 
     def print_interrupted(self) -> None:
         self.finish_steps(success=False)
+        glyph = self.theme.fail_glyph
         self.console.print(
-            f"[{self.theme.warning}]interrupted - back to prompt[/{self.theme.warning}]"
+            f"[{self.theme.warning}]{glyph} interrupted {self.theme.sep} "
+            f"back to prompt[/{self.theme.warning}]"
         )
 
     def register_interrupt(self) -> bool:
@@ -788,7 +894,12 @@ class TerminalUI:
             self._refresh_steps()
 
     def _todo_renderable(self) -> Text:
-        """Render the current workflow phase pipeline."""
+        """Phase pipeline as a subtle breadcrumb.
+
+        Done phases render in success color; the current phase is
+        accent-highlighted; upcoming phases stay muted. The separator uses
+        the theme's ``sep`` glyph so it degrades gracefully in no-color mode.
+        """
         text = Text()
         if self._todo is None:
             return text
@@ -801,17 +912,17 @@ class TerminalUI:
             Phase.validate: "ตรวจสอบ",
             Phase.deliver: "ส่งมอบ",
         }
+        sep = f" {self.theme.sep} "
         for index, phase in enumerate(order):
             label = labels.get(phase, phase.value)
-            if self._todo.is_done(phase):
-                if self._todo.current == phase and not self._todo.finished:
-                    text.append(f"[{label}]", style=f"bold {self.theme.accent}")
-                else:
-                    text.append(f"[{label}]", style=f"{self.theme.muted}")
+            if self._todo.current == phase and not self._todo.finished:
+                text.append(label, style=self.theme.accent)
+            elif self._todo.is_done(phase):
+                text.append(label, style=self.theme.success)
             else:
-                text.append(f"[{label}]", style=self.theme.muted)
+                text.append(label, style=self.theme.muted)
             if index < len(order) - 1:
-                text.append(" → ", style=self.theme.muted)
+                text.append(sep, style=self.theme.muted)
         return text
 
     def start_thinking(self) -> None:
@@ -836,8 +947,10 @@ class TerminalUI:
         self.console.print(
             Panel(
                 f"[{self.theme.error}]{escape(self._last_guardrail)}[/{self.theme.error}]",
-                title="Last Guardrail Stop",
+                title=f"{self.theme.fail_glyph} Last guardrail stop",
+                title_align="left",
                 border_style=self.theme.error,
+                padding=(0, 1),
             )
         )
 
@@ -903,19 +1016,20 @@ class TerminalUI:
         self._last_step_lines = list(self._step_lines)
         self._stop_live()
         self._turn_active = False
-        detail_hint = " · /steps" if self._last_step_lines else ""
+        sep = self.theme.sep
+        detail_hint = f" {sep} /steps" if self._last_step_lines else ""
+        count = f" {sep} {self._tool_count} tool(s)" if self._tool_count else ""
+        self._steps_collapsed = True
         if success:
-            self._steps_collapsed = True
-            count = f" · {self._tool_count} tool(s)" if self._tool_count else ""
+            glyph = self.theme.success_glyph
             self.console.print(
-                f"[{self.theme.success}]✓ done{count}[/{self.theme.success}]"
+                f"[{self.theme.success}]{glyph} done{count}[/{self.theme.success}]"
                 f"[{self.theme.muted}]{detail_hint}[/{self.theme.muted}]"
             )
         else:
-            self._steps_collapsed = True
-            count = f" · {self._tool_count} tool(s)" if self._tool_count else ""
+            glyph = self.theme.fail_glyph
             self.console.print(
-                f"[{self.theme.error}]× stopped{count}[/{self.theme.error}]"
+                f"[{self.theme.error}]{glyph} stopped{count}[/{self.theme.error}]"
                 f"[{self.theme.muted}]{detail_hint}[/{self.theme.muted}]"
             )
         self._step_lines = []
@@ -933,7 +1047,14 @@ class TerminalUI:
         saved_step_lines = list(self._step_lines)
         saved_tool_count = self._tool_count
         self._step_lines = list(lines)
-        self._tool_count = len([line for line in lines if line.startswith(("→ ", "✓ ", "x "))])
+        step_prefixes = (
+            f"{self.theme.arrow} ",
+            f"{self.theme.success_glyph} ",
+            f"{self.theme.fail_glyph} ",
+        )
+        self._tool_count = len(
+            [line for line in lines if line.startswith(step_prefixes)]
+        )
         self.console.print(self._steps_renderable(title="Last steps"))
         self._step_lines = saved_step_lines
         self._tool_count = saved_tool_count
@@ -950,12 +1071,16 @@ class TerminalUI:
         max_lines = max(4, self.console.size.height - 10)
         hidden = max(0, len(lines) - max_lines)
         if hidden:
-            lines = [f"… {hidden} earlier line(s) hidden; use /steps"] + lines[-(max_lines - 1) :]
-        panel_title = title or f"Steps · {self._tool_count} tool(s)"
+            lines = [
+                f"{self.theme.spinner} {hidden} earlier line(s) hidden; use /steps"
+            ] + lines[-(max_lines - 1) :]
+        panel_title = title or f"Steps {self.theme.sep} {self._tool_count} tool(s)"
         return Panel(
             "\n".join(escape(line) for line in lines),
             title=panel_title,
+            title_align="left",
             border_style=self.theme.border,
+            padding=(0, 1),
         )
 
     def _status_renderable(self) -> Text:
@@ -971,13 +1096,15 @@ class TerminalUI:
         filled = round(ratio * 20)
         bar = self.theme.bar_fill * filled + self.theme.bar_empty * (20 - filled)
         color = self._status_color(ratio)
+        sep = f" {self.theme.sep} "
         text = Text()
-        text.append(f"Session {hours:02d}:{minutes:02d}:{seconds:02d} │ Context ")
+        text.append(f"Session {hours:02d}:{minutes:02d}:{seconds:02d}{sep}Context ")
         text.append(f"[{bar}]", style=color)
-        text.append(f" ~{_format_tokens(used)}/{_format_tokens(limit)}\n")
+        text.append(f" ~{_format_tokens(used)}/{_format_tokens(limit)}{sep}Mode {status['mode']}\n")
         text.append(
-            f"Model {status['model']} │ Used {_format_tokens(status['total_tokens'])} tok │ "
-            f"{status['tokens_per_second']:.1f} tok/s │ Mode {status['mode']}\n"
+            f"Model {status['model']}{sep}"
+            f"Used {_format_tokens(status['total_tokens'])} tok{sep}"
+            f"{status['tokens_per_second']:.1f} tok/s\n"
         )
         text.append(f"Workspace {status['workspace']}", style=self.theme.muted)
         return text
@@ -996,24 +1123,36 @@ class TerminalUI:
         if self._thinking:
             elapsed = datetime.now().timestamp() - self._thinking_start
             activity = "streaming" if self._streaming else "thinking"
-            lines.append(f"… {activity} {elapsed:.1f}s")
+            lines.append(f"{self.theme.spinner} {activity} {elapsed:.1f}s")
         elif self._streaming:
-            lines.append("… streaming")
+            lines.append(f"{self.theme.spinner} streaming")
         elif not lines:
-            lines.append("… preparing")
+            lines.append(f"{self.theme.spinner} preparing")
 
-        max_lines = max(3, self.console.size.height - 8)
+        # Extra reserved rows account for panel border, phase breadcrumb,
+        # a blank spacer, the subtitle, and space for the prompt below.
+        max_lines = max(3, self.console.size.height - 10)
         hidden = max(0, len(lines) - max_lines)
         if hidden:
-            lines = [f"… {hidden} earlier step(s) · /steps"] + lines[-(max_lines - 1) :]
+            lines = [
+                f"{self.theme.spinner} {hidden} earlier step(s) {self.theme.sep} /steps"
+            ] + lines[-(max_lines - 1) :]
 
-        phase = self._todo.label() if self._todo is not None else "กำลังทำงาน"
-        count = f" · {self._tool_count} tool(s)" if self._tool_count else ""
-        title = f"Marcus · {phase}{count}"
+        step_body = Text.from_markup("\n".join(escape(line) for line in lines))
+        if self._todo is not None:
+            # Breadcrumb-then-rule-then-steps gives the eye a stable header
+            # regardless of how much churn is happening in the step list.
+            body: Group | Text = Group(self._todo_renderable(), Text(""), step_body)
+        else:
+            body = step_body
+
+        count = f" {self.theme.sep} {self._tool_count} tool(s)" if self._tool_count else ""
+        title = f"Marcus Code{count}"
         subtitle = self._working_status_line()
         return Panel(
-            "\n".join(escape(line) for line in lines),
+            body,
             title=title,
+            title_align="left",
             subtitle=subtitle or None,
             border_style=self.theme.border,
             padding=(0, 1),
@@ -1081,36 +1220,29 @@ class TerminalUI:
             risk = risk_level(command)
             warning = command_warning(command)
 
-        content_lines = [
-            f"Tool: {tool.name}",
-            f"Risk: {risk}",
-        ]
+        # Inline layout instead of a bordered panel: risk pill on the left,
+        # tool name and arguments to the right, so the eye lands on what's
+        # about to happen without decoding a boxed table first.
+        risk_style, risk_glyph = self._risk_style(risk)
+        header = (
+            f"[{risk_style}]{risk_glyph} risk: {risk}[/{risk_style}]"
+            f"  [bold]{escape(tool.name)}[/bold]"
+        )
         if summary:
-            content_lines.append(f"Arguments: {summary}")
+            header += f"  [{self.theme.muted}]{self.theme.sep} {escape(summary)}[/{self.theme.muted}]"
+        self.console.print(header)
         if warning:
-            content_lines.append(f"Warning: {warning}")
-
-        border = (
-            self.theme.error
-            if risk == "high"
-            else self.theme.warning
-            if risk == "medium"
-            else self.theme.border
-        )
-        self.console.print(
-            Panel(
-                "\n".join(content_lines),
-                title="Allow this tool call? (y)es / (n)o / (a)lways for this session",
-                border_style=border,
+            self.console.print(
+                f"  [{self.theme.warning}]{self.theme.arrow} warning: "
+                f"{escape(warning)}[/{self.theme.warning}]"
             )
-        )
 
         if tool.name == EDIT_FILE_TOOL_NAME:
             self._print_edit_diff(arguments)
 
         while True:
             try:
-                answer = self.console.input("Answer: ").strip().lower()
+                answer = self.console.input(self._approval_prompt).strip().lower()
             except (KeyboardInterrupt, EOFError):
                 self._resume_live()
                 return "no"
@@ -1123,7 +1255,17 @@ class TerminalUI:
             if answer in ("a", "always"):
                 self._resume_live()
                 return "always"
-            self.console.print(f"[{self.theme.muted}]please answer y, n, or a[/{self.theme.muted}]")
+            self.console.print(
+                f"[{self.theme.muted}]please answer y, n, or a[/{self.theme.muted}]"
+            )
+
+    def _risk_style(self, risk: str) -> tuple[str, str]:
+        """Colour + glyph for the risk pill on the approval header."""
+        if risk == "high":
+            return self.theme.error, self.theme.fail_glyph
+        if risk == "medium":
+            return self.theme.warning, self.theme.arrow
+        return self.theme.success, self.theme.success_glyph
 
     def _clear_approval_prompt(self, answer: str) -> None:
         if not self.console.is_terminal:

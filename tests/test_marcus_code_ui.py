@@ -430,14 +430,21 @@ def test_banner_shows_provider_next_to_model_and_profile_email(tmp_path):
     )
 
     output = stream.getvalue()
+    # Single-column key/value layout: each label sits on its own row so
+    # narrow terminals no longer clip the second column mid-word.
     assert "Model" in output and "gpt-oss:120b" in output
     assert "Provider" in output and "https://ollama.com/v1" in output
     assert "Profile" in output and "user@example.com" in output
-    assert "gpt-oss:120b         |  Provider" in output
-    assert "agent                |  Profile" in output
+    # Labels are aligned by longest ("Workspace" / "Provider" / "Session")
+    # via ljust, so each label is followed by at least one space before
+    # the value — verify that alignment rather than the pipe divider.
+    assert "Workspace  " in output
+    assert "Model      " in output
+    assert "Provider   " in output
+    assert "Session    " in output
 
 
-def test_banner_shows_version_when_provided(tmp_path):
+def test_banner_shows_version_in_panel_title_when_provided(tmp_path):
     ui, stream = _capturing_ui()
 
     ui.print_banner(
@@ -451,7 +458,8 @@ def test_banner_shows_version_when_provided(tmp_path):
     )
 
     output = stream.getvalue()
-    assert "Version" in output and "1.2.3" in output
+    assert "Marcus Code (V1.2.3)" in output
+    assert "Version" not in output
 
 
 def test_theme_dataclass_exposes_named_styles():
