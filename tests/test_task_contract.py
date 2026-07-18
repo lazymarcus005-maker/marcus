@@ -56,9 +56,7 @@ def test_short_workspace_commands_enter_agentic_read_mode():
 
 
 def test_plan_only_request_is_read_only_even_when_it_mentions_improvement():
-    contract = derive_task_contract(
-        "ช่วยวิเคราะห์ code และวางแผนปรับปรุง แต่ยังไม่ต้องแก้โค้ด"
-    )
+    contract = derive_task_contract("ช่วยวิเคราะห์ code และวางแผนปรับปรุง แต่ยังไม่ต้องแก้โค้ด")
 
     assert contract.kind == TaskKind.explain
     assert contract.response_mode == ResponseMode.agentic
@@ -91,6 +89,4 @@ def test_thai_test_request_has_command_capability():
 
 def test_run_tests_is_evidence_and_command_substrings_are_not():
     assert is_verification_evidence("run_tests", {}, {"exit_code": 0, "stdout": "2 passed"})
-    assert not is_verification_evidence(
-        "run_cli", {"command": "echo latest"}, {"exit_code": 0}
-    )
+    assert not is_verification_evidence("run_cli", {"command": "echo latest"}, {"exit_code": 0})

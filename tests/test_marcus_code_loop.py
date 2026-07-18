@@ -777,9 +777,7 @@ async def test_mutation_invalidates_cached_read_result():
     contract = TaskContract(
         kind=TaskKind.change,
         response_mode=ResponseMode.agentic,
-        capabilities=frozenset(
-            {Capability.workspace_read, Capability.workspace_write}
-        ),
+        capabilities=frozenset({Capability.workspace_read, Capability.workspace_write}),
         requires_plan=True,
         verification_policy=VerificationPolicy.none,
     )

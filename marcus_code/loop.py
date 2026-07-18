@@ -205,9 +205,7 @@ class MarcusLoop:
         if system_prompt:
             self.state.history.append(LLMMessage(role="system", content=system_prompt))
 
-    async def run_turn(
-        self, user_input: str, *, contract: TaskContract | None = None
-    ) -> None:
+    async def run_turn(self, user_input: str, *, contract: TaskContract | None = None) -> None:
         if hasattr(self.ui, "begin_turn"):
             self.ui.begin_turn()
         continuing = contract is not None
@@ -272,12 +270,8 @@ class MarcusLoop:
                 )
                 planning_phase = contract.requires_plan and not plan_shown
                 active_specs = [] if planning_phase else self._active_tool_specs(contract)
-                if not planning_phase and self._verification_is_impossible(
-                    contract, active_specs
-                ):
-                    self.state.last_turn_guardrail = (
-                        "task requires verification, but no compatible verification tool is available"
-                    )
+                if not planning_phase and self._verification_is_impossible(contract, active_specs):
+                    self.state.last_turn_guardrail = "task requires verification, but no compatible verification tool is available"
                     if hasattr(self.ui, "stop_thinking"):
                         self.ui.stop_thinking(0.0)
                     self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
@@ -301,7 +295,10 @@ class MarcusLoop:
                 if finalization_hint:
                     call_messages.append(LLMMessage(role="system", content=finalization_hint))
                 evidence = self.state.verification_evidence
-                if evidence is not None and evidence.workspace_revision == self.state.workspace_revision:
+                if (
+                    evidence is not None
+                    and evidence.workspace_revision == self.state.workspace_revision
+                ):
                     call_messages.append(
                         LLMMessage(
                             role="system",
@@ -420,9 +417,7 @@ class MarcusLoop:
                             f"active ({process_ids}). Stop every process you started before finishing."
                         )
                         continue
-                    self.state.last_turn_guardrail = (
-                        "final answer blocked: background processes started by this turn are still active"
-                    )
+                    self.state.last_turn_guardrail = "final answer blocked: background processes started by this turn are still active"
                     self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
                     return
                 evidence = self.state.verification_evidence
@@ -474,7 +469,9 @@ class MarcusLoop:
             if response.content and not planning_phase:
                 self.ui.print_assistant(response.content)
 
-            if all(is_verification_attempt(call.name, call.arguments) for call in response.tool_calls):
+            if all(
+                is_verification_attempt(call.name, call.arguments) for call in response.tool_calls
+            ):
                 tracker.advance(Phase.validate, "เรียกเครื่องมือตรวจสอบ")
                 self.state.active_phase = Phase.validate
             else:
@@ -596,10 +593,7 @@ class MarcusLoop:
                     # During identical-call recovery the LLM is being given a chance
                     # to change strategy, so a single non-identical outcome should
                     # reset the no-progress counter rather than stop immediately.
-                    if (
-                        identical_call_last_key is not None
-                        and key != identical_call_last_key
-                    ):
+                    if identical_call_last_key is not None and key != identical_call_last_key:
                         outcome_fingerprints.clear()
                         outcome_fingerprints.append(fingerprint)
                     else:

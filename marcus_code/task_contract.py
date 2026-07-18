@@ -100,7 +100,9 @@ _INFORMATIONAL = re.compile(
     r"(?i)^\s*(?:please\s+)?(?:what|why|how|when|where|which|explain|describe|tell\s+me)\b"
     r"|^\s*(?:ช่วย)?(?:อธิบาย|บอก|อะไร|ทำไม|อย่างไร|คืออะไร)"
 )
-_WEB = re.compile(r"(?i)\b(web|website|url|http|https|online|documentation|docs)\b|(?:เว็บไซต์|เว็บ|เอกสารออนไลน์)")
+_WEB = re.compile(
+    r"(?i)\b(web|website|url|http|https|online|documentation|docs)\b|(?:เว็บไซต์|เว็บ|เอกสารออนไลน์)"
+)
 
 # Remove explicitly negated mutation phrases before looking for affirmative
 # mutation intent. This deliberately handles both English and common Thai
@@ -208,16 +210,12 @@ def is_verification_evidence(tool_name: str, arguments: dict, observation: dict)
         return observation.get("exit_code") == 0
     if tool_name == "wait_for_http":
         status = observation.get("status")
-        return bool(observation.get("ready")) or (
-            isinstance(status, int) and 200 <= status < 400
-        )
+        return bool(observation.get("ready")) or (isinstance(status, int) and 200 <= status < 400)
     if tool_name == "check_url_health":
         status = observation.get("status")
         return bool(observation.get("healthy")) and (
             status is None or isinstance(status, int) and 200 <= status < 400
         )
     if tool_name == "run_cli":
-        return observation.get("exit_code") == 0 and is_verification_attempt(
-            tool_name, arguments
-        )
+        return observation.get("exit_code") == 0 and is_verification_attempt(tool_name, arguments)
     return False

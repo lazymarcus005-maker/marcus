@@ -142,9 +142,7 @@ def trim_messages_to_count(
         current_count -= len(group)
         if current_count <= max_messages:
             break
-    kept_indices = {
-        index for group_index in keep for index in groups[group_index]
-    }
+    kept_indices = {index for group_index in keep for index in groups[group_index]}
     return [message for index, message in enumerate(messages) if index in kept_indices]
 
 
@@ -197,9 +195,7 @@ def trim_messages_to_budget(
         if current_tokens <= token_budget:
             break
 
-    kept_indices = {
-        index for group_index in keep for index in groups[group_index]
-    }
+    kept_indices = {index for group_index in keep for index in groups[group_index]}
     return [message for index, message in enumerate(messages) if index in kept_indices]
 
 

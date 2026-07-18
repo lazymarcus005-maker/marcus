@@ -744,9 +744,7 @@ class TerminalUI:
         self.finish_steps(success=False)
         self._last_guardrail = reason
         self._guardrail_collapsed = True
-        self.console.print(
-            f"[{self.theme.error}]guardrail: {escape(reason)}[/{self.theme.error}]"
-        )
+        self.console.print(f"[{self.theme.error}]guardrail: {escape(reason)}[/{self.theme.error}]")
 
     def print_interrupted(self) -> None:
         self.finish_steps(success=False)
@@ -1056,9 +1054,7 @@ class TerminalUI:
         if self._live is not None:
             self._live.update(renderable, refresh=True)
             return
-        self._live = Live(
-            renderable, console=self.console, refresh_per_second=8, transient=True
-        )
+        self._live = Live(renderable, console=self.console, refresh_per_second=8, transient=True)
         self._live.start()
 
     def _pause_live(self) -> None:

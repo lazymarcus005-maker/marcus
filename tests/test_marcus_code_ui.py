@@ -135,7 +135,7 @@ def test_tool_call_collapses_when_finished_unsuccessfully():
 def test_command_result_collapses_and_steps_expands():
     ui, stream = _capturing_ui()
 
-    ui.print_tool_call("run_cli", {"command": "echo '{\"usd\":100,\"thb\":3550}'"})
+    ui.print_tool_call("run_cli", {"command": 'echo \'{"usd":100,"thb":3550}\''})
     ui.print_tool_result(
         "run_cli",
         {"exit_code": 0, "stdout": '{"usd":100,"thb":3550}', "stderr": ""},
