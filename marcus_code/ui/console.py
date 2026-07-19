@@ -1,8 +1,11 @@
+import asyncio
+import concurrent.futures
 import difflib
 import math
 import os
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,12 +32,12 @@ from rich.text import Text
 
 from harness.config import Settings
 from harness.runtime.tools import Tool
+from marcus_code.runtime.todo_tracker import Phase, TodoTracker
+from marcus_code.state.config import USER_CONFIG_DIR
+from marcus_code.tools.base import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME
 from marcus_code.ui.banner import render_banner
 from marcus_code.ui.command_info import all_commands, command_categories, command_description
 from marcus_code.ui.warnings import command_warning, risk_level
-from marcus_code.state.config import USER_CONFIG_DIR
-from marcus_code.runtime.todo_tracker import Phase, TodoTracker
-from marcus_code.tools.base import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME
 
 if TYPE_CHECKING:
     from marcus_code.runtime.agent import UsageStats
@@ -603,7 +606,8 @@ class TerminalUI:
         except ImportError:
             return None
         default = current_model if current_model in models else models[0]
-        try:
+
+        def run_menu() -> str | None:
             choice = inquirer.select(
                 message="Select a model:",
                 choices=models,
@@ -611,11 +615,27 @@ class TerminalUI:
                 qmark="›",
                 amark="›",
             ).execute()
+            return str(choice) if choice else None
+
+        try:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return run_menu()
+            # /config edit is handled inside the REPL's asyncio loop, and
+            # InquirerPy's execute() starts its own prompt_toolkit loop, which
+            # cannot nest inside a running one — run the menu on a worker
+            # thread that has no event loop of its own.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(run_menu).result()
         except (KeyboardInterrupt, EOFError):
             raise
-        except Exception:  # noqa: BLE001 - fall back to text on unexpected TTY errors
+        except Exception as exc:  # noqa: BLE001 - fall back to text on unexpected TTY errors
+            self.console.print(
+                f"[{self.theme.muted}]model menu unavailable "
+                f"({escape(str(exc))}); enter one manually.[/{self.theme.muted}]"
+            )
             return None
-        return str(choice) if choice else None
 
     def print_usage(
         self,
@@ -1015,10 +1035,8 @@ class TerminalUI:
 
     def _stop_thinking_status(self) -> None:
         if self._thinking_status is not None:
-            try:
+            with suppress(Exception):
                 self._thinking_status.stop()
-            except Exception:  # noqa: BLE001 - stopping a stale status must not raise
-                pass
             self._thinking_status = None
 
     def print_last_guardrail(self) -> None:

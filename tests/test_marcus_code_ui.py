@@ -517,3 +517,63 @@ def test_run_config_edit_drops_old_key_when_switching_provider(monkeypatch):
 
     # The api.example.com key must not be reused against the Ollama endpoint.
     assert captured["api_key"] == ""
+
+
+class _FakeLoopHostilePrompt:
+    """Mimics InquirerPy/prompt_toolkit: execute() refuses to run when the
+    calling thread already has a running asyncio event loop."""
+
+    def __init__(self, choice: str):
+        self._choice = choice
+
+    def execute(self) -> str:
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._choice
+        raise RuntimeError("Application.run() cannot be called from a running event loop")
+
+
+def _menu_capable_ui(monkeypatch, prompt):
+    """A UI whose TTY checks pass and whose InquirerPy menu is `prompt`."""
+    import sys as sys_module
+
+    from InquirerPy import inquirer
+
+    ui, stream = _capturing_ui()
+    monkeypatch.setattr(type(ui.console), "is_terminal", property(lambda self: True))
+    monkeypatch.setattr(sys_module.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys_module.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(inquirer, "select", lambda **kwargs: prompt)
+    return ui, stream
+
+
+@pytest.mark.asyncio
+async def test_select_model_menu_works_inside_running_event_loop(monkeypatch):
+    # /config edit runs from an async command handler, so the menu is invoked
+    # while the REPL's asyncio loop is running. InquirerPy's execute() starts
+    # its own prompt_toolkit loop, which cannot nest inside a running loop —
+    # the menu must therefore run on a worker thread, not silently fall back
+    # to the manual text prompt.
+    ui, _stream = _menu_capable_ui(monkeypatch, _FakeLoopHostilePrompt("gpt-oss:120b"))
+
+    choice = ui._select_model_from_menu(["gpt-oss:120b", "llama-3.1-70b"], "llama-3.1-70b")
+
+    assert choice == "gpt-oss:120b"
+
+
+def test_select_model_menu_reports_reason_when_menu_fails(monkeypatch):
+    # A real menu failure must say why instead of silently downgrading to the
+    # text prompt (a swallowed exception hid the event-loop bug for a release).
+    class _BrokenPrompt:
+        def execute(self):
+            raise OSError("console handle is invalid")
+
+    ui, stream = _menu_capable_ui(monkeypatch, _BrokenPrompt())
+
+    choice = ui._select_model_from_menu(["m1", "m2"], "m1")
+
+    assert choice is None
+    assert "console handle is invalid" in stream.getvalue()
