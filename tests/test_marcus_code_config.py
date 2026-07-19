@@ -1,7 +1,9 @@
+import httpx
 import pytest
 
 import marcus_code.state.config as config_module
 from marcus_code.state.config import (
+    fetch_available_models,
     has_llm_credentials,
     load_project_instructions,
     load_user_config,
@@ -9,6 +11,21 @@ from marcus_code.state.config import (
     save_user_config,
     validate_base_url,
 )
+
+
+class _FakeResponse:
+    def __init__(self, payload, *, status_error=False):
+        self._payload = payload
+        self._status_error = status_error
+
+    def raise_for_status(self):
+        if self._status_error:
+            raise httpx.HTTPStatusError("boom", request=None, response=None)
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
 
 
 def _point_user_config_at(monkeypatch, tmp_path):
@@ -128,6 +145,43 @@ def test_cli_max_steps_can_be_overridden_by_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("HARNESS_CLI_MAX_STEPS", "150")
 
     assert resolve_settings().cli_max_steps == 150
+
+
+def test_fetch_available_models_returns_sorted_unique_ids(monkeypatch):
+    captured = {}
+
+    def fake_get(url, *, headers, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        return _FakeResponse(
+            {"data": [{"id": "gpt-oss:120b"}, {"id": "deepseek-v3"}, {"id": "gpt-oss:120b"}]}
+        )
+
+    monkeypatch.setattr(config_module.httpx, "get", fake_get)
+
+    models = fetch_available_models("https://ollama.com/v1", "sk-key")
+
+    assert models == ["deepseek-v3", "gpt-oss:120b"]
+    assert captured["url"] == "https://ollama.com/v1/models"
+    assert captured["headers"] == {"Authorization": "Bearer sk-key"}
+
+
+def test_fetch_available_models_returns_empty_on_http_error(monkeypatch):
+    def fake_get(url, *, headers, timeout):
+        raise httpx.ConnectError("no network")
+
+    monkeypatch.setattr(config_module.httpx, "get", fake_get)
+
+    assert fetch_available_models("https://ollama.com/v1", "sk-key") == []
+
+
+def test_fetch_available_models_returns_empty_on_unexpected_payload(monkeypatch):
+    def fake_get(url, *, headers, timeout):
+        return _FakeResponse({"unexpected": "shape"})
+
+    monkeypatch.setattr(config_module.httpx, "get", fake_get)
+
+    assert fetch_available_models("https://ollama.com/v1", "sk-key") == []
 
 
 def test_load_project_instructions_returns_none_when_missing(tmp_path):

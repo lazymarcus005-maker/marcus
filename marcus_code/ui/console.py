@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 
 _SLASH_COMMANDS: tuple[str, ...] = all_commands()
 
+# Ollama Cloud is Marcus's default provider; /config edit falls back to this
+# endpoint when no base URL is configured yet.
+DEFAULT_OLLAMA_BASE_URL = "https://ollama.com/v1"
+
 
 class SlashCommandAutoSuggest(AutoSuggest):
     """Auto-suggest slash commands as the user types.
@@ -483,6 +487,18 @@ class TerminalUI:
     def print_error(self, message: str) -> None:
         self.console.print(f"[{self.theme.error}]{escape(message)}[/{self.theme.error}]")
 
+    def warn_missing_credentials(self) -> None:
+        """Prominent reminder shown whenever no LLM API key is configured.
+
+        Marcus can't reach any model without one, so this is surfaced at
+        startup and again before every turn until a key is set.
+        """
+        self.console.print(
+            f"[{self.theme.warning}]⚠ No LLM API key configured — set one before continuing. "
+            f"Run /config edit to add a key (or export HARNESS_LLM_API_KEY)."
+            f"[/{self.theme.warning}]"
+        )
+
     def clear_screen(self) -> None:
         """Clear the terminal screen (ANSI clear + home cursor)."""
         self.console.clear()
@@ -504,31 +520,89 @@ class TerminalUI:
         )
 
     def run_config_edit(
-        self, *, current_base_url: str, current_model: str, has_existing_key: bool
+        self,
+        *,
+        current_base_url: str,
+        current_model: str,
+        has_existing_key: bool,
+        current_api_key: str = "",
     ) -> tuple[str | None, str, str] | None:
         """Prompt to edit LLM config, prefilled with current values. Returns
         (api_key_or_None, base_url, model); api_key is None when the user
         left it blank to keep the existing key. Returns None if cancelled.
+
+        Defaults to the Ollama Cloud endpoint. After the API key is provided,
+        the available models are fetched from the provider and offered as an
+        arrow-key menu so the user selects one instead of typing it.
         """
+        default_base_url = current_base_url or DEFAULT_OLLAMA_BASE_URL
         self._print_heading("Edit config")
         self.console.print(
             f"[{self.theme.muted}]Press Enter to keep the current value.[/{self.theme.muted}]"
         )
         try:
             base_url = (
-                self.console.input(f"LLM base URL (current: {escape(current_base_url)}): ").strip()
-                or current_base_url
+                self.console.input(f"LLM base URL (current: {escape(default_base_url)}): ").strip()
+                or default_base_url
             )
             key_hint = "leave blank to keep current" if has_existing_key else "required"
             api_key = self.console.input(f"LLM API key ({key_hint}): ").strip()
-            model = (
-                self.console.input(f"LLM model (current: {escape(current_model)}): ").strip()
-                or current_model
-            )
+            effective_key = api_key or current_api_key
+            model = self._select_model(base_url, effective_key, current_model)
         except (KeyboardInterrupt, EOFError):
             self.console.print(f"\n[{self.theme.warning}]edit cancelled[/{self.theme.warning}]")
             return None
         return (api_key or None, base_url, model)
+
+    def _select_model(self, base_url: str, api_key: str, current_model: str) -> str:
+        """Fetch the provider's models and let the user pick one from a menu.
+
+        Falls back to a manual text prompt when the catalog can't be listed
+        (offline, bad key, non-OpenAI endpoint) or there is no interactive TTY.
+        """
+        from marcus_code.state.config import fetch_available_models
+
+        self.console.print(
+            f"[{self.theme.muted}]Fetching available models from "
+            f"{escape(base_url)} …[/{self.theme.muted}]"
+        )
+        models = fetch_available_models(base_url, api_key)
+        if models:
+            choice = self._select_model_from_menu(models, current_model)
+            if choice is not None:
+                return choice
+        else:
+            self.console.print(
+                f"[{self.theme.warning}]Could not list models automatically; "
+                f"enter one manually.[/{self.theme.warning}]"
+            )
+        return (
+            self.console.input(f"LLM model (current: {escape(current_model)}): ").strip()
+            or current_model
+        )
+
+    def _select_model_from_menu(self, models: list[str], current_model: str) -> str | None:
+        """Arrow-key menu of model ids; None when no interactive menu is available."""
+        if not (self.console.is_terminal and sys.stdin.isatty() and sys.stdout.isatty()):
+            return None
+        try:
+            from InquirerPy import inquirer
+        except ImportError:
+            return None
+        default = current_model if current_model in models else models[0]
+        try:
+            choice = inquirer.select(
+                message="Select a model:",
+                choices=models,
+                default=default,
+                qmark="›",
+                amark="›",
+            ).execute()
+        except (KeyboardInterrupt, EOFError):
+            raise
+        except Exception:  # noqa: BLE001 - fall back to text on unexpected TTY errors
+            return None
+        return str(choice) if choice else None
 
     def print_usage(
         self,

@@ -452,10 +452,14 @@ class _FakeUI:
         self.setup_result = None
         self.assistant = []
         self.banner_calls = []
+        self.credential_warnings = 0
         self.__class__.instances.append(self)
 
     def run_first_time_setup(self, **kwargs):
         return self.setup_result
+
+    def warn_missing_credentials(self):
+        self.credential_warnings += 1
 
     def print_banner(self, *args, **kwargs):
         self.banner_calls.append((args, kwargs))
@@ -578,6 +582,50 @@ async def test_amain_closes_gateway_when_turn_raises(patched_cli, monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         await cli._amain("hello")
     assert _FakeGateway.instances[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_amain_prompt_warns_and_skips_when_no_credentials(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _FakeUI.instances.clear()
+    _FakeGateway.instances.clear()
+    ui = _FakeUI()
+    ui.setup_result = None  # user skips first-time setup
+    monkeypatch.setattr(cli, "TerminalUI", lambda **kwargs: ui)
+    monkeypatch.setattr(cli, "LLMGateway", _FakeGateway)
+    monkeypatch.setattr(cli, "build_marcus_tools", lambda root, settings: [])
+    monkeypatch.setattr(cli, "load_project_instructions", lambda root: None)
+    monkeypatch.setattr(cli, "resolve_settings", lambda: Settings(llm_api_key="changeme"))
+    monkeypatch.setattr(cli, "has_llm_credentials", lambda value: value.llm_api_key != "changeme")
+
+    await cli._amain("hello")
+
+    # Warned at least once (startup + before the doomed turn) and never ran it.
+    assert ui.credential_warnings >= 1
+    assert ui.assistant == []
+    assert _FakeGateway.instances[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_amain_repl_warns_before_each_turn_when_no_credentials(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _FakeUI.instances.clear()
+    _FakeGateway.instances.clear()
+    ui = _FakeUI()
+    ui.setup_result = None
+    ui.inputs = iter(["do something", "/exit"])
+    monkeypatch.setattr(cli, "TerminalUI", lambda **kwargs: ui)
+    monkeypatch.setattr(cli, "LLMGateway", _FakeGateway)
+    monkeypatch.setattr(cli, "build_marcus_tools", lambda root, settings: [])
+    monkeypatch.setattr(cli, "load_project_instructions", lambda root: None)
+    monkeypatch.setattr(cli, "resolve_settings", lambda: Settings(llm_api_key="changeme"))
+    monkeypatch.setattr(cli, "has_llm_credentials", lambda value: value.llm_api_key != "changeme")
+
+    await cli._amain()
+
+    # Startup warning + one per attempted turn; the turn itself never ran.
+    assert ui.credential_warnings >= 2
+    assert ui.assistant == []
 
 
 @pytest.mark.asyncio

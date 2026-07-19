@@ -25,7 +25,9 @@ LOGO_TEXT = "MARCUS CODE"
 TAGLINE = "Plan. Build. Verify."
 
 _BLUE = "\x1b[94m"
-_RED = "\x1b[91m"
+# Faint dim-gray tagline — deliberately muted so it recedes behind the logo
+# (SGR 2 "faint" + bright-black; terminals that ignore SGR 2 still show gray).
+_FAINT = "\x1b[2;90m"
 _CYAN = "\x1b[96m"
 _RESET = "\x1b[0m"
 
@@ -91,6 +93,6 @@ def render_banner(*, force_fancy: bool | None = None) -> str:
     art_lines = [f"{_BLUE}{line}{_RESET}" for line in rows]
     # Left-aligned, flush with the logo's left edge (no centering) — matches
     # the tagline against the art instead of floating it in the middle.
-    tagline = f"{_RED}{TAGLINE}{_RESET}"
+    tagline = f"{_FAINT}{TAGLINE}{_RESET}"
     underline = f"{_CYAN}{'─' * width}{_RESET}"
     return "\n".join([*art_lines, tagline, underline])

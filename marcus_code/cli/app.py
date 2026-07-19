@@ -615,6 +615,8 @@ async def _amain(
         profile_email=profile_email,
         marcus_version=_current_version(),
     )
+    if not has_llm_credentials(settings) and hasattr(ui, "warn_missing_credentials"):
+        ui.warn_missing_credentials()
 
     llm = LLMGateway(settings=settings)
     tools = build_marcus_tools(root, settings)
@@ -656,6 +658,10 @@ async def _amain(
 
     try:
         if prompt is not None:
+            if not has_llm_credentials(ctx.settings):
+                if hasattr(ui, "warn_missing_credentials"):
+                    ui.warn_missing_credentials()
+                return
             try:
                 await loop.run_turn(prompt)
             finally:
@@ -678,6 +684,12 @@ async def _amain(
                 should_continue = await dispatch(ctx, stripped)
                 if not should_continue:
                     break
+                continue
+            # A key can be added mid-session via /config edit, so re-check the
+            # live ctx.settings before every turn rather than the startup value.
+            if not has_llm_credentials(ctx.settings):
+                if hasattr(ui, "warn_missing_credentials"):
+                    ui.warn_missing_credentials()
                 continue
             try:
                 await loop.run_turn(user_input)

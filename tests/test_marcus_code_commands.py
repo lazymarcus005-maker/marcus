@@ -36,12 +36,15 @@ class _FakeUI:
     def print_config(self, settings):
         self.config_shown.append(settings)
 
-    def run_config_edit(self, *, current_base_url, current_model, has_existing_key):
+    def run_config_edit(
+        self, *, current_base_url, current_model, has_existing_key, current_api_key=""
+    ):
         self.config_edit_calls.append(
             {
                 "current_base_url": current_base_url,
                 "current_model": current_model,
                 "has_existing_key": has_existing_key,
+                "current_api_key": current_api_key,
             }
         )
         return self._config_edit_result

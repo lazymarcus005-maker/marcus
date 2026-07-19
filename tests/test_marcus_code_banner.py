@@ -26,7 +26,7 @@ def test_render_banner_fancy_includes_ansi_colors_and_tagline():
     output = render_banner(force_fancy=True)
 
     assert "\x1b[94m" in output  # bright blue for the art
-    assert "\x1b[91m" in output  # bright red for the tagline
+    assert "\x1b[2;90m" in output  # faint dim-gray for the tagline
     assert "\x1b[96m" in output  # bright cyan for the underline
     assert "\x1b[0m" in output  # reset
     assert TAGLINE in output
@@ -38,7 +38,7 @@ def test_render_banner_fancy_tagline_is_left_aligned_with_the_logo():
 
     # No leading spaces before the color code + text — flush with the art's
     # left edge, not centered within its width.
-    assert tagline_line == f"\x1b[91m{TAGLINE}\x1b[0m"
+    assert tagline_line == f"\x1b[2;90m{TAGLINE}\x1b[0m"
 
 
 def test_render_banner_fancy_has_cyan_underline_below_tagline():

@@ -259,6 +259,7 @@ async def _cmd_config(ctx: CommandContext, args: str) -> None:
             current_base_url=ctx.settings.llm_base_url,
             current_model=ctx.settings.llm_model,
             has_existing_key=has_llm_credentials(ctx.settings),
+            current_api_key=ctx.settings.llm_api_key if has_llm_credentials(ctx.settings) else "",
         )
         if result is None:
             return

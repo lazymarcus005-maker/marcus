@@ -4,6 +4,8 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
+
 from harness.config import Settings
 
 USER_CONFIG_DIR = Path.home() / ".marcus"
@@ -53,6 +55,34 @@ def save_user_config(*, api_key: str, base_url: str, model: str) -> Path:
     with contextlib.suppress(OSError):
         os.chmod(USER_CONFIG_FILE, 0o600)
     return USER_CONFIG_FILE
+
+
+def fetch_available_models(base_url: str, api_key: str, *, timeout: float = 10.0) -> list[str]:
+    """List model ids from an OpenAI-compatible ``{base_url}/models`` endpoint.
+
+    Ollama Cloud (https://ollama.com/v1) and every other OpenAI-compatible
+    provider expose the catalog here, authenticated with the API key as a
+    bearer token. Returns a sorted, de-duplicated list of model ids, or an
+    empty list on any network/parse failure so callers can fall back to a
+    manual text prompt.
+    """
+    url = base_url.rstrip("/") + "/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        response = httpx.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return []
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    models = {
+        str(item["id"])
+        for item in items
+        if isinstance(item, dict) and item.get("id")
+    }
+    return sorted(models)
 
 
 def validate_base_url(base_url: str) -> str:
