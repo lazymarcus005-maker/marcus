@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 import orjson
 from prompt_toolkit import PromptSession
@@ -535,19 +536,31 @@ class TerminalUI:
         the available models are fetched from the provider and offered as an
         arrow-key menu so the user selects one instead of typing it.
         """
-        default_base_url = current_base_url or DEFAULT_OLLAMA_BASE_URL
         self._print_heading("Edit config")
         self.console.print(
-            f"[{self.theme.muted}]Press Enter to keep the current value.[/{self.theme.muted}]"
+            f"[{self.theme.muted}]Ollama Cloud is the default provider — press Enter to accept "
+            f"it.[/{self.theme.muted}]"
         )
         try:
+            # Default the base URL to Ollama Cloud regardless of the current
+            # value: this is an Ollama-first tool, so Enter should land on
+            # Ollama, not silently keep a previously configured endpoint.
             base_url = (
-                self.console.input(f"LLM base URL (current: {escape(default_base_url)}): ").strip()
-                or default_base_url
+                self.console.input(
+                    f"LLM base URL (Enter for Ollama {escape(DEFAULT_OLLAMA_BASE_URL)}): "
+                ).strip()
+                or DEFAULT_OLLAMA_BASE_URL
             )
-            key_hint = "leave blank to keep current" if has_existing_key else "required"
+            # A key from a different provider won't authenticate against the new
+            # endpoint, so require a fresh key whenever the host changes.
+            switching_provider = urlparse(base_url).hostname != urlparse(current_base_url).hostname
+            key_hint = (
+                "leave blank to keep current"
+                if has_existing_key and not switching_provider
+                else "required"
+            )
             api_key = self.console.input(f"LLM API key ({key_hint}): ").strip()
-            effective_key = api_key or current_api_key
+            effective_key = api_key or ("" if switching_provider else current_api_key)
             model = self._select_model(base_url, effective_key, current_model)
         except (KeyboardInterrupt, EOFError):
             self.console.print(f"\n[{self.theme.warning}]edit cancelled[/{self.theme.warning}]")

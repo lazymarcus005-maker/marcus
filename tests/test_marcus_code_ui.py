@@ -466,3 +466,54 @@ def test_history_path_creates_user_config_dir(tmp_path, monkeypatch):
     path = _history_path()
     assert path.parent.exists()
     assert path.name == "history"
+
+
+def test_run_config_edit_defaults_base_url_to_ollama_on_enter(monkeypatch):
+    ui, _stream = _capturing_ui()
+    # Blank base URL -> Ollama default; then a fresh key.
+    inputs = iter(["", "sk-ollama"])
+    monkeypatch.setattr(ui.console, "input", lambda *a, **k: next(inputs))
+    captured = {}
+
+    def fake_select_model(base_url, api_key, current_model):
+        captured["base_url"] = base_url
+        captured["api_key"] = api_key
+        return "gpt-oss:120b"
+
+    monkeypatch.setattr(ui, "_select_model", fake_select_model)
+
+    result = ui.run_config_edit(
+        current_base_url="https://api.example.com/v1",
+        current_model="llama-3.1-70b",
+        has_existing_key=True,
+        current_api_key="sk-old",
+    )
+
+    assert result == ("sk-ollama", "https://ollama.com/v1", "gpt-oss:120b")
+    assert captured["base_url"] == "https://ollama.com/v1"
+    # The freshly entered key is what the model catalog is fetched with.
+    assert captured["api_key"] == "sk-ollama"
+
+
+def test_run_config_edit_drops_old_key_when_switching_provider(monkeypatch):
+    ui, _stream = _capturing_ui()
+    # Blank base URL -> Ollama (different host from current); blank key.
+    inputs = iter(["", ""])
+    monkeypatch.setattr(ui.console, "input", lambda *a, **k: next(inputs))
+    captured = {}
+
+    def fake_select_model(base_url, api_key, current_model):
+        captured["api_key"] = api_key
+        return current_model
+
+    monkeypatch.setattr(ui, "_select_model", fake_select_model)
+
+    ui.run_config_edit(
+        current_base_url="https://api.example.com/v1",
+        current_model="m0",
+        has_existing_key=True,
+        current_api_key="sk-old",
+    )
+
+    # The api.example.com key must not be reused against the Ollama endpoint.
+    assert captured["api_key"] == ""
