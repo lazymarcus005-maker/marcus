@@ -1,7 +1,7 @@
 import pytest
 
 from harness.db.enums import RiskTier
-from marcus_code.modes import AgentMode, command_requires_approval, tool_requires_approval
+from marcus_code.runtime.modes import AgentMode, command_requires_approval, tool_requires_approval
 
 
 @pytest.mark.parametrize(

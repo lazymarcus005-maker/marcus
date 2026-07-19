@@ -1,4 +1,4 @@
-"""Tests for additional CLI tools in marcus_code.tools_extra."""
+"""Tests for additional CLI tools in marcus_code.tools.extra."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from harness.config import Settings
-from marcus_code.tools_extra import build_marcus_extra_tools
+from marcus_code.tools.extra import build_marcus_extra_tools
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def extra_tools(tmp_path: Path):
 async def test_search_web_returns_results(extra_tools):
     tool = extra_tools["search_web"]
     with patch(
-        "marcus_code.tools_extra._web_search_duckduckgo",
+        "marcus_code.tools.extra._web_search_duckduckgo",
         return_value=[{"title": "Test", "url": "https://example.com", "snippet": "snippet"}],
     ):
         result = await tool.handler({"query": "python async"})

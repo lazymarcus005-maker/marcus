@@ -1,7 +1,7 @@
 import pytest
 
-import marcus_code.config as config_module
-from marcus_code.config import (
+import marcus_code.state.config as config_module
+from marcus_code.state.config import (
     has_llm_credentials,
     load_project_instructions,
     load_user_config,

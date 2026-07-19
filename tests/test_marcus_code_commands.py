@@ -1,12 +1,12 @@
 import pytest
 
-import marcus_code.config as config_module
+import marcus_code.state.config as config_module
 from harness.config import Settings
 from harness.llm.types import LLMMessage
-from marcus_code.commands import CommandContext, dispatch
-from marcus_code.config import save_user_config
-from marcus_code.loop import MarcusLoop
-from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
+from marcus_code.cli.commands import CommandContext, dispatch
+from marcus_code.state.config import save_user_config
+from marcus_code.runtime.agent import MarcusLoop
+from marcus_code.runtime.ollama_usage import OllamaCloudUsage, UsagePeriod
 from tests.fakes import ScriptedLLMGateway, text_response
 
 
@@ -170,7 +170,7 @@ async def test_usage_command_fetches_ollama_cloud_usage(monkeypatch):
             assert interactive is False
             return expected
 
-    monkeypatch.setattr("marcus_code.commands.OllamaCloudUsageClient", _Client)
+    monkeypatch.setattr("marcus_code.cli.commands.OllamaCloudUsageClient", _Client)
     ui = _FakeUI()
     settings = Settings(
         llm_api_key="sk-real",
@@ -190,7 +190,7 @@ async def test_usage_logout_clears_saved_ollama_session(monkeypatch):
         def logout(self):
             return 3
 
-    monkeypatch.setattr("marcus_code.commands.OllamaCloudUsageClient", _Client)
+    monkeypatch.setattr("marcus_code.cli.commands.OllamaCloudUsageClient", _Client)
     ui = _FakeUI()
     settings = Settings(
         llm_api_key="sk-real",

@@ -30,6 +30,8 @@ dependencies = [
     "apscheduler>=3.10.4",
     "rich>=13.7.0",
     "prompt-toolkit>=3.0.43",
+    "typer>=0.12.0",
+    "inquirerpy>=0.3.4",
 ]
 
 [project.urls]
@@ -38,11 +40,14 @@ Repository = "https://github.com/lazymarcus005-maker/marcus"
 Issues = "https://github.com/lazymarcus005-maker/marcus/issues"
 
 [project.scripts]
-marcus = "marcus_code.cli:main"
+marcus = "marcus_code.cli.app:main"
 
 [project.optional-dependencies]
 ollama-usage = [
     "playwright>=1.49.0",
+]
+tui = [
+    "textual>=0.85.0",
 ]
 
 [dependency-groups]

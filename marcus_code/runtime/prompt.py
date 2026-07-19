@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from marcus_code.modes import AgentMode, mode_instructions
+from marcus_code.runtime.modes import AgentMode, mode_instructions
 
 SYSTEM_PROMPT_TEMPLATE = """You are Marcus Code, an interactive CLI coding agent that runs locally in \
 the user's terminal, built on the Harness agent runtime. You read, search, \

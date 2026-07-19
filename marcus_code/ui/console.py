@@ -16,28 +16,28 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from rich.console import ColorSystem, Console, Group
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.measure import Measurement
 from rich.padding import Padding
 from rich.panel import Panel
+from rich.status import Status
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
 from harness.config import Settings
 from harness.runtime.tools import Tool
-from marcus_code.banner import render_banner
-from marcus_code.command_info import all_commands, command_categories, command_description
-from marcus_code.command_warnings import command_warning, risk_level
-from marcus_code.config import USER_CONFIG_DIR
-from marcus_code.todo_tracker import Phase, TodoTracker
-from marcus_code.tools import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME
+from marcus_code.ui.banner import render_banner
+from marcus_code.ui.command_info import all_commands, command_categories, command_description
+from marcus_code.ui.warnings import command_warning, risk_level
+from marcus_code.state.config import USER_CONFIG_DIR
+from marcus_code.runtime.todo_tracker import Phase, TodoTracker
+from marcus_code.tools.base import EDIT_FILE_TOOL_NAME, RUN_CLI_TOOL_NAME, START_PROCESS_TOOL_NAME
 
 if TYPE_CHECKING:
-    from marcus_code.loop import UsageStats
-    from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
+    from marcus_code.runtime.agent import UsageStats
+    from marcus_code.runtime.ollama_usage import OllamaCloudUsage, UsagePeriod
 
 _SLASH_COMMANDS: tuple[str, ...] = all_commands()
 
@@ -222,10 +222,16 @@ def _history_path() -> Path:
 
 
 class TerminalUI:
-    """Presentation layer only — no approval state, no session state.
+    """Append-only terminal renderer.
 
-    The loop owns the "always allow this tool" set; this class just renders
-    and collects one decision per call.
+    All chat surfaces (tool calls, results, thinking, guardrails, final
+    answer) print inline once, in the order they happen — no live-refreshing
+    panel, no boxes. Scrollback and copy/paste behave like a normal shell,
+    which matches Claude Code / Codex CLI style.
+
+    The banner (one-shot at startup) and the prompt_toolkit bottom toolbar
+    (persistent status line, not a panel) are the only remaining
+    non-linear surfaces.
     """
 
     def __init__(self, *, no_color: bool = False) -> None:
@@ -240,9 +246,6 @@ class TerminalUI:
             # Rich's terminal auto-detection (which is unreliable when
             # stdout isn't a real console, e.g. piped/redirected).
             try:
-                # TextIO doesn't expose reconfigure in the base protocol, but
-                # the concrete CPython stream implementation has it on all
-                # platforms we support.
                 getattr(sys.stdout, "reconfigure", lambda **kwargs: None)(
                     encoding="utf-8", errors="replace"
                 )
@@ -257,25 +260,21 @@ class TerminalUI:
             no_color=self._no_color,
         )
         self.mode = "agent"
-        self._step_lines: list[str] = []
-        self._working_lines: list[str] = []
-        self._last_step_lines: list[str] = []
         self._tool_count = 0
         self._thinking: bool = False
         self._thinking_start: float = 0.0
+        self._thinking_status: Status | None = None
         self._last_thought_seconds: float | None = None
         self._todo: TodoTracker | None = None
+        self._last_phase: Phase | None = None
         self._last_guardrail: str | None = None
-        self._stream_buffer: str = ""
         self._streaming: bool = False
         self._turn_active: bool = False
-        self._live: Live | None = None
+        self._last_turn_lines: list[str] = []
         self._status_provider: Callable[[], dict[str, Any]] | None = None
         self._interrupt_count = 0
         self._input_history = FileHistory(str(_history_path()))
         self._prompt_session: PromptSession[str] | None = None
-        self._steps_collapsed: bool = True
-        self._guardrail_collapsed: bool = True
         self._build_prompt_style()
         self._completer = NestedCompleter.from_nested_dict(
             {
@@ -285,7 +284,6 @@ class TerminalUI:
                 "/usage": None,
                 "/mode": {"ask": None, "agent": None, "auto": None, "yolo": None},
                 "/status": None,
-                "/steps": None,
                 "/compact": None,
                 "/retry": None,
                 "/continue": None,
@@ -371,9 +369,6 @@ class TerminalUI:
         logo_padded = Padding(logo, (1, 2))
         profile = profile_email or "(run /usage login)"
 
-        # Single-column key/value block, aligned by longest label. Reads
-        # top-to-bottom instead of the old two-column table that broke on
-        # narrow terminals and forced awkward ljust(20) padding.
         rows: list[tuple[str, str]] = [
             ("Workspace", str(root)),
             ("Model", model),
@@ -397,12 +392,11 @@ class TerminalUI:
         if marcus_version:
             panel_title = f"Marcus Code (V{marcus_version})"
 
-        # Fit-then-nudge: measure natural width, add breathing room, and
-        # never overflow the terminal. Prior implementation multiplied by
-        # 1.1 which added padding proportional to logo width; a fixed
-        # +4 gutter reads the same on wide/narrow terminals.
         measurement = Measurement.get(self.console, self.console.options, body)
         panel_width = min(measurement.maximum + 8, self.console.width)
+        # Banner is one-shot at startup, not a live surface — keeping the
+        # panel here doesn't interfere with scrollback and gives the app a
+        # recognizable header.
         self.console.print(
             Panel(
                 body,
@@ -417,6 +411,18 @@ class TerminalUI:
             f"[{self.theme.muted}]  Type a task, or /help for commands.[/{self.theme.muted}]"
         )
 
+    def _print_heading(self, text: str) -> None:
+        self.console.print(f"[{self.theme.accent}]{escape(text)}[/{self.theme.accent}]")
+
+    def _print_kv_block(self, rows: list[tuple[str, str]]) -> None:
+        if not rows:
+            return
+        label_width = max(len(label) for label, _ in rows)
+        for label, value in rows:
+            self.console.print(
+                f"[bold]{label.ljust(label_width)}[/bold]  {escape(value)}"
+            )
+
     def print_help(self) -> None:
         arg_hints: dict[str, str] = {
             "/model": "[name]",
@@ -429,14 +435,7 @@ class TerminalUI:
         }
         categories = command_categories()
 
-        # Rich Table with no visible borders — gives us adaptive column
-        # widths and clean wrap behavior when the description overflows,
-        # instead of the previous ljust approach that only worked when the
-        # widest hint fit inside the terminal.
         table = Table.grid(padding=(0, 3), pad_edge=False)
-        # Signature column stays on one line so each command keeps its own
-        # row; the description column takes the remaining terminal width and
-        # wraps with a hanging indent.
         table.add_column(justify="left", no_wrap=True)
         table.add_column(justify="left", overflow="fold", ratio=1)
 
@@ -460,22 +459,23 @@ class TerminalUI:
                     ),
                 )
 
-        blocks: list[Any] = [
+        self.console.print(
             Text.from_markup(
                 f"[bold]Slash commands[/bold] "
                 f"[{self.theme.muted}]{self.theme.sep} "
                 f"prefix any input with / to run a command[/{self.theme.muted}]"
-            ),
-            Text(""),
-            table,
-            Text(""),
+            )
+        )
+        self.console.print()
+        self.console.print(table)
+        self.console.print()
+        self.console.print(
             Text.from_markup(
                 f"[{self.theme.muted}]Otherwise, type a task — Marcus will read, search, "
                 f"and edit files in the working directory, asking before anything "
                 f"risky.[/{self.theme.muted}]"
-            ),
-        ]
-        self.console.print(Group(*blocks))
+            )
+        )
 
     def print_info(self, message: str) -> None:
         self.console.print(f"[{self.theme.info}]{escape(message)}[/{self.theme.info}]")
@@ -490,28 +490,17 @@ class TerminalUI:
     def print_config(self, settings: Settings) -> None:
         key = settings.llm_api_key
         masked = f"{'*' * 8}{key[-4:]}" if len(key) > 4 else "(not set)"
-        rows = [
-            ("Base URL", settings.llm_base_url),
-            ("Model", settings.llm_model),
-            ("API key", masked),
-        ]
-        label_width = max(len(label) for label, _ in rows)
-        body = "\n".join(
-            f"[bold]{label.ljust(label_width)}[/bold]  {escape(value)}"
-            for label, value in rows
-        )
-        hint = (
-            f"\n\n[{self.theme.muted}]Use /config edit to change these for this session "
-            f"(saved to ~/.marcus/config.toml).[/{self.theme.muted}]"
+        self._print_heading("Current config")
+        self._print_kv_block(
+            [
+                ("Base URL", settings.llm_base_url),
+                ("Model", settings.llm_model),
+                ("API key", masked),
+            ]
         )
         self.console.print(
-            Panel.fit(
-                body + hint,
-                title="Current config",
-                title_align="left",
-                border_style=self.theme.border,
-                padding=(0, 2),
-            )
+            f"[{self.theme.muted}]Use /config edit to change these for this session "
+            f"(saved to ~/.marcus/config.toml).[/{self.theme.muted}]"
         )
 
     def run_config_edit(
@@ -521,12 +510,9 @@ class TerminalUI:
         (api_key_or_None, base_url, model); api_key is None when the user
         left it blank to keep the existing key. Returns None if cancelled.
         """
+        self._print_heading("Edit config")
         self.console.print(
-            Panel.fit(
-                "Edit LLM configuration. Press Enter to keep the current value.",
-                title="Edit Config",
-                border_style=self.theme.border,
-            )
+            f"[{self.theme.muted}]Press Enter to keep the current value.[/{self.theme.muted}]"
         )
         try:
             base_url = (
@@ -558,47 +544,25 @@ class TerminalUI:
             if max_total_tokens is None
             else f"{max(0, max_total_tokens - stats.total_tokens):,}"
         )
-        rows = [
-            ("LLM calls", str(stats.llm_calls)),
-            ("Prompt tokens", f"{stats.prompt_tokens:,}"),
-            ("Completion tokens", f"{stats.completion_tokens:,}"),
-            ("Total tokens", f"{stats.total_tokens:,}"),
-            ("Token budget", budget),
-            ("Remaining tokens", remaining),
-            ("LLM time", f"{stats.elapsed_seconds:.1f}s"),
-            ("Throughput", f"{stats.tokens_per_second:.1f} tok/s"),
-            ("Session time", f"{elapsed:.0f}s"),
-        ]
-        label_width = max(len(label) for label, _ in rows)
-        body = "\n".join(
-            f"[bold]{label.ljust(label_width)}[/bold]  {escape(value)}"
-            for label, value in rows
-        )
-        self.console.print(
-            Panel.fit(
-                body,
-                title="Usage",
-                title_align="left",
-                border_style=self.theme.border,
-                padding=(0, 2),
-            )
+        self._print_heading("Usage")
+        self._print_kv_block(
+            [
+                ("LLM calls", str(stats.llm_calls)),
+                ("Prompt tokens", f"{stats.prompt_tokens:,}"),
+                ("Completion tokens", f"{stats.completion_tokens:,}"),
+                ("Total tokens", f"{stats.total_tokens:,}"),
+                ("Token budget", budget),
+                ("Remaining tokens", remaining),
+                ("LLM time", f"{stats.elapsed_seconds:.1f}s"),
+                ("Throughput", f"{stats.tokens_per_second:.1f} tok/s"),
+                ("Session time", f"{elapsed:.0f}s"),
+            ]
         )
 
     def print_ollama_cloud_usage(self, usage: "OllamaCloudUsage") -> None:
-        self.console.print(
-            Panel.fit(
-                "\n".join(
-                    (
-                        _format_cloud_usage_line("Session", usage.session, theme=self.theme),
-                        _format_cloud_usage_line("Weekly", usage.weekly, theme=self.theme),
-                    )
-                ),
-                title="Ollama Cloud Usage",
-                title_align="left",
-                border_style=self.theme.border,
-                padding=(0, 2),
-            )
-        )
+        self._print_heading("Ollama Cloud Usage")
+        self.console.print(_format_cloud_usage_line("Session", usage.session, theme=self.theme))
+        self.console.print(_format_cloud_usage_line("Weekly", usage.weekly, theme=self.theme))
 
     def run_first_time_setup(
         self, *, default_base_url: str, default_model: str
@@ -608,19 +572,15 @@ class TerminalUI:
         cancelled (Ctrl+C/EOF/blank key) — the caller proceeds without saving
         and lets the first LLM call fail with a clear error instead.
         """
+        self._print_heading("First-time setup")
         self.console.print(
-            Panel.fit(
-                "No LLM API key found.\n"
-                "Let's set one up — saved to ~/.marcus/config.toml for future runs.\n"
-                "Press Ctrl+C to skip and rely on env vars instead.",
-                title="First-time setup",
-                border_style=self.theme.border,
-            )
+            f"[{self.theme.muted}]No LLM API key found. Let's set one up — "
+            f"saved to ~/.marcus/config.toml for future runs. "
+            f"Press Ctrl+C to skip and rely on env vars instead.[/{self.theme.muted}]"
         )
         try:
-            # Note: avoid literal square brackets in Console.input/print text
-            # — Rich parses "[...]" as markup, so "[default]" silently
-            # vanishes instead of printing (see the (y)/(n)/(a) prompt below).
+            # Avoid literal square brackets in Console.input/print text —
+            # Rich parses "[...]" as markup, so "[default]" silently vanishes.
             base_url = (
                 self.console.input(f"LLM base URL (default: {escape(default_base_url)}): ").strip()
                 or default_base_url
@@ -663,24 +623,31 @@ class TerminalUI:
         return "\n".join(lines)
 
     async def prompt_user(self) -> str | None:
-        # Defensive lifecycle boundary: prompt_toolkit and Rich Live must
-        # never own the terminal concurrently, even after an empty LLM reply.
-        self._stop_live()
-        try:
-            if self._prompt_session is None:
-                if not (sys.stdin.isatty() and sys.stdout.isatty()):
-                    result = input(f"{self.mode.upper()} > ")
-                    self._interrupt_count = 0
-                    return result
+        if self._prompt_session is None:
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
                 try:
-                    self._prompt_session = PromptSession(history=self._input_history)
-                except Exception as exc:  # noqa: BLE001 - terminal capability fallback
-                    self.print_recovery(
-                        f"Advanced prompt unavailable ({type(exc).__name__}); using basic input."
-                    )
                     result = input(f"{self.mode.upper()} > ")
-                    self._interrupt_count = 0
-                    return result
+                except EOFError:
+                    return None
+                except KeyboardInterrupt:
+                    return None if self.register_interrupt() else ""
+                self._interrupt_count = 0
+                return result
+            try:
+                self._prompt_session = PromptSession(history=self._input_history)
+            except Exception as exc:  # noqa: BLE001 - terminal capability fallback
+                self.print_recovery(
+                    f"Advanced prompt unavailable ({type(exc).__name__}); using basic input."
+                )
+                try:
+                    result = input(f"{self.mode.upper()} > ")
+                except EOFError:
+                    return None
+                except KeyboardInterrupt:
+                    return None if self.register_interrupt() else ""
+                self._interrupt_count = 0
+                return result
+        try:
             result = await self._prompt_session.prompt_async(
                 [("class:prompt", f"{self.mode.upper()} > ")],
                 completer=self._completer,
@@ -708,15 +675,9 @@ class TerminalUI:
         used = status["context_tokens"]
         limit = max(1, status["context_limit"])
         ratio = min(1.0, used / limit)
-        # Narrower bar (14 cells vs 20) — the numeric ratio next to it
-        # already carries the precision, so the visual bar just has to say
-        # "roughly how full."
         filled = round(ratio * 14)
         bar = self.theme.bar_fill * filled + self.theme.bar_empty * (14 - filled)
         sep = "  "
-        # Two lines instead of three. Session + context + mode on top,
-        # model + throughput + workspace below. Same information density,
-        # fewer rows anchored to the prompt.
         line_one = (
             f"Session {hours:02d}:{minutes:02d}:{seconds:02d}{sep}"
             f"Context [{bar}] ~{_format_tokens(used)}/{_format_tokens(limit)}{sep}"
@@ -737,16 +698,14 @@ class TerminalUI:
 
     def print_recovery(self, message: str) -> None:
         glyph = "↻" if not self._no_color else "~"
+        self._stop_thinking_status()
+        line = f"[{self.theme.warning}]{glyph} {escape(message)}[/{self.theme.warning}]"
+        self.console.print(line)
         if self._turn_active:
-            self._working_lines.append(f"{glyph} {self._compact_line(message, 180)}")
-            self._refresh_steps()
-            return
-        self.console.print(
-            f"[{self.theme.warning}]{glyph} {escape(message)}[/{self.theme.warning}]"
-        )
+            self._last_turn_lines.append(f"{glyph} {message}")
 
     async def aclose(self) -> None:
-        self._stop_live()
+        self._stop_thinking_status()
         if self._prompt_session is not None:
             await self._prompt_session.app.cancel_and_wait_for_background_tasks()
 
@@ -758,8 +717,11 @@ class TerminalUI:
         self._status_provider = provider
 
     def refresh_status(self) -> None:
-        if self._live is not None:
-            self._live.update(self._working_renderable(), refresh=True)
+        # Status is now shown only in the prompt_toolkit bottom toolbar
+        # (refreshed by prompt_toolkit itself) and via /status. Nothing to
+        # push during a turn — this stays as a no-op so callers in the loop
+        # don't need to feature-detect.
+        return
 
     def print_status(self) -> None:
         if self._status_provider is not None:
@@ -777,45 +739,50 @@ class TerminalUI:
         return answer == "yolo"
 
     def print_assistant(self, text: str) -> None:
-        if self._turn_active:
-            label = "plan" if text.lstrip().lower().startswith("plan") else "note"
-            compact = self._compact_line(text, 180)
-            self._working_lines.append(f"{self.theme.bullet} {label}: {compact}")
-            self._step_lines.append(f"{label}: {text}")
-            self._refresh_steps()
-            return
-        self._pause_live()
+        self._stop_thinking_status()
         self.console.print(Markdown(text))
-        self._resume_live()
+        if self._turn_active:
+            self._last_turn_lines.append(text)
 
     def print_final_answer(self, text: str) -> None:
-        had_tool_steps = bool(self._step_lines)
+        had_tool_steps = self._tool_count > 0
         self.finish_steps(success=True)
-        if not had_tool_steps:
-            self.console.print(Markdown(text))
-            return
-        self.console.print()
+        if had_tool_steps:
+            self.console.print()
         self.console.print(Markdown(text))
+        if self._turn_active:
+            self._last_turn_lines.append(text)
 
     def print_assistant_delta(self, text: str) -> None:
         self.console.print(text, end="")
 
     def print_tool_call(self, tool_name: str, arguments: dict) -> None:
+        self._stop_thinking_status()
         summary = _summarize_arguments(arguments)
         action = _tool_action(tool_name)
         self._tool_count += 1
-        arrow = self.theme.arrow
-        self._step_lines.extend([f"{arrow} {action}", f"  {tool_name}({summary})"])
-        compact_args = self._compact_line(summary, 120)
-        suffix = f" {self.theme.sep} {compact_args}" if compact_args else ""
-        self._working_lines.append(f"{self._tool_count}. {action}{suffix}")
-        self._refresh_steps()
+        compact_args = self._compact_line(summary, 140)
+        suffix = f" [{self.theme.muted}]{self.theme.sep} {escape(compact_args)}[/{self.theme.muted}]" if compact_args else ""
+        line = (
+            f"[{self.theme.accent}]{self.theme.arrow} {self._tool_count}. "
+            f"{escape(action)}[/{self.theme.accent}]{suffix}"
+        )
+        self.console.print(line)
+        if self._turn_active:
+            self._last_turn_lines.append(f"{self.theme.arrow} {self._tool_count}. {action}")
+            if compact_args:
+                self._last_turn_lines.append(f"    {tool_name}({summary})")
 
     def print_tool_result(self, tool_name: str, result: dict) -> None:
+        self._stop_thinking_status()
         summary = _tool_result_summary(tool_name, result)
-        glyph = self.theme.success_glyph
-        self._step_lines.append(f"{glyph} {summary}")
-        self._working_lines.append(f"   {glyph} {self._compact_line(summary, 160)}")
+        compact = self._compact_line(summary, 200)
+        self.console.print(
+            f"   [{self.theme.success}]{self.theme.success_glyph}[/{self.theme.success}] "
+            f"{escape(compact)}"
+        )
+        if self._turn_active:
+            self._last_turn_lines.append(f"  {self.theme.success_glyph} {summary}")
         for label in ("stdout", "stderr"):
             output = result.get(label)
             if not output:
@@ -823,27 +790,33 @@ class TerminalUI:
             text = str(output).strip()
             if not text:
                 continue
-            self._step_lines.extend([label, text[:2000]])
-        self._refresh_steps()
+            if self._turn_active:
+                self._last_turn_lines.append(f"  {label}:")
+                self._last_turn_lines.append(text[:2000])
 
     def print_tool_error(self, tool_name: str, error: str) -> None:
-        glyph = self.theme.fail_glyph
-        self._step_lines.append(f"{glyph} {tool_name}: {error}")
-        self._working_lines.append(
-            f"   {glyph} {tool_name}: {self._compact_line(error, 140)}"
+        self._stop_thinking_status()
+        compact = self._compact_line(error, 200)
+        self.console.print(
+            f"   [{self.theme.error}]{self.theme.fail_glyph}[/{self.theme.error}] "
+            f"{escape(tool_name)}: {escape(compact)}"
         )
-        self._refresh_steps()
+        if self._turn_active:
+            self._last_turn_lines.append(f"  {self.theme.fail_glyph} {tool_name}: {error}")
 
     def print_tool_declined(self, tool_name: str) -> None:
-        glyph = self.theme.fail_glyph
-        self._step_lines.append(f"{glyph} {tool_name} declined by user")
-        self._working_lines.append(f"   {glyph} {tool_name} declined")
-        self._refresh_steps()
+        self._stop_thinking_status()
+        self.console.print(
+            f"   [{self.theme.muted}]{self.theme.fail_glyph} "
+            f"{escape(tool_name)} declined[/{self.theme.muted}]"
+        )
+        if self._turn_active:
+            self._last_turn_lines.append(f"  {self.theme.fail_glyph} {tool_name} declined")
 
     def print_guardrail_stop(self, reason: str) -> None:
+        self._stop_thinking_status()
         self.finish_steps(success=False)
         self._last_guardrail = reason
-        self._guardrail_collapsed = True
         glyph = self.theme.fail_glyph
         self.console.print(
             f"[{self.theme.error}]{glyph} guardrail {self.theme.sep} "
@@ -851,6 +824,7 @@ class TerminalUI:
         )
 
     def print_interrupted(self) -> None:
+        self._stop_thinking_status()
         self.finish_steps(success=False)
         glyph = self.theme.fail_glyph
         self.console.print(
@@ -860,6 +834,7 @@ class TerminalUI:
 
     def register_interrupt(self) -> bool:
         """Return True on the third consecutive Ctrl+C, signaling CLI exit."""
+        self._stop_thinking_status()
         self.finish_steps(success=False)
         self._interrupt_count += 1
         remaining = 3 - self._interrupt_count
@@ -875,35 +850,26 @@ class TerminalUI:
         return False
 
     def begin_turn(self) -> None:
-        self._stop_live()
-        self._step_lines = []
-        self._working_lines = []
+        self._stop_thinking_status()
         self._tool_count = 0
         self._thinking = False
         self._thinking_start = 0.0
         self._last_thought_seconds = None
         self._todo = None
-        self._stream_buffer = ""
+        self._last_phase = None
         self._streaming = False
         self._turn_active = True
+        self._last_turn_lines = []
 
     def update_todo(self, todo: TodoTracker) -> None:
-        """Update the workflow tracker rendered in the live panel."""
-        self._todo = todo
-        if self._turn_active:
-            self._refresh_steps()
+        """Print a subtle breadcrumb line whenever the workflow phase advances.
 
-    def _todo_renderable(self) -> Text:
-        """Phase pipeline as a subtle breadcrumb.
-
-        Done phases render in success color; the current phase is
-        accent-highlighted; upcoming phases stay muted. The separator uses
-        the theme's ``sep`` glyph so it degrades gracefully in no-color mode.
+        Instead of a live-refreshing panel, we emit one inline line per
+        transition so the terminal scrollback shows the phase history.
         """
-        text = Text()
-        if self._todo is None:
-            return text
-        order = list(Phase)
+        self._todo = todo
+        if not self._turn_active:
+            return
         labels = {
             Phase.receive: "รับคำสั่ง",
             Phase.analyze: "วิเคราะห์",
@@ -912,63 +878,86 @@ class TerminalUI:
             Phase.validate: "ตรวจสอบ",
             Phase.deliver: "ส่งมอบ",
         }
-        sep = f" {self.theme.sep} "
-        for index, phase in enumerate(order):
-            label = labels.get(phase, phase.value)
-            if self._todo.current == phase and not self._todo.finished:
-                text.append(label, style=self.theme.accent)
-            elif self._todo.is_done(phase):
-                text.append(label, style=self.theme.success)
-            else:
-                text.append(label, style=self.theme.muted)
-            if index < len(order) - 1:
-                text.append(sep, style=self.theme.muted)
-        return text
+        current = todo.current if not todo.finished else None
+        if current is None or current == self._last_phase:
+            return
+        self._last_phase = current
+        label = labels.get(current, current.value)
+        self._stop_thinking_status()
+        self.console.print(
+            f"[{self.theme.muted}]{self.theme.sep} {escape(label)}[/{self.theme.muted}]"
+        )
+        if self._turn_active:
+            self._last_turn_lines.append(f"{self.theme.sep} {label}")
 
     def start_thinking(self) -> None:
-        """Show thinking inside the single live working panel."""
+        """Show a transient spinner while the model is thinking."""
         self._thinking = True
         self._thinking_start = datetime.now().timestamp()
-        self._refresh_steps()
+        if self._thinking_status is not None:
+            return
+        if not self.console.is_terminal:
+            # In non-terminal mode (piped output, tests) Rich's Status uses
+            # a Live under the hood which would clutter captured output.
+            return
+        try:
+            self._thinking_status = self.console.status(
+                f"[{self.theme.muted}]thinking...[/{self.theme.muted}]",
+                spinner="dots",
+            )
+            self._thinking_status.start()
+        except Exception:  # noqa: BLE001 - status is decorative; never block the turn
+            self._thinking_status = None
 
     def stop_thinking(self, elapsed_seconds: float) -> None:
-        """Finalize the thinking indicator timing in the step panel."""
+        """Finalize the thinking indicator; print a compact "thought Xs" line."""
         if not self._thinking:
             return
         self._thinking = False
         self._last_thought_seconds = elapsed_seconds
-        self._refresh_steps()
+        self._stop_thinking_status()
+        if elapsed_seconds > 0:
+            self.console.print(
+                f"[{self.theme.muted}]{self.theme.spinner} thought "
+                f"{elapsed_seconds:.1f}s[/{self.theme.muted}]"
+            )
+            if self._turn_active:
+                self._last_turn_lines.append(
+                    f"{self.theme.spinner} thought {elapsed_seconds:.1f}s"
+                )
+
+    def _stop_thinking_status(self) -> None:
+        if self._thinking_status is not None:
+            try:
+                self._thinking_status.stop()
+            except Exception:  # noqa: BLE001 - stopping a stale status must not raise
+                pass
+            self._thinking_status = None
 
     def print_last_guardrail(self) -> None:
         """Show the last guardrail stop reason, if any."""
         if self._last_guardrail is None:
             self.print_info("No guardrail stop in this session yet.")
             return
+        glyph = self.theme.fail_glyph
         self.console.print(
-            Panel(
-                f"[{self.theme.error}]{escape(self._last_guardrail)}[/{self.theme.error}]",
-                title=f"{self.theme.fail_glyph} Last guardrail stop",
-                title_align="left",
-                border_style=self.theme.error,
-                padding=(0, 1),
-            )
+            f"[{self.theme.error}]{glyph} last guardrail {self.theme.sep} "
+            f"{escape(self._last_guardrail)}[/{self.theme.error}]"
         )
 
     def start_stream(self) -> None:
-        """Collect streamed text while keeping status inside the working panel."""
-        self._stream_buffer = ""
+        """Streaming is now internal book-keeping only; the loop prints the
+        final content via ``print_assistant`` / ``print_final_answer``.
+        """
         self._streaming = True
-        self._refresh_steps()
 
     def stream_delta(self, text: str) -> None:
-        """Accumulate a streamed delta for later rendering."""
-        self._stream_buffer += text
+        # Deltas are ignored — the loop renders the assembled response once
+        # via print_assistant/print_final_answer to keep scrollback clean.
+        return
 
     def end_stream(self) -> None:
-        """Finish streaming; the loop renders the response exactly once."""
-        self._stream_buffer = ""
         self._streaming = False
-        self._refresh_steps()
 
     def save_turn(
         self,
@@ -987,9 +976,9 @@ class TerminalUI:
         ]
         if user_input:
             lines.extend(["\n## User Request\n", f"```text\n{user_input}\n```\n"])
-        if self._last_step_lines:
+        if self._last_turn_lines:
             lines.extend(
-                ["\n## Steps\n"] + [f"- {line}" for line in self._last_step_lines] + ["\n"]
+                ["\n## Steps\n"] + [f"- {line}" for line in self._last_turn_lines] + ["\n"]
             )
         if final_answer:
             lines.extend(["\n## Final Answer\n", f"{final_answer}\n"])
@@ -1007,81 +996,23 @@ class TerminalUI:
         path.write_text("".join(lines), encoding="utf-8")
 
     def finish_steps(self, *, success: bool) -> None:
-        if not self._step_lines and not self._working_lines:
-            # Still stop any active live panel so transient thinking lines don't
-            # leak into the final output.
-            self._stop_live()
+        self._stop_thinking_status()
+        if not self._tool_count:
             self._turn_active = False
             return
-        self._last_step_lines = list(self._step_lines)
-        self._stop_live()
-        self._turn_active = False
-        sep = self.theme.sep
-        detail_hint = f" {sep} /steps" if self._last_step_lines else ""
-        count = f" {sep} {self._tool_count} tool(s)" if self._tool_count else ""
-        self._steps_collapsed = True
+        count = f" {self.theme.sep} {self._tool_count} tool(s)"
         if success:
             glyph = self.theme.success_glyph
             self.console.print(
                 f"[{self.theme.success}]{glyph} done{count}[/{self.theme.success}]"
-                f"[{self.theme.muted}]{detail_hint}[/{self.theme.muted}]"
             )
         else:
             glyph = self.theme.fail_glyph
             self.console.print(
                 f"[{self.theme.error}]{glyph} stopped{count}[/{self.theme.error}]"
-                f"[{self.theme.muted}]{detail_hint}[/{self.theme.muted}]"
             )
-        self._step_lines = []
-        self._working_lines = []
+        self._turn_active = False
         self._tool_count = 0
-
-    def print_steps(self) -> None:
-        lines = self._last_step_lines
-        if not lines:
-            self.print_info("No completed task steps in this session yet.")
-            return
-        self._steps_collapsed = False
-        # Temporarily swap in the saved lines so _steps_renderable can reuse its
-        # truncation-aware layout logic, then restore the running state.
-        saved_step_lines = list(self._step_lines)
-        saved_tool_count = self._tool_count
-        self._step_lines = list(lines)
-        step_prefixes = (
-            f"{self.theme.arrow} ",
-            f"{self.theme.success_glyph} ",
-            f"{self.theme.fail_glyph} ",
-        )
-        self._tool_count = len(
-            [line for line in lines if line.startswith(step_prefixes)]
-        )
-        self.console.print(self._steps_renderable(title="Last steps"))
-        self._step_lines = saved_step_lines
-        self._tool_count = saved_tool_count
-
-    def _steps_renderable(self, *, title: str | None = None) -> Panel:
-        lines: list[str] = []
-        max_width = max(20, self.console.size.width - 8)
-        for entry in self._step_lines:
-            parts = entry.splitlines() or [""]
-            lines.extend(part[:max_width] for part in parts)
-
-        # Reserve room for the panel border, prompt, approval text, and final
-        # answer. Showing the tail keeps the currently running action visible.
-        max_lines = max(4, self.console.size.height - 10)
-        hidden = max(0, len(lines) - max_lines)
-        if hidden:
-            lines = [
-                f"{self.theme.spinner} {hidden} earlier line(s) hidden; use /steps"
-            ] + lines[-(max_lines - 1) :]
-        panel_title = title or f"Steps {self.theme.sep} {self._tool_count} tool(s)"
-        return Panel(
-            "\n".join(escape(line) for line in lines),
-            title=panel_title,
-            title_align="left",
-            border_style=self.theme.border,
-            padding=(0, 1),
-        )
 
     def _status_renderable(self) -> Text:
         if self._status_provider is None:
@@ -1118,67 +1049,6 @@ class TerminalUI:
             return self.theme.status_caution
         return self.theme.status_bad
 
-    def _working_renderable(self) -> Panel:
-        lines = list(self._working_lines)
-        if self._thinking:
-            elapsed = datetime.now().timestamp() - self._thinking_start
-            activity = "streaming" if self._streaming else "thinking"
-            lines.append(f"{self.theme.spinner} {activity} {elapsed:.1f}s")
-        elif self._streaming:
-            lines.append(f"{self.theme.spinner} streaming")
-        elif not lines:
-            lines.append(f"{self.theme.spinner} preparing")
-
-        # Extra reserved rows account for panel border, phase breadcrumb,
-        # a blank spacer, the subtitle, and space for the prompt below.
-        max_lines = max(3, self.console.size.height - 10)
-        hidden = max(0, len(lines) - max_lines)
-        if hidden:
-            lines = [
-                f"{self.theme.spinner} {hidden} earlier step(s) {self.theme.sep} /steps"
-            ] + lines[-(max_lines - 1) :]
-
-        step_body = Text.from_markup("\n".join(escape(line) for line in lines))
-        if self._todo is not None:
-            # Breadcrumb-then-rule-then-steps gives the eye a stable header
-            # regardless of how much churn is happening in the step list.
-            body: Group | Text = Group(self._todo_renderable(), Text(""), step_body)
-        else:
-            body = step_body
-
-        count = f" {self.theme.sep} {self._tool_count} tool(s)" if self._tool_count else ""
-        title = f"Marcus Code{count}"
-        subtitle = self._working_status_line()
-        return Panel(
-            body,
-            title=title,
-            title_align="left",
-            subtitle=subtitle or None,
-            border_style=self.theme.border,
-            padding=(0, 1),
-        )
-
-    def _working_status_line(self) -> str:
-        if self._status_provider is None:
-            thought = (
-                f"thought {self._last_thought_seconds:.1f}s"
-                if self._last_thought_seconds is not None
-                else ""
-            )
-            return thought
-        status = self._status_provider()
-        used = status["context_tokens"]
-        limit = max(1, status["context_limit"])
-        context_percent = min(100, round(used * 100 / limit))
-        parts = [
-            str(status["model"]),
-            f"ctx {context_percent}%",
-            str(status["mode"]),
-        ]
-        if self._last_thought_seconds is not None:
-            parts.append(f"thought {self._last_thought_seconds:.1f}s")
-        return " · ".join(parts)
-
     @staticmethod
     def _compact_line(text: str, limit: int) -> str:
         compact = " ".join(str(text).split())
@@ -1186,32 +1056,8 @@ class TerminalUI:
             return compact
         return compact[: max(1, limit - 1)].rstrip() + "…"
 
-    def _refresh_steps(self) -> None:
-        if not self.console.is_terminal or not self._turn_active:
-            return
-        renderable = self._working_renderable()
-        if self._live is not None:
-            self._live.update(renderable, refresh=True)
-            return
-        self._live = Live(renderable, console=self.console, refresh_per_second=8, transient=True)
-        self._live.start()
-
-    def _pause_live(self) -> None:
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
-
-    def _resume_live(self) -> None:
-        if self._turn_active:
-            self._refresh_steps()
-
-    def _stop_live(self) -> None:
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
-
     def confirm_tool_call(self, tool: Tool, arguments: dict) -> ApprovalDecision:
-        self._pause_live()
+        self._stop_thinking_status()
         summary = _summarize_arguments(arguments)
         risk = "low"
         warning: str | None = None
@@ -1220,9 +1066,6 @@ class TerminalUI:
             risk = risk_level(command)
             warning = command_warning(command)
 
-        # Inline layout instead of a bordered panel: risk pill on the left,
-        # tool name and arguments to the right, so the eye lands on what's
-        # about to happen without decoding a boxed table first.
         risk_style, risk_glyph = self._risk_style(risk)
         header = (
             f"[{risk_style}]{risk_glyph} risk: {risk}[/{risk_style}]"
@@ -1240,20 +1083,59 @@ class TerminalUI:
         if tool.name == EDIT_FILE_TOOL_NAME:
             self._print_edit_diff(arguments)
 
+        decision = self._approval_menu(tool.name)
+        if decision is not None:
+            return decision
+        return self._approval_text_prompt()
+
+    def _approval_menu(self, tool_name: str) -> ApprovalDecision | None:
+        """Show an arrow-key select menu for approving a tool call.
+
+        Returns None to signal "no menu available" (non-TTY, InquirerPy
+        import failure, etc.) so the caller can fall back to the text prompt.
+        InquirerPy uses prompt_toolkit internally; that plays fine here
+        because our outer PromptSession is idle during a tool call.
+        """
+        if not (self.console.is_terminal and sys.stdin.isatty() and sys.stdout.isatty()):
+            return None
+        try:
+            from InquirerPy import inquirer
+        except ImportError:
+            return None
+        try:
+            choice = inquirer.select(
+                message=f"Allow {tool_name}?",
+                choices=[
+                    {"name": "Apply once", "value": "yes"},
+                    {"name": "Always allow this tool this session", "value": "always"},
+                    {"name": "Reject", "value": "no"},
+                ],
+                default="yes",
+                qmark="›",
+                amark="›",
+            ).execute()
+        except (KeyboardInterrupt, EOFError):
+            return "no"
+        except Exception:  # noqa: BLE001 - fall back to text on unexpected TTY errors
+            return None
+        if choice in {"yes", "no", "always"}:
+            return choice  # type: ignore[return-value]
+        return "no"
+
+    def _approval_text_prompt(self) -> ApprovalDecision:
+        """Legacy y/n/a text prompt — used in non-TTY environments (tests,
+        piped stdin) where an arrow-key menu wouldn't render.
+        """
         while True:
             try:
                 answer = self.console.input(self._approval_prompt).strip().lower()
             except (KeyboardInterrupt, EOFError):
-                self._resume_live()
                 return "no"
             if answer in ("y", "yes"):
-                self._resume_live()
                 return "yes"
             if answer in ("n", "no"):
-                self._resume_live()
                 return "no"
             if answer in ("a", "always"):
-                self._resume_live()
                 return "always"
             self.console.print(
                 f"[{self.theme.muted}]please answer y, n, or a[/{self.theme.muted}]"

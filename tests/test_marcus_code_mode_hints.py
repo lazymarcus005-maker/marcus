@@ -1,4 +1,4 @@
-from marcus_code.modes import AgentMode, mode_help, mode_hint
+from marcus_code.runtime.modes import AgentMode, mode_help, mode_hint
 
 
 def test_every_mode_has_a_hint():

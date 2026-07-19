@@ -7,7 +7,6 @@ _COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/?": "Show this help",
     "/model": "Show or switch the active model",
     "/usage": "Show token usage; Ollama Cloud quota when configured",
-    "/steps": "Show details from the last completed task",
     "/status": "Show session, context, model, and workspace status",
     "/compact": "Compact retained conversation context now",
     "/retry": "Retry the previous task",
@@ -24,7 +23,7 @@ _COMMAND_DESCRIPTIONS: dict[str, str] = {
 }
 
 _COMMAND_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "Info": ("/help", "/?", "/status", "/usage", "/steps"),
+    "Info": ("/help", "/?", "/status", "/usage"),
     "Context": ("/compact", "/clear", "/retry", "/continue"),
     "Config": ("/model", "/mode", "/config", "/theme"),
     "Input": ("/edit",),

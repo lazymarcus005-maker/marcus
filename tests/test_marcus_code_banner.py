@@ -1,4 +1,4 @@
-from marcus_code.banner import LOGO_TEXT, MAX_WIDTH, TAGLINE, _render_block_text, render_banner
+from marcus_code.ui.banner import LOGO_TEXT, MAX_WIDTH, TAGLINE, _render_block_text, render_banner
 
 
 def test_block_text_rows_are_all_equal_width():

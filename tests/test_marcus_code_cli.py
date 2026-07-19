@@ -10,7 +10,7 @@ import pytest
 
 from harness.config import Settings
 from harness.llm.types import LLMResponse, Usage
-from marcus_code import cli
+from marcus_code.cli import app as cli
 
 
 def test_main_update_flag_prints_local_dev_instructions(monkeypatch, capsys, tmp_path):
@@ -283,8 +283,14 @@ def test_main_rejects_unknown_subcommand(monkeypatch, capsys, tmp_path):
     with pytest.raises(SystemExit) as exc_info:
         cli.main()
 
+    # Typer/Click surface unknown subcommands with exit code 2 and a Rich-
+    # rendered error banner. The exact wording ("No such command 'foo'.")
+    # is written to stderr but wrapped in a decorative box, so we assert on
+    # exit code + the offending argument appearing somewhere in the error
+    # output rather than a fixed argparse string.
     assert exc_info.value.code == 2
-    assert "unrecognized arguments: foo" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "foo" in captured.err
 
 
 def test_version_cache_is_used_when_fresh(monkeypatch, tmp_path):

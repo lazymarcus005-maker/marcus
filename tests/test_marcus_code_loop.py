@@ -6,9 +6,9 @@ from harness.db.enums import RiskTier
 from harness.llm.gateway import LLMTransientError
 from harness.llm.types import LLMMessage, LLMResponse, ToolCall, Usage
 from harness.runtime.tools import Tool
-from marcus_code.loop import MarcusLoop
-from marcus_code.modes import AgentMode
-from marcus_code.task_contract import (
+from marcus_code.runtime.agent import MarcusLoop
+from marcus_code.runtime.modes import AgentMode
+from marcus_code.runtime.task_contract import (
     Capability,
     ResponseMode,
     TaskContract,
