@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from marcus_code.ollama_usage import (
+from marcus_code.runtime.ollama_usage import (
     OllamaCloudUsageClient,
     find_installed_browsers,
     interactive_browser_args,
@@ -24,7 +24,7 @@ def test_browser_discovery_prefers_chrome_from_path(tmp_path, monkeypatch):
     chrome = tmp_path / "chrome.exe"
     chrome.write_text("", encoding="utf-8")
     monkeypatch.setattr(
-        "marcus_code.ollama_usage.shutil.which",
+        "marcus_code.runtime.ollama_usage.shutil.which",
         lambda command: str(chrome) if command == "chrome" else None,
     )
 
@@ -76,7 +76,7 @@ def test_saved_login_is_detected_from_storage_state(tmp_path):
 
 
 def test_logout_removes_saved_session_cache_and_browser_profile(tmp_path, monkeypatch):
-    monkeypatch.setattr("marcus_code.ollama_usage.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("marcus_code.runtime.ollama_usage.Path.home", lambda: tmp_path)
     marcus_home = tmp_path / ".marcus"
     profile = marcus_home / "browser-profile"
     profile.mkdir(parents=True)
@@ -114,7 +114,7 @@ async def test_plain_usage_fetches_with_saved_cookies_without_browser(tmp_path, 
 
     async_client = httpx.AsyncClient
     monkeypatch.setattr(
-        "marcus_code.ollama_usage.httpx.AsyncClient",
+        "marcus_code.runtime.ollama_usage.httpx.AsyncClient",
         lambda **kwargs: async_client(
             transport=httpx.MockTransport(handler), cookies=kwargs.get("cookies")
         ),

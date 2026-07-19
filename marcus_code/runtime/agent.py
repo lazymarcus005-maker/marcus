@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -13,8 +14,8 @@ from harness.runtime.guardrails import REPEATED_CALL_WINDOW
 from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tool_validation import ToolArgumentError, normalize_and_validate_arguments
 from harness.runtime.tools import Tool
-from marcus_code.modes import AgentMode, tool_is_allowed, tool_requires_approval
-from marcus_code.task_contract import (
+from marcus_code.runtime.modes import AgentMode, tool_is_allowed, tool_requires_approval
+from marcus_code.runtime.task_contract import (
     Capability,
     ResponseMode,
     TaskContract,
@@ -24,14 +25,34 @@ from marcus_code.task_contract import (
     is_verification_attempt,
     is_verification_evidence,
 )
-from marcus_code.todo_tracker import Phase, TodoTracker
-from marcus_code.token_utils import (
+from marcus_code.runtime.todo_tracker import Phase, TodoTracker
+from marcus_code.runtime.event_bus import EventBus
+from marcus_code.runtime.events import (
+    AssistantMessage,
+    FinalAnswer,
+    GuardrailStop,
+    Interrupted,
+    Recovery,
+    StreamDelta,
+    StreamEnded,
+    StreamStarted,
+    ThinkingStarted,
+    ThinkingStopped,
+    TodoUpdated,
+    ToolCallCompleted,
+    ToolCallDeclined,
+    ToolCallFailed,
+    ToolCallStarted,
+    TurnFinished,
+    TurnStarted,
+)
+from marcus_code.runtime.token_utils import (
     estimate_message_tokens,
     summarize_tool_result,
     trim_messages_to_budget,
     trim_messages_to_count,
 )
-from marcus_code.ui import TerminalUI
+from marcus_code.ui.console import TerminalUI
 
 DEFAULT_MAX_STEPS = 100
 DEFAULT_RESULT_MAX_CHARS = 4000
@@ -177,11 +198,24 @@ class MarcusLoop:
         max_argument_repairs: int = 1,
         max_finalization_repairs: int = DEFAULT_MAX_FINALIZATION_REPAIRS,
         max_parallel_read_only: int = DEFAULT_MAX_PARALLEL_READ_ONLY,
+        events: EventBus | None = None,
     ) -> None:
         self.llm = llm
         self.tools_by_name = {t.name: t for t in tools}
         self.all_tool_specs = [t.to_spec() for t in tools]
         self.ui = ui
+        # One-way notifications (tool calls, thinking, guardrails, etc.)
+        # flow through the event bus so alternative renderers can subscribe
+        # without touching the loop. Two-way calls (confirm_tool_call,
+        # prompt_user) remain direct on ``self.ui`` because they need a
+        # return value. When no bus is provided we wire a default renderer
+        # to the given ui so existing call sites keep working unchanged.
+        if events is None:
+            from marcus_code.ui.renderer import TerminalRenderer
+
+            events = EventBus()
+            events.subscribe(TerminalRenderer(ui).handle)
+        self.events = events
         self.model = model
         self.max_steps = max_steps
         self.result_max_chars = result_max_chars
@@ -207,16 +241,16 @@ class MarcusLoop:
 
     async def run_turn(self, user_input: str, *, contract: TaskContract | None = None) -> None:
         if hasattr(self.ui, "begin_turn"):
-            self.ui.begin_turn()
+            self.events.emit(TurnStarted())
         continuing = contract is not None
         resolved_contract = contract or derive_task_contract(user_input)
         tracker = TodoTracker()
         if hasattr(self.ui, "update_todo"):
-            self.ui.update_todo(tracker)
+            self.events.emit(TodoUpdated(tracker=tracker))
         tracker.advance(Phase.analyze, "จำแนกคำขอและขอบเขตเครื่องมือ")
         self.state.active_phase = Phase.analyze
         if hasattr(self.ui, "update_todo"):
-            self.ui.update_todo(tracker)
+            self.events.emit(TodoUpdated(tracker=tracker))
 
         # Files and external processes can change between user turns. A cache
         # is useful only inside one coherent turn and is invalidated by writes.
@@ -236,7 +270,7 @@ class MarcusLoop:
         if contract.requires_plan and not plan_shown:
             tracker.advance(Phase.plan, "สร้างแผนก่อนเรียกเครื่องมือ")
             if hasattr(self.ui, "update_todo"):
-                self.ui.update_todo(tracker)
+                self.events.emit(TodoUpdated(tracker=tracker))
         finalization_repairs = 0
         finalization_hint: str | None = None
         retried_after_timeout = False
@@ -249,22 +283,22 @@ class MarcusLoop:
             if self.context_percent >= self.compact_threshold_percent:
                 self.compact_history()
             if self.context_tokens >= self.context_window_tokens:
-                self.ui.print_guardrail_stop(
+                self.events.emit(GuardrailStop(reason=
                     "retained context exceeds the configured context window; use /compact or /clear"
-                )
+                ))
                 return
             if (
                 self.max_total_tokens is not None
                 and self.usage.total_tokens >= self.max_total_tokens
             ):
-                self.ui.print_guardrail_stop(
+                self.events.emit(GuardrailStop(reason=
                     f"session token budget exceeded ({self.max_total_tokens})"
-                )
+                ))
                 return
             try:
                 start = time.perf_counter()
                 if hasattr(self.ui, "start_thinking"):
-                    self.ui.start_thinking()
+                    self.events.emit(ThinkingStarted())
                 use_stream = hasattr(self.llm, "complete_stream") and hasattr(
                     self.ui, "stream_delta"
                 )
@@ -273,8 +307,8 @@ class MarcusLoop:
                 if not planning_phase and self._verification_is_impossible(contract, active_specs):
                     self.state.last_turn_guardrail = "task requires verification, but no compatible verification tool is available"
                     if hasattr(self.ui, "stop_thinking"):
-                        self.ui.stop_thinking(0.0)
-                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                        self.events.emit(ThinkingStopped(elapsed_seconds=0.0))
+                    self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                     return
                 call_messages = list(self.state.history)
                 if contract.response_mode is ResponseMode.direct:
@@ -312,11 +346,11 @@ class MarcusLoop:
                     if use_stream:
                         try:
                             if hasattr(self.ui, "start_stream"):
-                                self.ui.start_stream()
+                                self.events.emit(StreamStarted())
 
                             def _on_delta(delta_text: str) -> None:
                                 if hasattr(self.ui, "stream_delta"):
-                                    self.ui.stream_delta(delta_text)
+                                    self.events.emit(StreamDelta(text=delta_text))
 
                             response = await self.llm.complete_stream(
                                 call_messages,
@@ -327,14 +361,14 @@ class MarcusLoop:
                                 on_delta=_on_delta,
                             )
                             if hasattr(self.ui, "end_stream"):
-                                self.ui.end_stream()
+                                self.events.emit(StreamEnded())
                         except LLMTransientError:
                             if hasattr(self.ui, "end_stream"):
-                                self.ui.end_stream()
+                                self.events.emit(StreamEnded())
                             if hasattr(self.ui, "print_recovery"):
-                                self.ui.print_recovery(
+                                self.events.emit(Recovery(message=
                                     "Streaming failed; recovering with a standard request."
-                                )
+                                ))
                             response = await self.llm.complete(
                                 call_messages,
                                 tools=active_specs,
@@ -350,34 +384,34 @@ class MarcusLoop:
                         )
                 duration = time.perf_counter() - start
                 if hasattr(self.ui, "stop_thinking"):
-                    self.ui.stop_thinking(duration)
+                    self.events.emit(ThinkingStopped(elapsed_seconds=duration))
                 self.usage.record(response.usage, duration)
                 self._update_ui_status()
             except LLMError as exc:
                 if hasattr(self.ui, "end_stream"):
-                    self.ui.end_stream()
+                    self.events.emit(StreamEnded())
                 if hasattr(self.ui, "stop_thinking"):
-                    self.ui.stop_thinking(0.0)
-                self.ui.print_guardrail_stop(f"LLM call failed: {exc}")
+                    self.events.emit(ThinkingStopped(elapsed_seconds=0.0))
+                self.events.emit(GuardrailStop(reason=f"LLM call failed: {exc}"))
                 return
             except TimeoutError:
                 if hasattr(self.ui, "end_stream"):
-                    self.ui.end_stream()
+                    self.events.emit(StreamEnded())
                 if hasattr(self.ui, "stop_thinking"):
-                    self.ui.stop_thinking(0.0)
+                    self.events.emit(ThinkingStopped(elapsed_seconds=0.0))
                 if not retried_after_timeout:
                     retried_after_timeout = True
                     self.compact_history()
                     if hasattr(self.ui, "print_recovery"):
-                        self.ui.print_recovery(
+                        self.events.emit(Recovery(message=
                             "LLM timed out; retrying once with compacted context."
-                        )
+                        ))
                     continue
                 self.state.last_turn_guardrail = (
                     "LLM recovery timed out after "
                     f"{self.llm_recovery_timeout_seconds:g}s; returned control safely"
                 )
-                self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                 return
 
             self.state.history.append(
@@ -395,11 +429,11 @@ class MarcusLoop:
                 self.state.active_plan = plan_text
                 self.state.history[-1].content = plan_text
                 plan_shown = True
-                self.ui.print_assistant(plan_text)
+                self.events.emit(AssistantMessage(text=plan_text))
                 tracker.advance(Phase.implement, "ดำเนินงานตามแผน")
                 self.state.active_phase = Phase.implement
                 if hasattr(self.ui, "update_todo"):
-                    self.ui.update_todo(tracker)
+                    self.events.emit(TodoUpdated(tracker=tracker))
                 # A real gateway receives no tool schemas during planning, so a
                 # text response is the expected path. Scripted/test gateways may
                 # still return calls; execute them only after recording a plan.
@@ -418,7 +452,7 @@ class MarcusLoop:
                         )
                         continue
                     self.state.last_turn_guardrail = "final answer blocked: background processes started by this turn are still active"
-                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                    self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                     return
                 evidence = self.state.verification_evidence
                 verification_current = (
@@ -444,30 +478,30 @@ class MarcusLoop:
                         tracker.advance(Phase.validate, "ต้องมีหลักฐานจาก revision ปัจจุบัน")
                         self.state.active_phase = Phase.validate
                         if hasattr(self.ui, "update_todo"):
-                            self.ui.update_todo(tracker)
+                            self.events.emit(TodoUpdated(tracker=tracker))
                         continue
                     self.state.last_turn_guardrail = (
                         "final answer blocked: requested verification has no successful evidence"
                     )
-                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                    self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                     return
                 self._trim_history()
                 tracker.finish("ส่งมอบคำตอบพร้อมหลักฐาน")
                 self.state.active_phase = Phase.deliver
                 if hasattr(self.ui, "update_todo"):
-                    self.ui.update_todo(tracker)
+                    self.events.emit(TodoUpdated(tracker=tracker))
                 if response.content:
                     final_content = self._final_with_evidence(response.content, contract)
                     if hasattr(self.ui, "print_final_answer"):
-                        self.ui.print_final_answer(final_content)
+                        self.events.emit(FinalAnswer(text=final_content))
                     else:
-                        self.ui.print_assistant(final_content)
+                        self.events.emit(AssistantMessage(text=final_content))
                 elif hasattr(self.ui, "finish_steps"):
-                    self.ui.finish_steps(success=True)
+                    self.events.emit(TurnFinished(success=True))
                 return
 
             if response.content and not planning_phase:
-                self.ui.print_assistant(response.content)
+                self.events.emit(AssistantMessage(text=response.content))
 
             if all(
                 is_verification_attempt(call.name, call.arguments) for call in response.tool_calls
@@ -478,14 +512,14 @@ class MarcusLoop:
                 tracker.advance(Phase.implement, "เรียกเครื่องมือตามแผน")
                 self.state.active_phase = Phase.implement
             if hasattr(self.ui, "update_todo"):
-                self.ui.update_todo(tracker)
+                self.events.emit(TodoUpdated(tracker=tracker))
 
             selected_calls, rejected_calls = self._plan_tool_calls(response.tool_calls)
 
             # Reject calls that exceed the per-step policy before execution.
             for call in rejected_calls:
                 policy_reason = self._policy_reason_for_rejected(call, selected_calls)
-                self.ui.print_tool_error(call.name, policy_reason)
+                self.events.emit(ToolCallFailed(tool_name=call.name, error=policy_reason))
                 observation = {
                     "status": "error",
                     "error": policy_reason,
@@ -565,7 +599,7 @@ class MarcusLoop:
                             "different tool or different arguments before proceeding."
                         )
                         if hasattr(self.ui, "print_recovery"):
-                            self.ui.print_recovery(recovery_message)
+                            self.events.emit(Recovery(message=recovery_message))
                         self.state.history.append(
                             LLMMessage(role="system", content=recovery_message)
                         )
@@ -576,7 +610,7 @@ class MarcusLoop:
                         f"{REPEATED_CALL_WINDOW} times in a row; "
                         f"recovery budget exhausted ({identical_call_recovery_attempts}/2)"
                     )
-                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                    self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                     return
 
                 fingerprint = (
@@ -600,7 +634,7 @@ class MarcusLoop:
                         self.state.last_turn_guardrail = (
                             f"no progress after 3 calls to {call.name!r}; stopped to prevent a loop"
                         )
-                        self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                        self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                         return
 
                 if observation.get("code") == "INVALID_ARGUMENT":
@@ -610,7 +644,7 @@ class MarcusLoop:
                             f"argument repair budget exhausted for {call.name!r} "
                             f"({self.max_argument_repairs})"
                         )
-                        self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                        self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                         return
                 if "error" in observation and "declined" not in str(observation["error"]):
                     consecutive_tool_failures += 1
@@ -626,11 +660,11 @@ class MarcusLoop:
                         "too many consecutive tool failures "
                         f"({self.max_consecutive_tool_failures}); stopped to prevent a retry loop"
                     )
-                    self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+                    self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                     return
 
         self.state.last_turn_guardrail = f"exceeded max steps ({self.max_steps})"
-        self.ui.print_guardrail_stop(self.state.last_turn_guardrail)
+        self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
 
     @staticmethod
     def _is_structured_plan(content: str | None) -> bool:
@@ -1001,9 +1035,9 @@ class MarcusLoop:
                 cache_key = (call.name, self._cache_key_for_arguments(call.arguments))
                 cached = self.state.tool_result_cache.get(cache_key)
                 if cached is not None:
-                    self.ui.print_tool_call(call.name, call.arguments)
+                    self.events.emit(ToolCallStarted(tool_name=call.name, arguments=call.arguments))
                     if hasattr(self.ui, "print_tool_result"):
-                        self.ui.print_tool_result(call.name, cached)
+                        self.events.emit(ToolCallCompleted(tool_name=call.name, result=cached))
                     return call.id, cached
             observation = await self._invoke_tool_handler(call)
             if cache_key is not None and "error" not in observation:
@@ -1039,14 +1073,14 @@ class MarcusLoop:
         tool = self.tools_by_name.get(call.name)
         if tool is None:
             error = f"unknown tool: {call.name}"
-            self.ui.print_tool_error(call.name, error)
+            self.events.emit(ToolCallFailed(tool_name=call.name, error=error))
             return {"error": error}
 
-        self.ui.print_tool_call(call.name, call.arguments)
+        self.events.emit(ToolCallStarted(tool_name=call.name, arguments=call.arguments))
 
         if not tool_is_allowed(self.mode, tool.risk_tier):
             error = f"tool {call.name!r} is not available in {self.mode.value} mode"
-            self.ui.print_tool_error(call.name, error)
+            self.events.emit(ToolCallFailed(tool_name=call.name, error=error))
             return {"error": error}
 
         retryable = (tool.risk_tier.value == "read_only" or tool.idempotent) and call.name not in {
@@ -1060,17 +1094,17 @@ class MarcusLoop:
             except Exception as exc:  # noqa: BLE001 - failures become observations
                 if attempt + 1 < max_attempts:
                     if hasattr(self.ui, "print_recovery"):
-                        self.ui.print_recovery(
+                        self.events.emit(Recovery(message=
                             f"Tool {call.name} failed; retrying safely "
                             f"({attempt + 2}/{max_attempts})."
-                        )
+                        ))
                     continue
-                self.ui.print_tool_error(call.name, str(exc))
+                self.events.emit(ToolCallFailed(tool_name=call.name, error=str(exc)))
                 return {"error": str(exc)}
 
         observation = truncate_result(result, max_chars=self.result_max_chars)
         if hasattr(self.ui, "print_tool_result"):
-            self.ui.print_tool_result(call.name, observation)
+            self.events.emit(ToolCallCompleted(tool_name=call.name, result=observation))
         return observation
 
     async def _process_tool_call(self, call: ToolCall) -> dict:
@@ -1078,20 +1112,20 @@ class MarcusLoop:
         tool = self.tools_by_name.get(call.name)
         if tool is None:
             error = f"unknown tool: {call.name}"
-            self.ui.print_tool_error(call.name, error)
+            self.events.emit(ToolCallFailed(tool_name=call.name, error=error))
             return {"error": error}
 
         try:
             call.arguments = normalize_and_validate_arguments(tool.parameters, call.arguments)
         except ToolArgumentError as exc:
-            self.ui.print_tool_error(call.name, str(exc))
+            self.events.emit(ToolCallFailed(tool_name=call.name, error=str(exc)))
             return {"error": str(exc), "code": exc.code, "retryable": True}
 
-        self.ui.print_tool_call(call.name, call.arguments)
+        self.events.emit(ToolCallStarted(tool_name=call.name, arguments=call.arguments))
 
         if not tool_is_allowed(self.mode, tool.risk_tier):
             error = f"tool {call.name!r} is not available in {self.mode.value} mode"
-            self.ui.print_tool_error(call.name, error)
+            self.events.emit(ToolCallFailed(tool_name=call.name, error=error))
             return {"error": error}
 
         if (
@@ -1104,10 +1138,15 @@ class MarcusLoop:
             and call.name not in self.state.always_allowed
         ):
             decision = self.ui.confirm_tool_call(tool, call.arguments)
+            # A Textual/async prompter returns an awaitable so it can pop up
+            # a modal on its own event loop; the terminal UI returns a plain
+            # string. Handle both without asking callers to care.
+            if inspect.isawaitable(decision):
+                decision = await decision
             if decision == "always":
                 self.state.always_allowed.add(call.name)
             elif decision == "no":
-                self.ui.print_tool_declined(call.name)
+                self.events.emit(ToolCallDeclined(tool_name=call.name))
                 return {"error": "user declined this tool call"}
 
         return await self._invoke_tool_handler(call)

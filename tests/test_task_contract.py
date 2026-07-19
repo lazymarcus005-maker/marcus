@@ -1,4 +1,4 @@
-from marcus_code.task_contract import (
+from marcus_code.runtime.task_contract import (
     Capability,
     ResponseMode,
     TaskKind,

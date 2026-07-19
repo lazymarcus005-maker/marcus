@@ -1,6 +1,6 @@
 import pytest
 
-from marcus_code.skills import build_load_skill_tool, build_skill_catalog, discover_local_skills
+from marcus_code.runtime.skills import build_load_skill_tool, build_skill_catalog, discover_local_skills
 
 
 def _write_skill(root, name="review", description="Review code safely"):

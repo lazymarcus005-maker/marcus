@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import base64
 import contextlib
@@ -13,23 +12,26 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import httpx
+import typer
 
 from harness.config import Settings
 from harness.llm.gateway import LLMGateway
-from marcus_code.commands import CommandContext, dispatch
-from marcus_code.config import (
+from marcus_code.cli.commands import CommandContext, dispatch
+from marcus_code.runtime.event_bus import EventBus
+from marcus_code.state.config import (
     has_llm_credentials,
     load_project_instructions,
     resolve_settings,
     save_user_config,
 )
-from marcus_code.loop import MarcusLoop
-from marcus_code.modes import AgentMode
-from marcus_code.ollama_usage import is_ollama_cloud, load_cached_ollama_email
-from marcus_code.prompt import build_system_prompt
-from marcus_code.skills import build_skill_catalog
-from marcus_code.tools import build_marcus_tools
-from marcus_code.ui import TerminalUI
+from marcus_code.runtime.agent import MarcusLoop
+from marcus_code.runtime.modes import AgentMode
+from marcus_code.runtime.ollama_usage import is_ollama_cloud, load_cached_ollama_email
+from marcus_code.runtime.prompt import build_system_prompt
+from marcus_code.runtime.skills import build_skill_catalog
+from marcus_code.tools.base import build_marcus_tools
+from marcus_code.ui.console import TerminalUI
+from marcus_code.ui.renderer import TerminalRenderer
 
 
 def _current_version() -> str:
@@ -101,7 +103,8 @@ def _detect_install_method() -> str:
         return "pip"
 
     # Running from the repo source tree with `uv run marcus`.
-    marker = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    # cli/app.py → cli/ → marcus_code/ → repo root
+    marker = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
     if marker.is_file():
         return "local_dev"
 
@@ -616,10 +619,17 @@ async def _amain(
     llm = LLMGateway(settings=settings)
     tools = build_marcus_tools(root, settings)
     project_instructions = load_project_instructions(root)
+    # Explicitly wire the event bus at the CLI boundary. The agent emits
+    # one-way notifications through the bus; the terminal renderer forwards
+    # them to the TerminalUI. This is the seam where a Textual/web renderer
+    # would attach in the future.
+    events = EventBus()
+    events.subscribe(TerminalRenderer(ui).handle)
     loop = MarcusLoop(
         llm,
         tools,
         ui,
+        events=events,
         model=settings.llm_model,
         system_prompt=build_system_prompt(
             root,
@@ -688,48 +698,211 @@ async def _amain(
             await ui.aclose()
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="marcus")
-    parser.add_argument("-v", "--version", action="version", version=_version_string())
-    parser.add_argument(
-        "--update",
-        action="store_true",
-        help="update Marcus to the latest release (or the version given as an argument)",
+async def _amain_tui(mode: AgentMode | None) -> None:
+    """Interactive TUI variant of ``_amain``.
+
+    The Textual app owns the event loop, so instead of an explicit REPL we
+    hand it a submit callback that dispatches slash commands or turns. The
+    same ``MarcusLoop`` and ``EventBus`` are used — only the renderer and
+    prompter change.
+    """
+    from marcus_code.ui.tui import MarcusTuiApp, TuiPrompter
+
+    root = Path.cwd()
+    settings = resolve_settings()
+    if mode is None:
+        try:
+            mode = AgentMode(settings.cli_default_mode)
+        except ValueError:
+            mode = AgentMode.agent
+    if not has_llm_credentials(settings):
+        typer.echo(
+            "No LLM credentials configured. Run `marcus` once in your terminal "
+            "to complete first-time setup, then relaunch `marcus tui`."
+        )
+        return
+    session_name = _new_session_name()
+
+    llm = LLMGateway(settings=settings)
+    tools = build_marcus_tools(root, settings)
+    project_instructions = load_project_instructions(root)
+    events = EventBus()
+
+    # We need the app instance both for the prompter (approval modal) and
+    # the renderer (log writes), so build a stub reference we can fill in
+    # once the app has been created below.
+    app_holder: dict[str, MarcusTuiApp] = {}
+
+    class _AppProxy:
+        """Thin proxy so ``TuiPrompter`` can receive ``self._app`` before
+        the real ``MarcusTuiApp`` exists (chicken-and-egg: the loop needs
+        the prompter to construct, the app needs the loop to submit to)."""
+
+        def __getattr__(self, name: str):
+            return getattr(app_holder["app"], name)
+
+    prompter = TuiPrompter(_AppProxy())  # type: ignore[arg-type]
+
+    loop = MarcusLoop(
+        llm,
+        tools,
+        prompter,
+        events=events,
+        model=settings.llm_model,
+        system_prompt=build_system_prompt(
+            root,
+            project_instructions=project_instructions,
+            git_summary=_git_summary(root),
+            skill_catalog=build_skill_catalog(root),
+            mode=mode,
+        ),
+        max_steps=settings.cli_max_steps,
+        max_history_messages=settings.cli_max_history_messages,
+        max_total_tokens=settings.cli_max_total_tokens,
+        history_summary_enabled=settings.cli_history_summary_enabled,
+        mode=mode,
+        context_window_tokens=settings.cli_context_window_tokens,
+        compact_threshold_percent=settings.cli_compact_threshold_percent,
+        compact_target_percent=settings.cli_compact_target_percent,
+        llm_recovery_timeout_seconds=settings.cli_llm_recovery_timeout_seconds,
+        max_tool_calls_per_step=settings.cli_max_tool_calls_per_step,
+        max_argument_repairs=settings.cli_max_argument_repairs,
     )
-    parser.add_argument("-y", "--yes", action="store_true", help="skip confirmation prompts")
-    parser.add_argument("--mode", choices=[mode.value for mode in AgentMode])
-    parser.add_argument("-p", "--prompt", help="run one prompt non-interactively")
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        help="disable colored output and use ASCII characters for progress bars",
+    ctx = CommandContext(ui=prompter, loop=loop, settings=settings)
+
+    async def _on_submit(text: str) -> None:
+        stripped = text.strip()
+        if not stripped:
+            return
+        try:
+            if stripped.startswith("/"):
+                await dispatch(ctx, stripped)
+                return
+            await loop.run_turn(text)
+        finally:
+            if hasattr(tools, "process_manager"):
+                await tools.process_manager.aclose()
+                loop.state.active_process_ids.clear()
+
+    tui_app = MarcusTuiApp(
+        events,
+        on_submit=_on_submit,
+        status_provider=lambda: loop.status(str(root)),
+        session_name=session_name,
     )
-    return parser
+    app_holder["app"] = tui_app
+    try:
+        await tui_app.run_async()
+    finally:
+        if hasattr(tools, "aclose"):
+            await tools.aclose()
+        await loop.llm.aclose()
+
+
+app = typer.Typer(
+    name="marcus",
+    help="Marcus Code — an AI coding agent CLI.",
+    no_args_is_help=False,
+    add_completion=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(_version_string())
+        raise typer.Exit()
+
+
+def _run_interactive(
+    prompt: str | None, mode: AgentMode | None, *, no_color: bool
+) -> None:
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(_amain(prompt, mode, no_color=no_color))
+
+
+@app.callback(invoke_without_command=True)
+def _default(
+    ctx: typer.Context,
+    prompt: str | None = typer.Option(
+        None, "-p", "--prompt", help="run one prompt non-interactively"
+    ),
+    mode: AgentMode | None = typer.Option(
+        None, "--mode", case_sensitive=False, help="agent mode (ask, agent, auto, yolo)"
+    ),
+    no_color: bool = typer.Option(
+        False, "--no-color", help="disable colored output; use ASCII progress bars"
+    ),
+    update: bool = typer.Option(
+        False, "--update", help="update Marcus to the latest release"
+    ),
+    yes: bool = typer.Option(
+        False, "-y", "--yes", help="skip confirmation prompts"
+    ),
+    show_version: bool | None = typer.Option(
+        None,
+        "-v",
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="show program's version and exit",
+    ),
+) -> None:
+    """Default entry — runs the interactive REPL or the requested subcommand."""
+    if _report_deferred_update_result():
+        raise typer.Exit()
+    if update:
+        raise typer.Exit(_run_update(None, assume_yes=yes))
+    if ctx.invoked_subcommand is not None:
+        # A subcommand (e.g. `marcus update`) will handle the run itself;
+        # stash shared flags so the subcommand can read them.
+        ctx.obj = {"yes": yes}
+        return
+    _run_interactive(prompt, mode, no_color=no_color)
+
+
+@app.command("update")
+def _cmd_update(
+    ctx: typer.Context,
+    target: str | None = typer.Argument(
+        None, help="specific version to install (defaults to latest release)"
+    ),
+    yes: bool = typer.Option(False, "-y", "--yes", help="skip confirmation prompts"),
+) -> None:
+    """Update Marcus to the latest release (or a specific version)."""
+    inherited_yes = bool((ctx.obj or {}).get("yes"))
+    version_arg = target.lstrip("v") if target else None
+    raise typer.Exit(_run_update(version_arg, assume_yes=yes or inherited_yes))
+
+
+@app.command("version")
+def _cmd_version() -> None:
+    """Show the installed Marcus version."""
+    typer.echo(_version_string())
+
+
+@app.command("tui")
+def _cmd_tui(
+    mode: AgentMode | None = typer.Option(
+        None, "--mode", case_sensitive=False, help="agent mode (ask, agent, auto, yolo)"
+    ),
+) -> None:
+    """Launch the Textual dashboard (``pip install 'marcus[tui]'``)."""
+    try:
+        from marcus_code.ui.tui import MarcusTuiApp, TuiPrompter
+    except ImportError as exc:
+        typer.echo(
+            "Textual is not installed. Install the TUI extras with "
+            "'uv tool install marcus[tui]' or 'pip install marcus[tui]'."
+        )
+        typer.echo(f"(missing dependency: {exc.name})")
+        raise typer.Exit(1) from exc
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(_amain_tui(mode))
 
 
 def main() -> None:
-    if _report_deferred_update_result():
-        raise SystemExit(0)
-    parser = _build_parser()
-    args, remaining = parser.parse_known_args()
-
-    # Support both `marcus --update` and the subcommand style `marcus update`.
-    if args.update or (remaining and remaining[0] == "update"):
-        target_version = None
-        if remaining and remaining[0] == "update" and len(remaining) > 1:
-            target_version = remaining[1].lstrip("v")
-        raise SystemExit(_run_update(target_version, assume_yes=args.yes))
-    if remaining:
-        parser.error(f"unrecognized arguments: {' '.join(remaining)}")
-
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(
-            _amain(
-                args.prompt,
-                AgentMode(args.mode) if args.mode else None,
-                no_color=args.no_color,
-            )
-        )
+    app()
 
 
 if __name__ == "__main__":

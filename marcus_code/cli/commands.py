@@ -4,15 +4,15 @@ from dataclasses import dataclass
 from harness.config import Settings
 from harness.llm.gateway import LLMGateway
 from harness.llm.types import LLMMessage
-from marcus_code.config import has_llm_credentials, resolve_settings, save_user_config
-from marcus_code.loop import MarcusLoop
-from marcus_code.modes import AgentMode, mode_help, mode_hint, mode_instructions
-from marcus_code.ollama_usage import (
+from marcus_code.state.config import has_llm_credentials, resolve_settings, save_user_config
+from marcus_code.runtime.agent import MarcusLoop
+from marcus_code.runtime.modes import AgentMode, mode_help, mode_hint, mode_instructions
+from marcus_code.runtime.ollama_usage import (
     OllamaCloudUsageClient,
     OllamaUsageError,
     is_ollama_cloud,
 )
-from marcus_code.ui import TerminalUI
+from marcus_code.ui.console import TerminalUI
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 
@@ -45,7 +45,7 @@ async def _cmd_help(ctx: CommandContext, args: str) -> None:
 
 
 async def _cmd_model(ctx: CommandContext, args: str) -> None:
-    from marcus_code.config import has_llm_credentials, save_user_config
+    from marcus_code.state.config import has_llm_credentials, save_user_config
 
     name = args.strip()
     if not name:
@@ -104,11 +104,6 @@ async def _cmd_usage(ctx: CommandContext, args: str) -> None:
         return
     if hasattr(ctx.ui, "print_ollama_cloud_usage"):
         ctx.ui.print_ollama_cloud_usage(usage)
-
-
-async def _cmd_steps(ctx: CommandContext, args: str) -> None:
-    if hasattr(ctx.ui, "print_steps"):
-        ctx.ui.print_steps()
 
 
 async def _cmd_retry(ctx: CommandContext, args: str) -> None:
@@ -203,7 +198,7 @@ async def _cmd_theme(ctx: CommandContext, args: str) -> None:
     if not hasattr(ctx.ui, "set_theme"):
         ctx.ui.print_error("theme switching is not supported by this UI")
         return
-    from marcus_code.ui import ThemeName
+    from marcus_code.ui.console import ThemeName
 
     theme_value: ThemeName = value  # type: ignore[assignment]
     ctx.ui.set_theme(theme_value)
@@ -289,7 +284,6 @@ COMMANDS: dict[str, CommandHandler] = {
     "/?": _cmd_help,
     "/model": _cmd_model,
     "/usage": _cmd_usage,
-    "/steps": _cmd_steps,
     "/retry": _cmd_retry,
     "/continue": _cmd_continue,
     "/compact": _cmd_compact,

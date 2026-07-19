@@ -739,8 +739,8 @@ def build_fetch_url_tool(settings: Settings) -> Tool:
 
 
 def build_marcus_tools(root: Path, settings: Settings) -> MarcusTools:
-    from marcus_code.skills import build_load_skill_tool
-    from marcus_code.tools_extra import build_marcus_extra_tools
+    from marcus_code.runtime.skills import build_load_skill_tool
+    from marcus_code.tools.extra import build_marcus_extra_tools
 
     process_manager = BackgroundProcessManager(
         root, max_output_chars=settings.tools_run_cli_max_output_bytes

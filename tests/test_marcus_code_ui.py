@@ -6,9 +6,9 @@ import pytest
 from prompt_toolkit.document import Document
 from rich.console import Console
 
-from marcus_code.ollama_usage import OllamaCloudUsage, UsagePeriod
-from marcus_code.todo_tracker import Phase, TodoTracker
-from marcus_code.ui import SlashCommandAutoSuggest, TerminalUI, Theme, _history_path
+from marcus_code.runtime.ollama_usage import OllamaCloudUsage, UsagePeriod
+from marcus_code.runtime.todo_tracker import Phase, TodoTracker
+from marcus_code.ui.console import SlashCommandAutoSuggest, TerminalUI, Theme, _history_path
 
 
 @pytest.mark.asyncio
@@ -21,15 +21,17 @@ async def test_slash_command_auto_suggest_filters_and_limits_to_seven():
         suggestion = await suggester.get_suggestion_async(fake_buffer, doc)
         return suggestion.text if suggestion else None
 
+    # /steps was retired when the working panel was replaced with an
+    # append-only timeline — the completer list must reflect that.
     assert await suggest("/") == "  |  ".join(
         [
             "/help",
             "/?",
             "/model",
             "/usage",
-            "/steps",
             "/status",
             "/compact",
+            "/retry",
         ]
     )
     assert await suggest("/m") == "  |  ".join(
@@ -75,114 +77,76 @@ def _capturing_ui(*, height: int | None = None) -> tuple[TerminalUI, StringIO]:
     return ui, stream
 
 
-def test_thinking_indicator_stays_inside_working_box():
+def test_thinking_indicator_emits_a_thought_summary_line():
+    # Append-only surface: start_thinking is transient (spinner on TTYs only,
+    # no-op in tests) and stop_thinking prints one compact "thought Xs" line.
     ui, stream = _capturing_ui()
-
     ui.begin_turn()
     ui.start_thinking()
-    ui.console.print(ui._working_renderable())
-    assert "thinking" in stream.getvalue()
-
     ui.stop_thinking(1.234)
-    ui.console.print(ui._working_renderable())
-    assert "thought 1.2s" in stream.getvalue()
+
+    output = stream.getvalue()
+    assert "thought 1.2s" in output
+    # No live-refreshed panel means no box characters.
+    assert "┌" not in output and "╭" not in output
 
 
-def test_working_view_is_one_minimal_box_for_phase_thinking_and_steps():
+def test_tool_call_and_result_render_inline_without_a_box():
     ui, stream = _capturing_ui()
-    ui.bind_status(
-        lambda: {
-            "session_started_at": datetime.now(),
-            "model": "test-model",
-            "mode": "agent",
-            "workspace": "workspace",
-            "context_tokens": 25,
-            "context_limit": 100,
-            "total_tokens": 50,
-            "tokens_per_second": 10.0,
-        }
-    )
     ui.begin_turn()
     todo = TodoTracker()
     todo.advance(Phase.implement, "working")
     ui.update_todo(todo)
     ui.print_tool_call("read_file", {"path": "app.py"})
     ui.print_tool_result("read_file", {"path": "app.py", "lines": 20})
-    ui.start_thinking()
-
-    ui.console.print(ui._working_renderable())
 
     output = stream.getvalue()
-    # Rich may select square or rounded borders depending on the platform.
-    assert output.count("┌") + output.count("╭") == 1
-    assert output.count("└") + output.count("╰") == 1
+    # Phase breadcrumb + tool line + result line — three inline rows,
+    # no bordered panel around them.
     assert "ดำเนินการ" in output
+    assert "1. Read file" in output
     assert "app.py" in output
-    assert "thinking" in output
-    assert "test-model · ctx 25% · agent" in output
-    assert "Session" not in output
+    assert "Read app.py (20 lines)" in output
+    assert "┌" not in output and "╭" not in output
 
 
-def test_tool_call_collapses_when_finished_unsuccessfully():
+def test_finish_steps_prints_single_summary_line_on_failure():
     ui, stream = _capturing_ui()
-
+    ui.begin_turn()
     ui.print_tool_call("run_cli", {"command": "curl http://localhost:5234/"})
     ui.finish_steps(success=False)
 
     output = stream.getvalue()
-    assert "× stopped · 1 tool(s) · /steps" in output
+    # Terminal scrollback shows every tool call already; the summary line
+    # no longer hints at a /steps recap since that command was removed.
+    assert "× stopped · 1 tool(s)" in output
+    assert "/steps" not in output
 
 
-def test_command_result_collapses_and_steps_expands():
+def test_finish_steps_summary_reports_tool_count_on_success():
     ui, stream = _capturing_ui()
-
-    ui.print_tool_call("run_cli", {"command": 'echo \'{"usd":100,"thb":3550}\''})
+    ui.begin_turn()
+    ui.print_tool_call("run_cli", {"command": 'echo hi'})
     ui.print_tool_result(
         "run_cli",
-        {"exit_code": 0, "stdout": '{"usd":100,"thb":3550}', "stderr": ""},
+        {"exit_code": 0, "stdout": "hi", "stderr": ""},
     )
-    ui.finish_steps(success=False)
+    ui.finish_steps(success=True)
 
     output = stream.getvalue()
-    assert "× stopped · 1 tool(s) · /steps" in output
-
-    ui.print_steps()
-    expanded = stream.getvalue()
-    assert "Command finished with exit code 0" in expanded
-    assert '"usd":100' in expanded
-    assert '"thb":3550' in expanded
+    assert "✓ done · 1 tool(s)" in output
 
 
-def test_process_results_collapses_and_steps_expands():
+def test_final_answer_follows_steps_with_blank_line():
     ui, stream = _capturing_ui()
-
-    ui.print_tool_call("start_process", {"command": "node server.js"})
-    ui.print_tool_result(
-        "start_process",
-        {"status": "running", "process_id": "abc123def456", "pid": 42},
-    )
-    ui.print_tool_call("stop_process", {"process_id": "abc123def456"})
-    ui.print_tool_result("stop_process", {"process_id": "abc123def456", "status": "stopped"})
-    ui.finish_steps(success=False)
-
-    output = stream.getvalue()
-    assert "× stopped · 2 tool(s) · /steps" in output
-
-    ui.print_steps()
-    expanded = stream.getvalue()
-    assert "process abc123def456, PID 42" in expanded
-    assert "Service stopped (process abc123def456)" in expanded
-
-
-def test_final_answer_has_spacing_heading_and_content():
-    ui, stream = _capturing_ui()
+    ui.begin_turn()
     ui.print_tool_call("run_cli", {"command": "pytest -q"})
     ui.print_tool_result("run_cli", {"exit_code": 0, "stdout": "1 passed", "stderr": ""})
 
     ui.print_final_answer("API ทำงานสำเร็จ")
 
     output = stream.getvalue()
-    assert "✓ done · 1 tool(s) · /steps" in output
+    assert "✓ done · 1 tool(s)" in output
     assert output.rstrip().endswith("API ทำงานสำเร็จ")
 
 
@@ -193,41 +157,8 @@ def test_direct_answer_without_tools_has_no_result_heading_or_preamble():
 
     output = stream.getvalue()
     assert output.startswith("JWT คือ")
-    assert "ผลการทำงาน" not in output
-    assert "งานสำเร็จ" not in output
-
-
-def test_success_collapses_steps_and_steps_command_restores_details():
-    ui, stream = _capturing_ui()
-    ui.print_tool_call("run_cli", {"command": "pytest -q"})
-    ui.print_tool_result("run_cli", {"exit_code": 0, "stdout": "10 passed", "stderr": ""})
-
-    ui.finish_steps(success=True)
-    collapsed = stream.getvalue()
-    assert "✓ done · 1 tool(s) · /steps" in collapsed
-
-    ui.print_steps()
-    expanded = stream.getvalue()
-    assert "run_cli(command='pytest -q')" in expanded
-    assert "10 passed" in expanded
-    assert "Last steps" in expanded
-
-
-def test_working_box_keeps_latest_lines_visible_when_terminal_is_short():
-    ui, stream = _capturing_ui(height=12)
-    for index in range(8):
-        ui.print_tool_call("read_file", {"path": f"file-{index}.txt"})
-        ui.print_tool_result("read_file", {"path": f"file-{index}.txt", "lines": index + 1})
-
-    ui.finish_steps(success=False)
-
-    output = stream.getvalue()
-    assert "× stopped · 8 tool(s) · /steps" in output
-
-    ui.print_steps()
-    expanded = stream.getvalue()
-    assert "earlier line(s) hidden; use /steps" in expanded
-    assert "file-7.txt" in expanded
+    assert "done" not in output
+    assert "stopped" not in output
 
 
 def test_status_bar_shows_retained_context_usage_and_session_details():
@@ -430,14 +361,9 @@ def test_banner_shows_provider_next_to_model_and_profile_email(tmp_path):
     )
 
     output = stream.getvalue()
-    # Single-column key/value layout: each label sits on its own row so
-    # narrow terminals no longer clip the second column mid-word.
     assert "Model" in output and "gpt-oss:120b" in output
     assert "Provider" in output and "https://ollama.com/v1" in output
     assert "Profile" in output and "user@example.com" in output
-    # Labels are aligned by longest ("Workspace" / "Provider" / "Session")
-    # via ljust, so each label is followed by at least one space before
-    # the value — verify that alignment rather than the pipe divider.
     assert "Workspace  " in output
     assert "Model      " in output
     assert "Provider   " in output
@@ -531,12 +457,12 @@ def test_status_renderable_uses_ascii_bars_in_no_color_mode():
     )
     text = ui._status_renderable()
     assert "[##------------------]" in text.plain
-    assert "\u2588" not in text.plain
-    assert "\u2591" not in text.plain
+    assert "█" not in text.plain
+    assert "░" not in text.plain
 
 
 def test_history_path_creates_user_config_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr("marcus_code.ui.USER_CONFIG_DIR", tmp_path / ".marcus")
+    monkeypatch.setattr("marcus_code.ui.console.USER_CONFIG_DIR", tmp_path / ".marcus")
     path = _history_path()
     assert path.parent.exists()
     assert path.name == "history"

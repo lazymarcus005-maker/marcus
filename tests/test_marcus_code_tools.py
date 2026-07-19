@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from harness.config import Settings
-from marcus_code.tools import (
+from marcus_code.tools.base import (
     BackgroundProcessManager,
     build_background_process_tools,
     build_edit_file_tool,
@@ -328,7 +328,7 @@ async def test_fetch_url_strips_html_and_returns_text():
             return_value=[(0, 0, 0, "", ("93.184.216.34", 443))],
         ),
         patch(
-            "marcus_code.tools.httpx.AsyncClient",
+            "marcus_code.tools.base.httpx.AsyncClient",
             return_value=_FakeAsyncClient(
                 _FakeResponse(content=body, headers={"content-type": "text/html"})
             ),
