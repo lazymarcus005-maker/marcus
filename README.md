@@ -1,97 +1,180 @@
-# marcus
+# Marcus
 
-Hermes-style AI agent harness — a stateless agent runtime with PostgreSQL as the
-source of truth for run state, skills, and audit history.
+Marcus is a local coding-agent CLI built on the Harness agent runtime. It can
+read and edit files, run commands, manage long-running local processes, track
+token usage, and apply risk-based approval rules while working inside the
+current project.
 
-See `idea.md` for the design, `decisions.md` for the technical decisions taken,
-and `tasks.md` for the implementation plan (tracked as GitHub issues).
+The repository also contains the broader Harness stack: FastAPI, PostgreSQL,
+Redis, RabbitMQ, workers, scheduling, skills, audit history, and a React web UI.
 
-## Stack
+## What Is In This Repo
 
-Python 3.12 + FastAPI, PostgreSQL, Redis, RabbitMQ. See `decisions.md` D1–D4.
+- `marcus_code/` - the local Marcus Code CLI and terminal/TUI experience.
+- `harness/` - the server-side agent runtime, API, workers, tools, DB models,
+  auth, MCP plumbing, and observability.
+- `web/` - the React UI served by the API when built.
+- `docs/` - schema, runbook, and design notes.
+- `.github/workflows/` - CI and GitHub release automation.
 
-## Development
+See `idea.md`, `decisions.md`, and `tasks.md` for design history and planning.
 
-```bash
-uv sync --all-extras --dev
-cp .env.example .env
+## Requirements
 
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy harness
-uv run pytest --cov=harness
+- Python 3.12 or newer
+- `uv`
+- Node.js/npm for the web UI
+- Docker, if running the full Harness stack locally
 
-uv run uvicorn harness.api.app:app --reload
+## Install Marcus CLI
 
-cd web
-npm install
-npm run dev
-```
-
-`GET /healthz` — liveness (process up, no dependency checks).
-`GET /readyz` — readiness (checks PostgreSQL, Redis, RabbitMQ connectivity).
-
-The production React UI is served by the API at `/app` when `web/dist` is
-present. The Vite dev server proxies API calls to `http://localhost:8000`.
-
-## Marcus CLI
-
-### Install a released version
-
-Requires Python 3.12 or newer. Install the CLI into an isolated tool
-environment with a pinned release:
+Install the latest released wheel into an isolated `uv` tool environment:
 
 ```bash
-uv tool install "marcus==0.1.0"
+uv tool install --force https://github.com/lazymarcus005-maker/marcus/releases/download/v2.1.5/marcus-2.1.5-py3-none-any.whl
+marcus --version
 marcus --help
 ```
 
-Alternatively, install the wheel asset from a GitHub release with `pipx`:
+For unreleased work from this checkout, run locally:
 
 ```bash
-pipx install https://github.com/lazymarcus005-maker/marcus/releases/download/v0.1.0/marcus-0.1.0-py3-none-any.whl
-```
-
-Verify a downloaded release asset before installing:
-
-```bash
-sha256sum -c SHA256SUMS --ignore-missing
-```
-
-Upgrade or pin a specific release with `uv tool install --force
-"marcus==<version>"`. The `marcus` command is provided by the package's
-console entrypoint; the server and worker remain available from the same
-distribution.
-
-Run the local coding agent interactively:
-
-```bash
+uv sync --all-extras --dev
 uv run marcus
 ```
 
-Run one prompt for scripts or CI:
+Or install the checkout into the local `uv` tool environment:
+
+```bash
+uv tool install --force .
+```
+
+Run one prompt non-interactively:
 
 ```bash
 uv run marcus -p "inspect the failing tests and summarize the cause"
 ```
 
-CLI guardrails can be configured with environment variables using the
-`HARNESS_` prefix:
+Launch the Textual TUI:
 
 ```bash
-HARNESS_CLI_MAX_TOTAL_TOKENS=50000
-HARNESS_CLI_MAX_HISTORY_MESSAGES=100
-HARNESS_CLI_HISTORY_SUMMARY_ENABLED=true
+uv run marcus tui
 ```
 
-Inside the REPL, `/usage` shows calls, token totals, configured budget, and
-remaining tokens. Use `/config` to inspect session LLM settings and `/exit` to
-leave the session.
+## First-Time Config
 
-### Local CLI skills
+Marcus defaults to Ollama Cloud:
 
-The CLI discovers portable Markdown skills from `.marcus/skills/`. Each skill
-is a directory containing `SKILL.md` with YAML frontmatter:
+```text
+https://ollama.com/v1
+```
+
+Start `marcus` and run:
+
+```text
+/config edit
+```
+
+Marcus will ask for:
+
+- LLM base URL
+- API key
+- model
+
+Config is saved to:
+
+```text
+~/.marcus/config.toml
+```
+
+Environment variables with the `HARNESS_` prefix override the user config:
+
+```bash
+HARNESS_LLM_BASE_URL=https://ollama.com/v1
+HARNESS_LLM_API_KEY=...
+HARNESS_LLM_MODEL=gpt-oss:120b
+HARNESS_LLM_REASONING_EFFORT=auto
+HARNESS_LLM_MAX_COMPLETION_TOKENS=4096
+```
+
+Do not commit API keys or paste them into logs. If a key is exposed, rotate it.
+
+## CLI Commands
+
+Inside the REPL:
+
+```text
+/help
+/status
+/usage
+/usage login
+/model llama-3.1-70b
+/effort high
+/config
+/config edit
+/mode auto
+/compact
+/clear
+/retry
+/continue
+/save
+/exit
+```
+
+Common workflows:
+
+- `/config edit` switches provider, API key, and model.
+- `/model <name>` switches and persists the default model.
+- `/effort <level>` switches and persists reasoning effort.
+- `/usage` shows token totals and, for Ollama Cloud, quota information.
+- `/usage login` opens a browser once to save Ollama Cloud usage-session state.
+- `/mode ask|agent|auto|yolo` changes tool approval behavior.
+
+## Reasoning Effort
+
+Marcus supports first-class reasoning effort values:
+
+```text
+off
+low
+medium
+high
+auto
+```
+
+`auto` leaves model behavior unchanged. Other levels add a lightweight system
+hint for the current LLM call. `HARNESS_LLM_MAX_COMPLETION_TOKENS`, when set, is
+sent as `max_completion_tokens` to OpenAI-compatible chat-completions endpoints.
+
+This is the first layer of the feature. Provider-specific adapters for models
+with special thinking controls are tracked in `feature-worl.md`.
+
+## Agent Modes
+
+Marcus has four local operating modes:
+
+- `ask` - inspect and explain only; writes and commands are blocked.
+- `agent` - normal risk-based approval flow.
+- `auto` - edit and test automatically; asks for high-risk commands.
+- `yolo` - bypasses approvals while keeping hard guardrails active.
+
+Use:
+
+```bash
+uv run marcus --mode auto
+```
+
+or inside the REPL:
+
+```text
+/mode auto
+```
+
+## Local Skills
+
+Marcus discovers portable Markdown skills from `.marcus/skills/`.
+
+Example:
 
 ```text
 .marcus/skills/code-review/SKILL.md
@@ -106,17 +189,89 @@ description: Review changes for correctness and security
 Inspect the diff first. Report concrete findings with file and line references.
 ```
 
-Discovered skills appear in the system prompt. The model can call the
-read-only `load_skill` tool with the exact skill name to load the full
-instructions. Skill files are local project data; review them before trusting
-their instructions.
+Discovered skills appear in the system prompt. The model can call the read-only
+`load_skill` tool with the exact skill name to load full instructions.
 
-## Running the full stack
+## Development
+
+Set up the Python environment:
+
+```bash
+uv sync --all-extras --dev
+```
+
+Run checks:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy harness
+uv run pytest -q
+```
+
+Run the API:
+
+```bash
+uv run uvicorn harness.api.app:app --reload
+```
+
+Run the web UI:
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+The Vite dev server proxies API calls to `http://localhost:8000`.
+
+## Full Stack
+
+Run the full Harness stack:
 
 ```bash
 docker compose up --build
 ```
 
 This starts PostgreSQL, Redis, RabbitMQ, the API, worker, scheduler, Jaeger, and
-Prometheus. See `docker-compose.yml`, `docs/schema.md`, and `docs/runbook.md`
-for details.
+Prometheus.
+
+Health endpoints:
+
+```text
+GET /healthz
+GET /readyz
+```
+
+When `web/dist` exists, the production React UI is served by the API at `/app`.
+
+## Build And Release
+
+Build distributions locally:
+
+```bash
+uv build
+```
+
+Releases are created by pushing a `v*` tag. The GitHub Actions release workflow
+builds the wheel and sdist, generates `SHA256SUMS`, and uploads the assets to a
+GitHub release.
+
+```bash
+git tag -a vX.Y.Z -m "Release X.Y.Z"
+git push origin main
+git push origin vX.Y.Z
+```
+
+Verify a downloaded release asset:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+## Notes
+
+- Marcus currently uses OpenAI-compatible chat completions.
+- Tool calling is required for agentic coding workflows.
+- Some providers omit usage fields; Marcus estimates token usage in that case.
+- Full provider-specific reasoning adapters are planned but not complete.

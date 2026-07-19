@@ -9,29 +9,16 @@ import orjson
 
 from harness.db.enums import RiskTier
 from harness.llm.gateway import LLMError, LLMGateway, LLMTransientError
-from harness.llm.types import LLMMessage, ToolCall, ToolSpec, Usage
+from harness.llm.types import LLMMessage, LLMOptions, ReasoningEffort, ToolCall, ToolSpec, Usage
 from harness.runtime.guardrails import REPEATED_CALL_WINDOW
 from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tool_validation import ToolArgumentError, normalize_and_validate_arguments
 from harness.runtime.tools import Tool
-from marcus_code.runtime.modes import AgentMode, tool_is_allowed, tool_requires_approval
-from marcus_code.runtime.task_contract import (
-    Capability,
-    ResponseMode,
-    TaskContract,
-    TaskKind,
-    VerificationPolicy,
-    derive_task_contract,
-    is_verification_attempt,
-    is_verification_evidence,
-)
-from marcus_code.runtime.todo_tracker import Phase, TodoTracker
 from marcus_code.runtime.event_bus import EventBus
 from marcus_code.runtime.events import (
     AssistantMessage,
     FinalAnswer,
     GuardrailStop,
-    Interrupted,
     Recovery,
     StreamDelta,
     StreamEnded,
@@ -46,6 +33,18 @@ from marcus_code.runtime.events import (
     TurnFinished,
     TurnStarted,
 )
+from marcus_code.runtime.modes import AgentMode, tool_is_allowed, tool_requires_approval
+from marcus_code.runtime.task_contract import (
+    Capability,
+    ResponseMode,
+    TaskContract,
+    TaskKind,
+    VerificationPolicy,
+    derive_task_contract,
+    is_verification_attempt,
+    is_verification_evidence,
+)
+from marcus_code.runtime.todo_tracker import Phase, TodoTracker
 from marcus_code.runtime.token_utils import (
     estimate_message_tokens,
     trim_messages_to_budget,
@@ -84,6 +83,20 @@ _PLAN_HINT = (
     "you need to inspect, the actions you may take, how you will verify the result, and the "
     "finish condition. Do not claim that any action has run yet."
 )
+
+
+def _reasoning_effort_hint(effort: ReasoningEffort) -> str | None:
+    if effort == "auto":
+        return None
+    if effort == "off":
+        return (
+            "Reasoning effort: off. Prefer a direct answer, keep internal reasoning brief, "
+            "and do not emit visible <think> traces."
+        )
+    return (
+        f"Reasoning effort: {effort}. Spend an amount of inference-time work appropriate "
+        "to that effort level, while keeping the final answer concise and evidence-based."
+    )
 
 
 @dataclass
@@ -180,6 +193,8 @@ class MarcusLoop:
         ui: TerminalUI,
         *,
         model: str | None = None,
+        reasoning_effort: ReasoningEffort = "auto",
+        max_completion_tokens: int | None = None,
         system_prompt: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         result_max_chars: int = DEFAULT_RESULT_MAX_CHARS,
@@ -216,6 +231,8 @@ class MarcusLoop:
             events.subscribe(TerminalRenderer(ui).handle)
         self.events = events
         self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.max_completion_tokens = max_completion_tokens
         self.max_steps = max_steps
         self.result_max_chars = result_max_chars
         self.max_history_messages = max_history_messages
@@ -341,6 +358,14 @@ class MarcusLoop:
                             ),
                         )
                     )
+                effort_hint = _reasoning_effort_hint(self.reasoning_effort)
+                if effort_hint:
+                    call_messages.append(LLMMessage(role="system", content=effort_hint))
+                options = LLMOptions(
+                    reasoning_effort=self.reasoning_effort,
+                    thinking_enabled=False if self.reasoning_effort == "off" else None,
+                    max_completion_tokens=self.max_completion_tokens,
+                )
                 async with asyncio.timeout(self.llm_recovery_timeout_seconds):
                     if use_stream:
                         try:
@@ -355,6 +380,7 @@ class MarcusLoop:
                                 call_messages,
                                 tools=active_specs,
                                 model=self.model,
+                                options=options,
                                 # One retry here, then one bounded standard fallback.
                                 max_retries=1,
                                 on_delta=_on_delta,
@@ -372,6 +398,7 @@ class MarcusLoop:
                                 call_messages,
                                 tools=active_specs,
                                 model=self.model,
+                                options=options,
                                 max_retries=1,
                             )
                     else:
@@ -379,6 +406,7 @@ class MarcusLoop:
                             call_messages,
                             tools=active_specs,
                             model=self.model,
+                            options=options,
                             max_retries=1,
                         )
                 duration = time.perf_counter() - start
@@ -940,6 +968,7 @@ class MarcusLoop:
         return {
             "session_started_at": self.started_at,
             "model": self.model or "default",
+            "reasoning_effort": self.reasoning_effort,
             "mode": self.mode.value,
             "workspace": workspace,
             "phase": self.state.active_phase.value,

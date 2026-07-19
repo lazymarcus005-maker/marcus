@@ -651,5 +651,7 @@ async def test_amain_first_time_setup_saves_config(monkeypatch, tmp_path):
         "api_key": "sk-new",
         "base_url": "https://api.example.com/v1",
         "model": "model-new",
+        "reasoning_effort": "auto",
+        "max_completion_tokens": None,
     }
     assert _FakeGateway.instances[0].closed is True

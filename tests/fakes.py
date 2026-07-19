@@ -52,8 +52,17 @@ class ScriptedLLMGateway:
         self._responses = iter(responses)
         self.calls: list[dict] = []
 
-    async def complete(self, messages, *, tools=None, model=None, temperature=0.0, max_retries=3):
-        self.calls.append({"messages": messages, "tools": tools})
+    async def complete(
+        self,
+        messages,
+        *,
+        tools=None,
+        model=None,
+        options=None,
+        temperature=0.0,
+        max_retries=3,
+    ):
+        self.calls.append({"messages": messages, "tools": tools, "options": options})
         try:
             return next(self._responses)
         except StopIteration as exc:

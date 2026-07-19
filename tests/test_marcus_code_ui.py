@@ -28,10 +28,10 @@ async def test_slash_command_auto_suggest_filters_and_limits_to_seven():
             "/help",
             "/?",
             "/model",
+            "/effort",
             "/usage",
             "/status",
             "/compact",
-            "/retry",
         ]
     )
     assert await suggest("/m") == "  |  ".join(
@@ -173,6 +173,7 @@ def test_status_bar_shows_retained_context_usage_and_session_details():
             "context_limit": 32_000,
             "total_tokens": 84_700,
             "tokens_per_second": 120.0,
+            "reasoning_effort": "high",
         }
     )
 
@@ -184,6 +185,7 @@ def test_status_bar_shows_retained_context_usage_and_session_details():
     assert "Used 84.7k tok" in output
     assert "120.0 tok/s" in output
     assert "Mode auto" in output
+    assert "Effort high" in output
     assert "D:\\workspace" in output
 
 
@@ -219,6 +221,7 @@ def test_prompt_toolkit_bottom_toolbar_contains_live_status():
             "context_limit": 1000,
             "total_tokens": 500,
             "tokens_per_second": 12.0,
+            "reasoning_effort": "low",
         }
     )
 
@@ -228,6 +231,7 @@ def test_prompt_toolkit_bottom_toolbar_contains_live_status():
     assert text.startswith("\nSession")
     assert "Context" in text
     assert "Mode auto" in text
+    assert "Effort low" in text
     assert "Workspace workspace" in text
 
     toolbar_style = ui._prompt_style.get_attrs_for_style_str("class:bottom-toolbar")

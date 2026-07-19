@@ -7,7 +7,7 @@ import httpx
 import orjson
 
 from harness.config import Settings, get_settings
-from harness.llm.types import LLMMessage, LLMResponse, ToolCall, ToolSpec, Usage
+from harness.llm.types import LLMMessage, LLMOptions, LLMResponse, ToolCall, ToolSpec, Usage
 
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
@@ -65,6 +65,7 @@ class LLMGateway:
         *,
         tools: list[ToolSpec] | None = None,
         model: str | None = None,
+        options: LLMOptions | None = None,
         temperature: float = 0.0,
         max_retries: int = 3,
     ) -> LLMResponse:
@@ -81,6 +82,7 @@ class LLMGateway:
         }
         if tools:
             payload["tools"] = [t.to_openai() for t in tools]
+        _apply_options(payload, options)
 
         response = await self._post_with_retry(payload, max_retries=max_retries)
         body = response.json()
@@ -96,6 +98,7 @@ class LLMGateway:
         *,
         tools: list[ToolSpec] | None = None,
         model: str | None = None,
+        options: LLMOptions | None = None,
         on_delta: Callable[[str], None] | None = None,
         max_retries: int = 3,
     ) -> LLMResponse:
@@ -113,6 +116,7 @@ class LLMGateway:
         }
         if tools:
             payload["tools"] = [t.to_openai() for t in tools]
+        _apply_options(payload, options)
         attempt = 0
         while True:
             try:
@@ -243,6 +247,15 @@ class LLMGateway:
 def _backoff_delay(attempt: int) -> float:
     base = min(2**attempt, 30)
     return base + random.uniform(0, base * 0.1)
+
+
+def _apply_options(payload: dict[str, Any], options: LLMOptions | None) -> None:
+    if options is None:
+        return
+    if options.max_completion_tokens is not None:
+        payload["max_completion_tokens"] = options.max_completion_tokens
+    if options.extra_body:
+        payload.update(options.extra_body)
 
 
 def _parse_response(body: dict[str, Any]) -> LLMResponse:

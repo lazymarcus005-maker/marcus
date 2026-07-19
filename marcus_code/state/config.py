@@ -2,11 +2,13 @@ import contextlib
 import os
 import tomllib
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlparse
 
 import httpx
 
 from harness.config import Settings
+from harness.llm.types import ReasoningEffort
 
 USER_CONFIG_DIR = Path.home() / ".marcus"
 USER_CONFIG_FILE = USER_CONFIG_DIR / "config.toml"
@@ -20,6 +22,8 @@ _ENV_VAR_BY_FIELD = {
     "llm_api_key": "HARNESS_LLM_API_KEY",
     "llm_base_url": "HARNESS_LLM_BASE_URL",
     "llm_model": "HARNESS_LLM_MODEL",
+    "llm_reasoning_effort": "HARNESS_LLM_REASONING_EFFORT",
+    "llm_max_completion_tokens": "HARNESS_LLM_MAX_COMPLETION_TOKENS",
 }
 
 
@@ -37,13 +41,24 @@ def load_user_config() -> dict:
     return data.get("llm", {})
 
 
-def save_user_config(*, api_key: str, base_url: str, model: str) -> Path:
+def save_user_config(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    reasoning_effort: str | None = None,
+    max_completion_tokens: int | None = None,
+) -> Path:
     """Write ~/.marcus/config.toml, creating the directory if needed.
 
     Best-effort chmod 600 — meaningful on POSIX, a no-op on Windows (see
     docs/marcus-code-handoff.md's Windows-11-dev-machine context).
     """
     validate_base_url(base_url)
+    if reasoning_effort is not None:
+        validate_reasoning_effort(reasoning_effort)
+    if max_completion_tokens is not None and max_completion_tokens <= 0:
+        raise ValueError("max completion tokens must be positive")
     USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     content = (
         "[llm]\n"
@@ -51,6 +66,10 @@ def save_user_config(*, api_key: str, base_url: str, model: str) -> Path:
         f'base_url = "{_toml_escape(base_url)}"\n'
         f'model = "{_toml_escape(model)}"\n'
     )
+    if reasoning_effort is not None:
+        content += f'reasoning_effort = "{_toml_escape(reasoning_effort)}"\n'
+    if max_completion_tokens is not None:
+        content += f"max_completion_tokens = {max_completion_tokens}\n"
     USER_CONFIG_FILE.write_text(content, encoding="utf-8")
     with contextlib.suppress(OSError):
         os.chmod(USER_CONFIG_FILE, 0o600)
@@ -96,6 +115,13 @@ def validate_base_url(base_url: str) -> str:
     ):
         raise ValueError("base URL must be an absolute HTTP(S) URL without credentials")
     return value.rstrip("/")
+
+
+def validate_reasoning_effort(value: str) -> ReasoningEffort:
+    normalized = value.strip().lower()
+    if normalized not in {"off", "low", "medium", "high", "auto"}:
+        raise ValueError("reasoning effort must be one of: off, low, medium, high, auto")
+    return cast(ReasoningEffort, normalized)
 
 
 def _toml_escape(value: str) -> str:

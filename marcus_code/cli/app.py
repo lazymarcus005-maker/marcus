@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import importlib
 import inspect
 import json
 import os
@@ -17,18 +18,18 @@ import typer
 from harness.config import Settings
 from harness.llm.gateway import LLMGateway
 from marcus_code.cli.commands import CommandContext, dispatch
+from marcus_code.runtime.agent import MarcusLoop
 from marcus_code.runtime.event_bus import EventBus
+from marcus_code.runtime.modes import AgentMode
+from marcus_code.runtime.ollama_usage import is_ollama_cloud, load_cached_ollama_email
+from marcus_code.runtime.prompt import build_system_prompt
+from marcus_code.runtime.skills import build_skill_catalog
 from marcus_code.state.config import (
     has_llm_credentials,
     load_project_instructions,
     resolve_settings,
     save_user_config,
 )
-from marcus_code.runtime.agent import MarcusLoop
-from marcus_code.runtime.modes import AgentMode
-from marcus_code.runtime.ollama_usage import is_ollama_cloud, load_cached_ollama_email
-from marcus_code.runtime.prompt import build_system_prompt
-from marcus_code.runtime.skills import build_skill_catalog
 from marcus_code.tools.base import build_marcus_tools
 from marcus_code.ui.console import TerminalUI
 from marcus_code.ui.renderer import TerminalRenderer
@@ -596,7 +597,13 @@ async def _amain(
         )
         if setup is not None:
             api_key, base_url, model = setup
-            save_user_config(api_key=api_key, base_url=base_url, model=model)
+            save_user_config(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                reasoning_effort=settings.llm_reasoning_effort,
+                max_completion_tokens=settings.llm_max_completion_tokens,
+            )
             settings = resolve_settings()
 
     session_name = _new_session_name()
@@ -643,6 +650,8 @@ async def _amain(
         max_steps=settings.cli_max_steps,
         max_history_messages=settings.cli_max_history_messages,
         max_total_tokens=settings.cli_max_total_tokens,
+        reasoning_effort=settings.llm_reasoning_effort,
+        max_completion_tokens=settings.llm_max_completion_tokens,
         history_summary_enabled=settings.cli_history_summary_enabled,
         mode=mode,
         context_window_tokens=settings.cli_context_window_tokens,
@@ -771,6 +780,8 @@ async def _amain_tui(mode: AgentMode | None) -> None:
         max_steps=settings.cli_max_steps,
         max_history_messages=settings.cli_max_history_messages,
         max_total_tokens=settings.cli_max_total_tokens,
+        reasoning_effort=settings.llm_reasoning_effort,
+        max_completion_tokens=settings.llm_max_completion_tokens,
         history_summary_enabled=settings.cli_history_summary_enabled,
         mode=mode,
         context_window_tokens=settings.cli_context_window_tokens,
@@ -826,6 +837,11 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+_MODE_OPTION = typer.Option(
+    None, "--mode", case_sensitive=False, help="agent mode (ask, agent, auto, yolo)"
+)
+
+
 def _run_interactive(
     prompt: str | None, mode: AgentMode | None, *, no_color: bool
 ) -> None:
@@ -839,9 +855,7 @@ def _default(
     prompt: str | None = typer.Option(
         None, "-p", "--prompt", help="run one prompt non-interactively"
     ),
-    mode: AgentMode | None = typer.Option(
-        None, "--mode", case_sensitive=False, help="agent mode (ask, agent, auto, yolo)"
-    ),
+    mode: AgentMode | None = _MODE_OPTION,
     no_color: bool = typer.Option(
         False, "--no-color", help="disable colored output; use ASCII progress bars"
     ),
@@ -894,14 +908,10 @@ def _cmd_version() -> None:
 
 
 @app.command("tui")
-def _cmd_tui(
-    mode: AgentMode | None = typer.Option(
-        None, "--mode", case_sensitive=False, help="agent mode (ask, agent, auto, yolo)"
-    ),
-) -> None:
+def _cmd_tui(mode: AgentMode | None = _MODE_OPTION) -> None:
     """Launch the Textual dashboard (``pip install 'marcus[tui]'``)."""
     try:
-        from marcus_code.ui.tui import MarcusTuiApp, TuiPrompter
+        importlib.import_module("marcus_code.ui.tui")
     except ImportError as exc:
         typer.echo(
             "Textual is not installed. Install the TUI extras with "

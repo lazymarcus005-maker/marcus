@@ -4,9 +4,9 @@ import marcus_code.state.config as config_module
 from harness.config import Settings
 from harness.llm.types import LLMMessage
 from marcus_code.cli.commands import CommandContext, dispatch
-from marcus_code.state.config import save_user_config
 from marcus_code.runtime.agent import MarcusLoop
 from marcus_code.runtime.ollama_usage import OllamaCloudUsage, UsagePeriod
+from marcus_code.state.config import save_user_config
 from tests.fakes import ScriptedLLMGateway, text_response
 
 
@@ -89,9 +89,16 @@ class _ClosableScriptedLLMGateway(ScriptedLLMGateway):
 
 def _make_ctx(ui=None, *, settings=None, model=None):
     llm = _ClosableScriptedLLMGateway([text_response("ok")])
-    loop = MarcusLoop(llm, [], ui or _FakeUI(), model=model)
     settings = settings or Settings(
         llm_api_key="sk-real", llm_base_url="https://api.example.com/v1", llm_model="m1"
+    )
+    loop = MarcusLoop(
+        llm,
+        [],
+        ui or _FakeUI(),
+        model=model,
+        reasoning_effort=settings.llm_reasoning_effort,
+        max_completion_tokens=settings.llm_max_completion_tokens,
     )
     return CommandContext(ui=ui or loop.ui, loop=loop, settings=settings)
 
@@ -144,6 +151,48 @@ async def test_model_command_switches_model_for_session():
 
     assert ctx.loop.model == "llama-3.1-70b"
     assert "llama-3.1-70b" in ui.info[0]
+
+
+@pytest.mark.asyncio
+async def test_effort_command_with_no_args_shows_current_effort():
+    ui = _FakeUI()
+    settings = Settings(
+        llm_api_key="sk-real",
+        llm_base_url="https://api.example.com/v1",
+        llm_model="m1",
+        llm_reasoning_effort="medium",
+        llm_max_completion_tokens=1024,
+    )
+    ctx = _make_ctx(ui, settings=settings)
+
+    await dispatch(ctx, "/effort")
+
+    assert ui.info == ["Current reasoning effort: medium; max completion tokens: 1,024"]
+
+
+@pytest.mark.asyncio
+async def test_effort_command_switches_effort_for_session_and_default(tmp_path, monkeypatch):
+    _point_user_config_at(monkeypatch, tmp_path)
+    monkeypatch.delenv("HARNESS_LLM_REASONING_EFFORT", raising=False)
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/effort high")
+
+    assert ctx.loop.reasoning_effort == "high"
+    assert ctx.settings.llm_reasoning_effort == "high"
+    assert config_module.load_user_config()["reasoning_effort"] == "high"
+    assert "high" in ui.info[0]
+
+
+@pytest.mark.asyncio
+async def test_effort_command_rejects_unknown_effort():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/effort maximum")
+
+    assert "reasoning effort" in ui.errors[0]
 
 
 @pytest.mark.asyncio
@@ -238,7 +287,11 @@ async def test_config_edit_saves_new_values_and_rebuilds_llm(tmp_path, monkeypat
 
     ui = _FakeUI(config_edit_result=("sk-new", "https://new.example.com/v1", "new-model"))
     settings = Settings(
-        llm_api_key="sk-old", llm_base_url="https://old.example.com/v1", llm_model="old-model"
+        llm_api_key="sk-old",
+        llm_base_url="https://old.example.com/v1",
+        llm_model="old-model",
+        llm_reasoning_effort="high",
+        llm_max_completion_tokens=2048,
     )
     ctx = _make_ctx(ui, settings=settings)
     old_llm = ctx.loop.llm
@@ -248,7 +301,10 @@ async def test_config_edit_saves_new_values_and_rebuilds_llm(tmp_path, monkeypat
     assert ctx.settings.llm_api_key == "sk-new"
     assert ctx.settings.llm_base_url == "https://new.example.com/v1"
     assert ctx.settings.llm_model == "new-model"
+    assert ctx.settings.llm_reasoning_effort == "high"
+    assert ctx.settings.llm_max_completion_tokens == 2048
     assert ctx.loop.model == "new-model"
+    assert ctx.loop.reasoning_effort == "high"
     assert ctx.loop.llm is not old_llm
     assert "updated" in ui.info[0].lower()
 

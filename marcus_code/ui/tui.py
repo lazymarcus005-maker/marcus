@@ -24,8 +24,8 @@ the terminal REPL.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable
-from datetime import datetime
 from typing import Any
 
 from rich.markup import escape
@@ -172,7 +172,7 @@ class TuiPrompter:
         "finish_steps",
     )
 
-    def __init__(self, app: "MarcusTuiApp") -> None:
+    def __init__(self, app: MarcusTuiApp) -> None:
         self._app = app
         # Install no-op stubs so ``hasattr(ui, name)`` in agent.py returns True.
         # We deliberately do NOT expose ``start_stream``/``stream_delta``/
@@ -206,7 +206,7 @@ class TuiRenderer:
     ``RichLog``. Mirrors the terminal renderer's structure so both surfaces
     stay in sync when we add a new event type."""
 
-    def __init__(self, app: "MarcusTuiApp") -> None:
+    def __init__(self, app: MarcusTuiApp) -> None:
         self._app = app
         self._tool_count = 0
         self._last_phase: Phase | None = None
@@ -339,7 +339,7 @@ class MarcusTuiApp(App):
         self,
         events: EventBus,
         *,
-        on_submit: Callable[[str], "asyncio.Future[None]"],
+        on_submit: Callable[[str], asyncio.Future[None]],
         status_provider: Callable[[], dict[str, Any]] | None = None,
         session_name: str = "",
     ) -> None:
@@ -369,20 +369,16 @@ class MarcusTuiApp(App):
         )
 
     def write_log(self, text: str) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self.query_one("#log", RichLog).write(Text.from_markup(text))
-        except Exception:  # noqa: BLE001 - never let a render bug crash the app
-            pass
 
     def set_thinking(self, active: bool) -> None:
         self._thinking = active
         self.refresh_status()
 
     def refresh_status(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self.query_one("#status", Static).update(self._render_status())
-        except Exception:  # noqa: BLE001
-            pass
 
     def _render_status(self) -> str:
         status = self._status_provider() if self._status_provider else None
@@ -395,6 +391,7 @@ class MarcusTuiApp(App):
                 [
                     f"[bold]{escape(str(status.get('model', '')))}[/bold]",
                     f"mode {escape(str(status.get('mode', '')))}",
+                    f"effort {escape(str(status.get('reasoning_effort', 'auto')))}",
                     f"ctx {pct}%",
                     f"used {_format_tokens(int(status.get('total_tokens', 0)))} tok",
                 ]

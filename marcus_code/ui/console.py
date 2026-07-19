@@ -434,6 +434,7 @@ class TerminalUI:
     def print_help(self) -> None:
         arg_hints: dict[str, str] = {
             "/model": "[name]",
+            "/effort": "[off|low|medium|high|auto]",
             "/usage": "[login|logout]",
             "/clear": "[--all]",
             "/mode": "[ask|agent|auto|yolo]",
@@ -515,6 +516,15 @@ class TerminalUI:
             [
                 ("Base URL", settings.llm_base_url),
                 ("Model", settings.llm_model),
+                ("Reasoning effort", settings.llm_reasoning_effort),
+                (
+                    "Max completion",
+                    (
+                        f"{settings.llm_max_completion_tokens:,} tokens"
+                        if settings.llm_max_completion_tokens is not None
+                        else "provider default"
+                    ),
+                ),
                 ("API key", masked),
             ]
         )
@@ -788,7 +798,8 @@ class TerminalUI:
         line_one = (
             f"Session {hours:02d}:{minutes:02d}:{seconds:02d}{sep}"
             f"Context [{bar}] ~{_format_tokens(used)}/{_format_tokens(limit)}{sep}"
-            f"Mode {status['mode']}"
+            f"Mode {status['mode']}{sep}"
+            f"Effort {status.get('reasoning_effort', 'auto')}"
         )
         line_two = (
             f"Model {status['model']}{sep}"
@@ -1136,7 +1147,10 @@ class TerminalUI:
         text = Text()
         text.append(f"Session {hours:02d}:{minutes:02d}:{seconds:02d}{sep}Context ")
         text.append(f"[{bar}]", style=color)
-        text.append(f" ~{_format_tokens(used)}/{_format_tokens(limit)}{sep}Mode {status['mode']}\n")
+        text.append(
+            f" ~{_format_tokens(used)}/{_format_tokens(limit)}{sep}Mode {status['mode']}"
+            f"{sep}Effort {status.get('reasoning_effort', 'auto')}\n"
+        )
         text.append(
             f"Model {status['model']}{sep}"
             f"Used {_format_tokens(status['total_tokens'])} tok{sep}"

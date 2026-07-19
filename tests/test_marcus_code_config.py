@@ -10,6 +10,7 @@ from marcus_code.state.config import (
     resolve_settings,
     save_user_config,
     validate_base_url,
+    validate_reasoning_effort,
 )
 
 
@@ -69,6 +70,31 @@ def test_save_and_load_user_config_round_trips(tmp_path, monkeypatch):
     }
 
 
+def test_save_and_load_user_config_round_trips_reasoning_options(tmp_path, monkeypatch):
+    _point_user_config_at(monkeypatch, tmp_path)
+
+    save_user_config(
+        api_key="sk-secret",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+        reasoning_effort="high",
+        max_completion_tokens=4096,
+    )
+
+    loaded = load_user_config()
+    assert loaded["reasoning_effort"] == "high"
+    assert loaded["max_completion_tokens"] == 4096
+
+
+def test_validate_reasoning_effort_normalizes_known_values():
+    assert validate_reasoning_effort(" HIGH ") == "high"
+
+
+def test_validate_reasoning_effort_rejects_unknown_values():
+    with pytest.raises(ValueError):
+        validate_reasoning_effort("maximum")
+
+
 def test_save_user_config_escapes_quotes_and_backslashes(tmp_path, monkeypatch):
     _point_user_config_at(monkeypatch, tmp_path)
 
@@ -99,6 +125,24 @@ def test_resolve_settings_applies_file_config_when_no_env_var(tmp_path, monkeypa
     assert settings.llm_api_key == "sk-from-file"
     assert settings.llm_base_url == "https://api.openai.com/v1"
     assert settings.llm_model == "gpt-4o-mini"
+
+
+def test_resolve_settings_applies_reasoning_options_from_file(tmp_path, monkeypatch):
+    _point_user_config_at(monkeypatch, tmp_path)
+    monkeypatch.delenv("HARNESS_LLM_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("HARNESS_LLM_MAX_COMPLETION_TOKENS", raising=False)
+    save_user_config(
+        api_key="sk-from-file",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+        reasoning_effort="low",
+        max_completion_tokens=2048,
+    )
+
+    settings = resolve_settings()
+
+    assert settings.llm_reasoning_effort == "low"
+    assert settings.llm_max_completion_tokens == 2048
 
 
 def test_resolve_settings_env_var_wins_over_file(tmp_path, monkeypatch):

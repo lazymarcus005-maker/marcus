@@ -8,7 +8,7 @@ from harness.llm.gateway import (
     LLMToolCallingNotSupportedError,
     LLMTransientError,
 )
-from harness.llm.types import LLMMessage, ToolSpec
+from harness.llm.types import LLMMessage, LLMOptions, ToolSpec
 
 
 def _openai_response(
@@ -56,6 +56,24 @@ async def test_complete_estimates_usage_when_provider_omits_it():
 
     assert response.usage.total_tokens > 0
     assert response.usage.source == "estimated"
+
+
+@pytest.mark.asyncio
+async def test_complete_applies_llm_options_to_payload():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(orjson.loads(request.content))
+        return httpx.Response(200, json=_openai_response(content="ok"))
+
+    gateway = LLMGateway(http_client=_client_with_handler(handler))
+    await gateway.complete(
+        [LLMMessage(role="user", content="hello")],
+        options=LLMOptions(max_completion_tokens=256, extra_body={"seed": 7}),
+    )
+
+    assert captured["max_completion_tokens"] == 256
+    assert captured["seed"] == 7
 
 
 @pytest.mark.asyncio

@@ -4,13 +4,18 @@ from dataclasses import dataclass
 from harness.config import Settings
 from harness.llm.gateway import LLMGateway
 from harness.llm.types import LLMMessage
-from marcus_code.state.config import has_llm_credentials, resolve_settings, save_user_config
 from marcus_code.runtime.agent import MarcusLoop
 from marcus_code.runtime.modes import AgentMode, mode_help, mode_hint, mode_instructions
 from marcus_code.runtime.ollama_usage import (
     OllamaCloudUsageClient,
     OllamaUsageError,
     is_ollama_cloud,
+)
+from marcus_code.state.config import (
+    has_llm_credentials,
+    resolve_settings,
+    save_user_config,
+    validate_reasoning_effort,
 )
 from marcus_code.ui.console import TerminalUI
 
@@ -33,6 +38,8 @@ class CommandContext:
         old_llm = self.loop.llm
         self.loop.llm = LLMGateway(settings=new_settings)
         self.loop.model = new_settings.llm_model
+        self.loop.reasoning_effort = new_settings.llm_reasoning_effort
+        self.loop.max_completion_tokens = new_settings.llm_max_completion_tokens
         self.settings = new_settings
         await old_llm.aclose()
 
@@ -60,11 +67,48 @@ async def _cmd_model(ctx: CommandContext, args: str) -> None:
             api_key=api_key,
             base_url=ctx.settings.llm_base_url,
             model=name,
+            reasoning_effort=ctx.settings.llm_reasoning_effort,
+            max_completion_tokens=ctx.settings.llm_max_completion_tokens,
         )
     except ValueError as exc:
         ctx.ui.print_error(f"Model switched for this session, but could not save default: {exc}")
         return
     ctx.ui.print_info(f"Model switched to {name!r} and saved as default.")
+
+
+async def _cmd_effort(ctx: CommandContext, args: str) -> None:
+    value = args.strip().lower()
+    if not value:
+        max_tokens = ctx.loop.max_completion_tokens
+        suffix = (
+            f"; max completion tokens: {max_tokens:,}"
+            if max_tokens is not None
+            else "; max completion tokens: provider default"
+        )
+        ctx.ui.print_info(f"Current reasoning effort: {ctx.loop.reasoning_effort}{suffix}")
+        return
+    try:
+        effort = validate_reasoning_effort(value)
+    except ValueError as exc:
+        ctx.ui.print_error(str(exc))
+        return
+    ctx.loop.reasoning_effort = effort
+    ctx.settings = ctx.settings.model_copy(update={"llm_reasoning_effort": effort})
+    api_key = ctx.settings.llm_api_key if has_llm_credentials(ctx.settings) else ""
+    try:
+        save_user_config(
+            api_key=api_key,
+            base_url=ctx.settings.llm_base_url,
+            model=ctx.settings.llm_model,
+            reasoning_effort=effort,
+            max_completion_tokens=ctx.settings.llm_max_completion_tokens,
+        )
+    except ValueError as exc:
+        ctx.ui.print_error(f"Reasoning effort switched for this session, but could not save default: {exc}")
+        return
+    if hasattr(ctx.ui, "refresh_status"):
+        ctx.ui.refresh_status()
+    ctx.ui.print_info(f"Reasoning effort switched to {effort!r} and saved as default.")
 
 
 async def _cmd_usage(ctx: CommandContext, args: str) -> None:
@@ -270,7 +314,13 @@ async def _cmd_config(ctx: CommandContext, args: str) -> None:
                 return
             new_key = ctx.settings.llm_api_key
         try:
-            save_user_config(api_key=new_key, base_url=base_url, model=model)
+            save_user_config(
+                api_key=new_key,
+                base_url=base_url,
+                model=model,
+                reasoning_effort=ctx.settings.llm_reasoning_effort,
+                max_completion_tokens=ctx.settings.llm_max_completion_tokens,
+            )
         except ValueError as exc:
             ctx.ui.print_error(str(exc))
             return
@@ -284,6 +334,7 @@ COMMANDS: dict[str, CommandHandler] = {
     "/help": _cmd_help,
     "/?": _cmd_help,
     "/model": _cmd_model,
+    "/effort": _cmd_effort,
     "/usage": _cmd_usage,
     "/retry": _cmd_retry,
     "/continue": _cmd_continue,

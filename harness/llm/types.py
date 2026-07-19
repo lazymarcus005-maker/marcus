@@ -4,6 +4,7 @@ from typing import Any, Literal
 import orjson
 
 Role = Literal["system", "user", "assistant", "tool"]
+ReasoningEffort = Literal["off", "low", "medium", "high", "auto"]
 
 
 @dataclass
@@ -64,6 +65,14 @@ class Usage:
     completion_tokens: int
     total_tokens: int
     source: Literal["provider", "estimated"] = "provider"
+
+
+@dataclass
+class LLMOptions:
+    reasoning_effort: ReasoningEffort = "auto"
+    thinking_enabled: bool | None = None
+    max_completion_tokens: int | None = None
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

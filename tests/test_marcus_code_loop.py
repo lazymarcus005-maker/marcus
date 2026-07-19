@@ -4,7 +4,7 @@ import pytest
 
 from harness.db.enums import RiskTier
 from harness.llm.gateway import LLMTransientError
-from harness.llm.types import LLMMessage, LLMResponse, ToolCall, Usage
+from harness.llm.types import LLMMessage, LLMOptions, LLMResponse, ToolCall, Usage
 from harness.runtime.tools import Tool
 from marcus_code.runtime.agent import MarcusLoop
 from marcus_code.runtime.modes import AgentMode
@@ -94,6 +94,25 @@ async def test_plain_text_reply_ends_turn_immediately():
     await loop.run_turn("do something")
 
     assert ui.assistant_messages == ["all done"]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_adds_hint_and_options_to_llm_call():
+    llm = ScriptedLLMGateway([text_response("all done")])
+    ui = _FakeUI()
+    loop = MarcusLoop(llm, [], ui, reasoning_effort="high", max_completion_tokens=2048)
+
+    await loop.run_turn("do something difficult")
+
+    messages = llm.calls[0]["messages"]
+    assert any(
+        message.role == "system" and "Reasoning effort: high" in (message.content or "")
+        for message in messages
+    )
+    options = llm.calls[0]["options"]
+    assert isinstance(options, LLMOptions)
+    assert options.reasoning_effort == "high"
+    assert options.max_completion_tokens == 2048
 
 
 @pytest.mark.asyncio
