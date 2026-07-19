@@ -103,7 +103,7 @@ def test_tool_call_and_result_render_inline_without_a_box():
     output = stream.getvalue()
     # Phase breadcrumb + tool line + result line — three inline rows,
     # no bordered panel around them.
-    assert "ดำเนินการ" in output
+    assert "Implement" in output
     assert "1. Read file" in output
     assert "app.py" in output
     assert "Read app.py (20 lines)" in output

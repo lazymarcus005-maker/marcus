@@ -81,8 +81,8 @@ def test_renderer_prints_phase_breadcrumb_only_on_transition():
 
     breadcrumbs = [line for line in app.log_lines if line.startswith("[dim]·")]
     assert len(breadcrumbs) == 2
-    assert "วิเคราะห์" in breadcrumbs[0]
-    assert "ดำเนินการ" in breadcrumbs[1]
+    assert "Analyze" in breadcrumbs[0]
+    assert "Implement" in breadcrumbs[1]
 
 
 def test_renderer_reports_failures_and_declines_distinctly():

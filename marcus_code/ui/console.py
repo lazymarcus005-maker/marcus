@@ -871,12 +871,12 @@ class TerminalUI:
         if not self._turn_active:
             return
         labels = {
-            Phase.receive: "รับคำสั่ง",
-            Phase.analyze: "วิเคราะห์",
-            Phase.plan: "วางแผน",
-            Phase.implement: "ดำเนินการ",
-            Phase.validate: "ตรวจสอบ",
-            Phase.deliver: "ส่งมอบ",
+            Phase.receive: "Receive",
+            Phase.analyze: "Analyze",
+            Phase.plan: "Plan",
+            Phase.implement: "Implement",
+            Phase.validate: "Validate",
+            Phase.deliver: "Deliver",
         }
         current = todo.current if not todo.finished else None
         if current is None or current == self._last_phase:

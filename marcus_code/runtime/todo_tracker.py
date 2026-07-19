@@ -2,8 +2,7 @@
 
 The tracker exposes the standard user-facing pipeline:
 
-    รับคำสั่ง (receive) → วิเคราะห์ (analyze) → วางแผน (plan) →
-    ดำเนินการ (implement) → ตรวจสอบ (validate) → ส่งมอบ (deliver)
+    Receive → Analyze → Plan → Implement → Validate → Deliver
 
 UI implementations render the tracker to show the user where the agent is
 in the workflow.
@@ -25,12 +24,12 @@ class Phase(Enum):
 
 
 _PHASE_LABELS: dict[Phase, str] = {
-    Phase.receive: "รับคำสั่ง",
-    Phase.analyze: "วิเคราะห์ความต้องการ",
-    Phase.plan: "วางแผน",
-    Phase.implement: "ดำเนินการ",
-    Phase.validate: "ตรวจสอบ",
-    Phase.deliver: "ส่งมอบ / สรุปผล",
+    Phase.receive: "Receive",
+    Phase.analyze: "Analyze requirements",
+    Phase.plan: "Plan",
+    Phase.implement: "Implement",
+    Phase.validate: "Validate",
+    Phase.deliver: "Deliver / summarize",
 }
 
 
@@ -51,7 +50,7 @@ class TodoTracker:
 
     def finish(self, note: str = "") -> None:
         """Mark the workflow as complete."""
-        self.advance(Phase.deliver, note or "ส่งมอบ / สรุปผล")
+        self.advance(Phase.deliver, note or "Deliver / summarize")
         self.finished = True
 
     def label(self, phase: Phase | None = None) -> str:

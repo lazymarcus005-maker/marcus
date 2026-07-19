@@ -70,12 +70,12 @@ def _summarize(arguments: dict[str, Any], max_len: int = 120) -> str:
 
 
 _PHASE_LABELS = {
-    Phase.receive: "รับคำสั่ง",
-    Phase.analyze: "วิเคราะห์",
-    Phase.plan: "วางแผน",
-    Phase.implement: "ดำเนินการ",
-    Phase.validate: "ตรวจสอบ",
-    Phase.deliver: "ส่งมอบ",
+    Phase.receive: "Receive",
+    Phase.analyze: "Analyze",
+    Phase.plan: "Plan",
+    Phase.implement: "Implement",
+    Phase.validate: "Validate",
+    Phase.deliver: "Deliver",
 }
 
 

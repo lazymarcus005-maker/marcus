@@ -48,7 +48,6 @@ from marcus_code.runtime.events import (
 )
 from marcus_code.runtime.token_utils import (
     estimate_message_tokens,
-    summarize_tool_result,
     trim_messages_to_budget,
     trim_messages_to_count,
 )
@@ -247,7 +246,7 @@ class MarcusLoop:
         tracker = TodoTracker()
         if hasattr(self.ui, "update_todo"):
             self.events.emit(TodoUpdated(tracker=tracker))
-        tracker.advance(Phase.analyze, "จำแนกคำขอและขอบเขตเครื่องมือ")
+        tracker.advance(Phase.analyze, "Classify the request and tool scope")
         self.state.active_phase = Phase.analyze
         if hasattr(self.ui, "update_todo"):
             self.events.emit(TodoUpdated(tracker=tracker))
@@ -268,7 +267,7 @@ class MarcusLoop:
         self.state.last_turn_guardrail = None
         plan_shown = bool(continuing and self.state.active_plan)
         if contract.requires_plan and not plan_shown:
-            tracker.advance(Phase.plan, "สร้างแผนก่อนเรียกเครื่องมือ")
+            tracker.advance(Phase.plan, "Draft a plan before calling tools")
             if hasattr(self.ui, "update_todo"):
                 self.events.emit(TodoUpdated(tracker=tracker))
         finalization_repairs = 0
@@ -430,7 +429,7 @@ class MarcusLoop:
                 self.state.history[-1].content = plan_text
                 plan_shown = True
                 self.events.emit(AssistantMessage(text=plan_text))
-                tracker.advance(Phase.implement, "ดำเนินงานตามแผน")
+                tracker.advance(Phase.implement, "Execute the plan")
                 self.state.active_phase = Phase.implement
                 if hasattr(self.ui, "update_todo"):
                     self.events.emit(TodoUpdated(tracker=tracker))
@@ -475,7 +474,7 @@ class MarcusLoop:
                             f"{self.max_finalization_repairs}): {hint}. "
                             "Run one appropriate verification tool, then summarize its result."
                         )
-                        tracker.advance(Phase.validate, "ต้องมีหลักฐานจาก revision ปัจจุบัน")
+                        tracker.advance(Phase.validate, "Verification evidence from the current revision is required")
                         self.state.active_phase = Phase.validate
                         if hasattr(self.ui, "update_todo"):
                             self.events.emit(TodoUpdated(tracker=tracker))
@@ -486,7 +485,7 @@ class MarcusLoop:
                     self.events.emit(GuardrailStop(reason=self.state.last_turn_guardrail))
                     return
                 self._trim_history()
-                tracker.finish("ส่งมอบคำตอบพร้อมหลักฐาน")
+                tracker.finish("Deliver the answer with evidence")
                 self.state.active_phase = Phase.deliver
                 if hasattr(self.ui, "update_todo"):
                     self.events.emit(TodoUpdated(tracker=tracker))
@@ -506,10 +505,10 @@ class MarcusLoop:
             if all(
                 is_verification_attempt(call.name, call.arguments) for call in response.tool_calls
             ):
-                tracker.advance(Phase.validate, "เรียกเครื่องมือตรวจสอบ")
+                tracker.advance(Phase.validate, "Run verification tools")
                 self.state.active_phase = Phase.validate
             else:
-                tracker.advance(Phase.implement, "เรียกเครื่องมือตามแผน")
+                tracker.advance(Phase.implement, "Call tools per the plan")
                 self.state.active_phase = Phase.implement
             if hasattr(self.ui, "update_todo"):
                 self.events.emit(TodoUpdated(tracker=tracker))
@@ -568,13 +567,18 @@ class MarcusLoop:
                     else:
                         # A newer failed check supersedes an older successful one.
                         self.state.verification_evidence = None
-                compressed = summarize_tool_result(orjson.dumps(observation).decode())
+                # Store the tool result as produced. It was already bounded to
+                # result_max_chars by truncate_result; compressing it again here
+                # (which sliced read_file content down to ~120 chars) made the
+                # model believe files were truncated and re-read them in a loop.
+                # Retained-history size is bounded by _trim_history /
+                # compact_history, which drop or summarize whole old turns.
                 self.state.history.append(
                     LLMMessage(
                         role="tool",
                         tool_call_id=call.id,
                         name=call.name,
-                        content=compressed,
+                        content=orjson.dumps(observation).decode(),
                     )
                 )
             self._trim_history()
