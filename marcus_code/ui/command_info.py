@@ -6,7 +6,7 @@ _COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/help": "Show this help",
     "/?": "Show this help",
     "/model": "Show or switch the active model",
-    "/effort": "Show or switch reasoning effort",
+    "/effort": "Set reasoning effort, output limit, or thinking budget",
     "/usage": "Show token usage; Ollama Cloud quota when configured",
     "/status": "Show session, context, model, and workspace status",
     "/compact": "Compact retained conversation context now",

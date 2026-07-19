@@ -601,8 +601,10 @@ async def _amain(
                 api_key=api_key,
                 base_url=base_url,
                 model=model,
+                provider=settings.llm_provider,
                 reasoning_effort=settings.llm_reasoning_effort,
                 max_completion_tokens=settings.llm_max_completion_tokens,
+                reasoning_budget_tokens=settings.llm_reasoning_budget_tokens,
             )
             settings = resolve_settings()
 
@@ -652,6 +654,7 @@ async def _amain(
         max_total_tokens=settings.cli_max_total_tokens,
         reasoning_effort=settings.llm_reasoning_effort,
         max_completion_tokens=settings.llm_max_completion_tokens,
+        reasoning_budget_tokens=settings.llm_reasoning_budget_tokens,
         history_summary_enabled=settings.cli_history_summary_enabled,
         mode=mode,
         context_window_tokens=settings.cli_context_window_tokens,
@@ -782,6 +785,7 @@ async def _amain_tui(mode: AgentMode | None) -> None:
         max_total_tokens=settings.cli_max_total_tokens,
         reasoning_effort=settings.llm_reasoning_effort,
         max_completion_tokens=settings.llm_max_completion_tokens,
+        reasoning_budget_tokens=settings.llm_reasoning_budget_tokens,
         history_summary_enabled=settings.cli_history_summary_enabled,
         mode=mode,
         context_window_tokens=settings.cli_context_window_tokens,

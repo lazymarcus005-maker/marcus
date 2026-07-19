@@ -177,7 +177,12 @@ def llm_call_step_to_messages(step: AgentStep, executions: list[ToolExecution]) 
         ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"]) for tc in tool_calls_raw
     ]
     result = [
-        LLMMessage(role="assistant", content=step.payload.get("content"), tool_calls=tool_calls)
+        LLMMessage(
+            role="assistant",
+            content=step.payload.get("content"),
+            tool_calls=tool_calls,
+            provider_fields=step.payload.get("provider_fields") or {},
+        )
     ]
 
     executions_by_index = {e.call_index: e for e in executions}

@@ -515,6 +515,7 @@ class TerminalUI:
         self._print_kv_block(
             [
                 ("Base URL", settings.llm_base_url),
+                ("Provider adapter", settings.llm_provider),
                 ("Model", settings.llm_model),
                 ("Reasoning effort", settings.llm_reasoning_effort),
                 (
@@ -522,6 +523,14 @@ class TerminalUI:
                     (
                         f"{settings.llm_max_completion_tokens:,} tokens"
                         if settings.llm_max_completion_tokens is not None
+                        else "provider default"
+                    ),
+                ),
+                (
+                    "Reasoning budget",
+                    (
+                        f"{settings.llm_reasoning_budget_tokens:,} tokens"
+                        if settings.llm_reasoning_budget_tokens is not None
                         else "provider default"
                     ),
                 ),

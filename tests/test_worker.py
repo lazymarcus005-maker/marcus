@@ -148,5 +148,6 @@ async def test_resolve_llm_gateway_uses_tenant_provider_when_configured(db_sessi
         assert gateway._settings.llm_base_url == "https://api.openai.com/v1"
         assert gateway._settings.llm_model == "gpt-4o-mini"
         assert gateway._settings.llm_api_key == "sk-tenant-secret"
+        assert gateway._settings.llm_provider == "openai"
     finally:
         await gateway.aclose()

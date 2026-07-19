@@ -195,6 +195,7 @@ class MarcusLoop:
         model: str | None = None,
         reasoning_effort: ReasoningEffort = "auto",
         max_completion_tokens: int | None = None,
+        reasoning_budget_tokens: int | None = None,
         system_prompt: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         result_max_chars: int = DEFAULT_RESULT_MAX_CHARS,
@@ -233,6 +234,7 @@ class MarcusLoop:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.max_completion_tokens = max_completion_tokens
+        self.reasoning_budget_tokens = reasoning_budget_tokens
         self.max_steps = max_steps
         self.result_max_chars = result_max_chars
         self.max_history_messages = max_history_messages
@@ -365,6 +367,7 @@ class MarcusLoop:
                     reasoning_effort=self.reasoning_effort,
                     thinking_enabled=False if self.reasoning_effort == "off" else None,
                     max_completion_tokens=self.max_completion_tokens,
+                    reasoning_budget_tokens=self.reasoning_budget_tokens,
                 )
                 async with asyncio.timeout(self.llm_recovery_timeout_seconds):
                     if use_stream:
@@ -443,7 +446,10 @@ class MarcusLoop:
 
             self.state.history.append(
                 LLMMessage(
-                    role="assistant", content=response.content, tool_calls=response.tool_calls
+                    role="assistant",
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                    provider_fields=response.provider_fields,
                 )
             )
 
@@ -969,6 +975,7 @@ class MarcusLoop:
             "session_started_at": self.started_at,
             "model": self.model or "default",
             "reasoning_effort": self.reasoning_effort,
+            "reasoning_budget_tokens": self.reasoning_budget_tokens,
             "mode": self.mode.value,
             "workspace": workspace,
             "phase": self.state.active_phase.value,

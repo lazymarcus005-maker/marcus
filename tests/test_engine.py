@@ -86,6 +86,25 @@ async def test_engine_runs_tool_then_finishes(db_session):
 
 
 @pytest.mark.asyncio
+async def test_engine_persists_provider_reasoning_fields_across_tool_turns(db_session):
+    run = await _make_run(db_session)
+    first = tool_call_response("search_logs", {"query": "500 error"})
+    first.provider_fields = {
+        "reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque"}]
+    }
+    llm = ScriptedLLMGateway(
+        [first, tool_call_response("finish", {"result": "done", "summary": "done"})]
+    )
+    engine = RunEngine(db_session, llm, tools=[_search_tool()])
+
+    await engine.run_until_blocked(run.id)
+
+    second_call_messages = llm.calls[1]["messages"]
+    assistant = next(message for message in second_call_messages if message.role == "assistant")
+    assert assistant.provider_fields == first.provider_fields
+
+
+@pytest.mark.asyncio
 async def test_engine_plain_text_response_waits_for_user(db_session):
     run = await _make_run(db_session)
     llm = ScriptedLLMGateway([text_response("I need more context to proceed.")])

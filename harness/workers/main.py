@@ -50,6 +50,7 @@ async def _resolve_llm_gateway(
             "llm_base_url": tenant_setting.base_url,
             "llm_api_key": decrypt(tenant_setting.api_key_encrypted),
             "llm_model": tenant_setting.model,
+            "llm_provider": tenant_setting.provider.value.replace("ollama_cloud", "ollama"),
         }
     )
     return LLMGateway(settings=effective_settings), True

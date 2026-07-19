@@ -2,84 +2,97 @@
 
 ## Goal
 
-Add first-class reasoning effort controls to Marcus Code so users can tune the
-cost, latency, and answer quality trade-off without changing models manually.
+Give Marcus first-class control over inference effort, latency, and token cost
+without coupling the agent runtime to one provider's request format.
 
-## Implemented
+## Completed
 
-- Added `ReasoningEffort` values: `off`, `low`, `medium`, `high`, `auto`.
-- Added `LLMOptions` for per-call model behavior:
-  - `reasoning_effort`
-  - `thinking_enabled`
-  - `max_completion_tokens`
-  - `extra_body`
-- Added settings:
-  - `HARNESS_LLM_REASONING_EFFORT`
-  - `HARNESS_LLM_MAX_COMPLETION_TOKENS`
-- Added `/effort` slash command:
-  - `/effort`
-  - `/effort off`
-  - `/effort low`
-  - `/effort medium`
-  - `/effort high`
-  - `/effort auto`
-- Persisted effort settings to `~/.marcus/config.toml`.
-- Preserved effort settings when `/model`, `/config edit`, and first-time setup save config.
-- Displayed effort in terminal status, config output, command help, and TUI status.
-- Passed `max_completion_tokens` into OpenAI-compatible payloads.
-- Added generic system hints for non-auto effort modes.
+### Phase 1: Core API
 
-## Current Behavior
+- Added `ReasoningEffort`: `off`, `low`, `medium`, `high`, `auto`.
+- Added `LLMOptions` fields for effort, thinking enablement, completion limits,
+  hard reasoning budgets, and advanced request fields.
+- Added reasoning-token accounting from
+  `usage.completion_tokens_details.reasoning_tokens`.
 
-`auto` leaves the model behavior unchanged.
+### Phase 2: Config and CLI
 
-`off`, `low`, `medium`, and `high` add a system-level hint before the LLM call.
-`off` also marks `thinking_enabled=False` in `LLMOptions`, ready for provider
-adapters in a later phase.
+- Added `HARNESS_LLM_REASONING_EFFORT`.
+- Added `HARNESS_LLM_MAX_COMPLETION_TOKENS`.
+- Added `HARNESS_LLM_REASONING_BUDGET_TOKENS`.
+- Added `HARNESS_LLM_PROVIDER` for explicit adapter selection behind proxies.
+- Added `/effort <off|low|medium|high|auto>`.
+- Added `/effort budget <tokens|default>`.
+- Added `/effort max-tokens <tokens|default>`.
+- Persisted controls in `~/.marcus/config.toml` and preserved them across model
+  changes, config edits, and first-time setup.
 
-`max_completion_tokens`, when configured, is sent as `max_completion_tokens` in
-the chat completions payload.
+### Phase 3: Provider Adapters
 
-## Verified
+- Added provider detection and explicit override for:
+  - OpenAI
+  - Ollama and Ollama Cloud
+  - OpenRouter
+  - NVIDIA NIM / Nemotron
+  - strict OpenAI-compatible endpoints
+- Mapped output limits to `max_completion_tokens` or `max_tokens` per provider.
+- Mapped OpenAI reasoning models to `reasoning_effort` only when the model family
+  supports it.
+- Mapped Ollama effort to `reasoning_effort`; GPT-OSS degrades `off` to `low`
+  because its reasoning trace cannot be disabled.
+- Mapped OpenRouter effort to `reasoning.effort` and hard budgets to
+  `reasoning.max_tokens`. A hard budget takes precedence because OpenRouter
+  treats those controls as alternatives.
+- Mapped Nemotron controls to `chat_template_kwargs.enable_thinking`,
+  `low_effort`, and model-specific budget fields:
+  - `reasoning_budget`
+  - `thinking_token_budget`
+  - `max_thinking_tokens`
+  - `nvext.max_thinking_tokens`
+- Added one-time graceful fallback when a 400/422 response rejects generated
+  reasoning controls. The unsupported result is cached per provider, model, and
+  effort shape so one rejected level does not disable every level.
+- Protected core request fields from `extra_body` overrides.
+- Preserved `reasoning`, `reasoning_content`, and `reasoning_details` across tool
+  turns, including persisted server runs, while filtering them when the provider
+  changes.
+- Added compatibility tests for adapter selection, payload shape, hard budgets,
+  streaming and non-streaming fallback, fallback caching, and reasoning
+  continuation.
 
-- Focused ruff checks passed for touched files.
-- Focused tests passed: `134 passed`.
-- Full test suite passed: `311 passed, 123 skipped`.
-- CLI help still renders for:
-  - `uv run marcus --help`
-  - `uv run marcus tui --help`
+## Behavior Notes
 
-## Not Implemented Yet
-
-Provider-specific reasoning adapters are intentionally not part of this phase.
-The current implementation avoids sending unsupported provider-specific fields
-by default.
+- `auto` does not add a provider reasoning field.
+- A generic system hint remains in place for explicit effort values. It provides
+  a useful fallback for models that do not expose native controls.
+- Provider-generated reasoning traces are retained for protocol continuity but
+  are not rendered as the final answer.
+- `extra_body` remains an advanced escape hatch for model-specific fields, but it
+  cannot replace `model`, `messages`, `tools`, streaming controls, or temperature.
+- NVIDIA budget field selection is model-family based. New NIM model families can
+  still be configured through `extra_body` until added to the adapter table.
 
 ## Next Work
 
-1. Add provider adapter layer.
-   - OpenAI-compatible/gpt-oss: map effort to supported request fields or system prompt.
-   - Qwen-style models: map `off` to disabled thinking template behavior.
-   - Nemotron-style models: support `enable_thinking`, `medium_effort`, and hard budgets.
+1. Add the auto effort router.
+   - Direct questions: `low` or `off`.
+   - Code reading and explanation: `medium`.
+   - Multi-file edits, CI, releases, and debugging: `high`.
+   - Downgrade effort when the remaining token budget is low.
 
-2. Add `/effort max-tokens` control.
-   - Example: `/effort max-tokens 4096`
-   - Example: `/effort max-tokens default`
-
-3. Add auto effort router.
-   - Direct questions: `low` or `off`
-   - Code reading/explanation: `medium`
-   - Multi-file edits, CI, release, debugging: `high`
-   - Low remaining token budget: downgrade effort automatically
-
-4. Add metrics by effort.
-   - tokens
+2. Add effort observability.
+   - requested and effective effort
+   - reasoning tokens
    - latency
    - tool calls
-   - retries
+   - fallback count
    - guardrail stops
 
-5. Add provider compatibility tests.
-   - Ensure unsupported fields are not sent to strict OpenAI-compatible providers.
-   - Ensure adapter-specific payloads are generated only when selected.
+3. Add provider capability discovery where APIs expose model metadata.
+   - OpenRouter model reasoning capabilities
+   - mandatory reasoning models
+   - supported effort levels
+   - hard-budget support
 
+4. Add opt-in live smoke tests using provider credentials. Unit tests remain
+   deterministic and do not make billable requests.

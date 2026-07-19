@@ -167,7 +167,10 @@ async def test_effort_command_with_no_args_shows_current_effort():
 
     await dispatch(ctx, "/effort")
 
-    assert ui.info == ["Current reasoning effort: medium; max completion tokens: 1,024"]
+    assert ui.info == [
+        "Current reasoning effort: medium; max completion tokens: 1,024; "
+        "reasoning budget: provider default"
+    ]
 
 
 @pytest.mark.asyncio
@@ -193,6 +196,38 @@ async def test_effort_command_rejects_unknown_effort():
     await dispatch(ctx, "/effort maximum")
 
     assert "reasoning effort" in ui.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_effort_budget_commands_set_and_clear_persisted_limits(tmp_path, monkeypatch):
+    _point_user_config_at(monkeypatch, tmp_path)
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/effort budget 4096")
+    await dispatch(ctx, "/effort max-tokens 8192")
+
+    assert ctx.loop.reasoning_budget_tokens == 4096
+    assert ctx.loop.max_completion_tokens == 8192
+    assert ctx.settings.llm_reasoning_budget_tokens == 4096
+    assert ctx.settings.llm_max_completion_tokens == 8192
+    saved = config_module.load_user_config()
+    assert saved["reasoning_budget_tokens"] == 4096
+    assert saved["max_completion_tokens"] == 8192
+
+    await dispatch(ctx, "/effort budget default")
+    assert ctx.loop.reasoning_budget_tokens is None
+    assert "reasoning_budget_tokens" not in config_module.load_user_config()
+
+
+@pytest.mark.asyncio
+async def test_effort_budget_rejects_invalid_token_limit():
+    ui = _FakeUI()
+    ctx = _make_ctx(ui)
+
+    await dispatch(ctx, "/effort budget many")
+
+    assert ui.errors == ["token limit must be a positive integer or 'default'"]
 
 
 @pytest.mark.asyncio

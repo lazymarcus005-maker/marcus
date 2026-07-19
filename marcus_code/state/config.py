@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import httpx
 
 from harness.config import Settings
-from harness.llm.types import ReasoningEffort
+from harness.llm.types import LLMProvider, ReasoningEffort
 
 USER_CONFIG_DIR = Path.home() / ".marcus"
 USER_CONFIG_FILE = USER_CONFIG_DIR / "config.toml"
@@ -22,8 +22,10 @@ _ENV_VAR_BY_FIELD = {
     "llm_api_key": "HARNESS_LLM_API_KEY",
     "llm_base_url": "HARNESS_LLM_BASE_URL",
     "llm_model": "HARNESS_LLM_MODEL",
+    "llm_provider": "HARNESS_LLM_PROVIDER",
     "llm_reasoning_effort": "HARNESS_LLM_REASONING_EFFORT",
     "llm_max_completion_tokens": "HARNESS_LLM_MAX_COMPLETION_TOKENS",
+    "llm_reasoning_budget_tokens": "HARNESS_LLM_REASONING_BUDGET_TOKENS",
 }
 
 
@@ -46,8 +48,10 @@ def save_user_config(
     api_key: str,
     base_url: str,
     model: str,
+    provider: LLMProvider | None = None,
     reasoning_effort: str | None = None,
     max_completion_tokens: int | None = None,
+    reasoning_budget_tokens: int | None = None,
 ) -> Path:
     """Write ~/.marcus/config.toml, creating the directory if needed.
 
@@ -55,10 +59,14 @@ def save_user_config(
     docs/marcus-code-handoff.md's Windows-11-dev-machine context).
     """
     validate_base_url(base_url)
+    if provider not in {None, "auto", "openai", "openrouter", "ollama", "nvidia", "compatible"}:
+        raise ValueError("provider must be one of: auto, openai, openrouter, ollama, nvidia, compatible")
     if reasoning_effort is not None:
         validate_reasoning_effort(reasoning_effort)
     if max_completion_tokens is not None and max_completion_tokens <= 0:
         raise ValueError("max completion tokens must be positive")
+    if reasoning_budget_tokens is not None and reasoning_budget_tokens <= 0:
+        raise ValueError("reasoning budget tokens must be positive")
     USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     content = (
         "[llm]\n"
@@ -66,10 +74,14 @@ def save_user_config(
         f'base_url = "{_toml_escape(base_url)}"\n'
         f'model = "{_toml_escape(model)}"\n'
     )
+    if provider is not None:
+        content += f'provider = "{provider}"\n'
     if reasoning_effort is not None:
         content += f'reasoning_effort = "{_toml_escape(reasoning_effort)}"\n'
     if max_completion_tokens is not None:
         content += f"max_completion_tokens = {max_completion_tokens}\n"
+    if reasoning_budget_tokens is not None:
+        content += f"reasoning_budget_tokens = {reasoning_budget_tokens}\n"
     USER_CONFIG_FILE.write_text(content, encoding="utf-8")
     with contextlib.suppress(OSError):
         os.chmod(USER_CONFIG_FILE, 0o600)

@@ -77,13 +77,17 @@ def test_save_and_load_user_config_round_trips_reasoning_options(tmp_path, monke
         api_key="sk-secret",
         base_url="https://api.openai.com/v1",
         model="gpt-4o-mini",
+        provider="openai",
         reasoning_effort="high",
         max_completion_tokens=4096,
+        reasoning_budget_tokens=1024,
     )
 
     loaded = load_user_config()
     assert loaded["reasoning_effort"] == "high"
     assert loaded["max_completion_tokens"] == 4096
+    assert loaded["provider"] == "openai"
+    assert loaded["reasoning_budget_tokens"] == 1024
 
 
 def test_validate_reasoning_effort_normalizes_known_values():
@@ -131,18 +135,24 @@ def test_resolve_settings_applies_reasoning_options_from_file(tmp_path, monkeypa
     _point_user_config_at(monkeypatch, tmp_path)
     monkeypatch.delenv("HARNESS_LLM_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("HARNESS_LLM_MAX_COMPLETION_TOKENS", raising=False)
+    monkeypatch.delenv("HARNESS_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("HARNESS_LLM_REASONING_BUDGET_TOKENS", raising=False)
     save_user_config(
         api_key="sk-from-file",
         base_url="https://api.openai.com/v1",
         model="gpt-4o-mini",
+        provider="openai",
         reasoning_effort="low",
         max_completion_tokens=2048,
+        reasoning_budget_tokens=512,
     )
 
     settings = resolve_settings()
 
     assert settings.llm_reasoning_effort == "low"
     assert settings.llm_max_completion_tokens == 2048
+    assert settings.llm_provider == "openai"
+    assert settings.llm_reasoning_budget_tokens == 512
 
 
 def test_resolve_settings_env_var_wins_over_file(tmp_path, monkeypatch):

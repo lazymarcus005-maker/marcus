@@ -100,7 +100,14 @@ async def test_plain_text_reply_ends_turn_immediately():
 async def test_reasoning_effort_adds_hint_and_options_to_llm_call():
     llm = ScriptedLLMGateway([text_response("all done")])
     ui = _FakeUI()
-    loop = MarcusLoop(llm, [], ui, reasoning_effort="high", max_completion_tokens=2048)
+    loop = MarcusLoop(
+        llm,
+        [],
+        ui,
+        reasoning_effort="high",
+        max_completion_tokens=2048,
+        reasoning_budget_tokens=512,
+    )
 
     await loop.run_turn("do something difficult")
 
@@ -113,6 +120,20 @@ async def test_reasoning_effort_adds_hint_and_options_to_llm_call():
     assert isinstance(options, LLMOptions)
     assert options.reasoning_effort == "high"
     assert options.max_completion_tokens == 2048
+    assert options.reasoning_budget_tokens == 512
+
+
+@pytest.mark.asyncio
+async def test_provider_reasoning_fields_survive_local_tool_turn():
+    first = tool_call_response("peek", {})
+    first.provider_fields = {"reasoning_details": [{"type": "reasoning.encrypted"}]}
+    llm = ScriptedLLMGateway([first, text_response("done")])
+    loop = MarcusLoop(llm, [_read_only_tool()], _FakeUI())
+
+    await loop.run_turn("inspect")
+
+    assistant = next(message for message in llm.calls[1]["messages"] if message.role == "assistant")
+    assert assistant.provider_fields == first.provider_fields
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ import httpx
 import orjson
 import pytest
 
+from harness.config import Settings
 from harness.llm.gateway import (
     LLMError,
     LLMGateway,
@@ -72,8 +73,101 @@ async def test_complete_applies_llm_options_to_payload():
         options=LLMOptions(max_completion_tokens=256, extra_body={"seed": 7}),
     )
 
-    assert captured["max_completion_tokens"] == 256
+    assert captured["max_tokens"] == 256
     assert captured["seed"] == 7
+
+
+@pytest.mark.asyncio
+async def test_complete_retries_without_rejected_reasoning_fields_and_caches_result():
+    payloads = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        payloads.append(payload)
+        if "reasoning_effort" in payload:
+            return httpx.Response(400, text="unknown parameter: reasoning_effort")
+        return httpx.Response(200, json=_openai_response(content="ok"))
+
+    settings = Settings(
+        llm_base_url="https://api.openai.com/v1", llm_model="gpt-5.2", llm_api_key="test"
+    )
+    gateway = LLMGateway(settings=settings, http_client=_client_with_handler(handler))
+    options = LLMOptions(reasoning_effort="high")
+
+    await gateway.complete([LLMMessage(role="user", content="hello")], options=options)
+    await gateway.complete([LLMMessage(role="user", content="again")], options=options)
+    await gateway.complete(
+        [LLMMessage(role="user", content="try low")],
+        options=LLMOptions(reasoning_effort="low"),
+    )
+
+    assert len(payloads) == 5
+    assert payloads[0]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in payloads[1]
+    assert "reasoning_effort" not in payloads[2]
+    assert payloads[3]["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in payloads[4]
+
+
+@pytest.mark.asyncio
+async def test_complete_preserves_openrouter_reasoning_details_for_tool_continuation():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(orjson.loads(request.content))
+        body = _openai_response(content="done")
+        body["choices"][0]["message"]["reasoning_details"] = [
+            {"type": "reasoning.encrypted", "data": "opaque"}
+        ]
+        body["usage"]["completion_tokens_details"] = {"reasoning_tokens": 3}
+        return httpx.Response(200, json=body)
+
+    settings = Settings(
+        llm_base_url="https://openrouter.ai/api/v1",
+        llm_model="anthropic/claude-sonnet",
+        llm_api_key="test",
+    )
+    gateway = LLMGateway(settings=settings, http_client=_client_with_handler(handler))
+    response = await gateway.complete(
+        [
+            LLMMessage(
+                role="assistant",
+                tool_calls=[],
+                provider_fields={
+                    "reasoning_details": [{"type": "reasoning.encrypted", "data": "prior"}]
+                },
+            )
+        ]
+    )
+
+    assert captured["messages"][0]["reasoning_details"][0]["data"] == "prior"
+    assert response.provider_fields["reasoning_details"][0]["data"] == "opaque"
+    assert response.usage.reasoning_tokens == 3
+
+
+@pytest.mark.asyncio
+async def test_complete_filters_provider_fields_when_switching_to_strict_compatible_endpoint():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(orjson.loads(request.content))
+        return httpx.Response(200, json=_openai_response(content="ok"))
+
+    settings = Settings(
+        llm_base_url="https://strict.example/v1", llm_model="model", llm_api_key="test"
+    )
+    gateway = LLMGateway(settings=settings, http_client=_client_with_handler(handler))
+    await gateway.complete(
+        [
+            LLMMessage(
+                role="assistant",
+                content="prior",
+                provider_fields={"reasoning_details": [{"data": "must-not-leak"}]},
+            )
+        ]
+    )
+
+    assert "reasoning_details" not in captured["messages"][0]
 
 
 @pytest.mark.asyncio
@@ -96,6 +190,36 @@ async def test_complete_stream_emits_text_deltas():
     )
     assert response.content == "hello world"
     assert deltas == ["hello ", "world"]
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_retries_once_without_rejected_reasoning_fields():
+    payloads = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        payloads.append(payload)
+        if "reasoning" in payload:
+            return httpx.Response(422, text="extra inputs are not permitted: reasoning")
+        return httpx.Response(
+            200, text='data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]'
+        )
+
+    settings = Settings(
+        llm_base_url="https://openrouter.ai/api/v1",
+        llm_model="openai/gpt-5.2",
+        llm_api_key="test",
+    )
+    gateway = LLMGateway(settings=settings, http_client=_client_with_handler(handler))
+    response = await gateway.complete_stream(
+        [LLMMessage(role="user", content="hello")],
+        options=LLMOptions(reasoning_effort="medium"),
+    )
+
+    assert response.content == "ok"
+    assert len(payloads) == 2
+    assert payloads[0]["reasoning"] == {"effort": "medium"}
+    assert "reasoning" not in payloads[1]
 
 
 @pytest.mark.asyncio

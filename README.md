@@ -93,8 +93,10 @@ Environment variables with the `HARNESS_` prefix override the user config:
 HARNESS_LLM_BASE_URL=https://ollama.com/v1
 HARNESS_LLM_API_KEY=...
 HARNESS_LLM_MODEL=gpt-oss:120b
+HARNESS_LLM_PROVIDER=auto
 HARNESS_LLM_REASONING_EFFORT=auto
 HARNESS_LLM_MAX_COMPLETION_TOKENS=4096
+HARNESS_LLM_REASONING_BUDGET_TOKENS=2048
 ```
 
 Do not commit API keys or paste them into logs. If a key is exposed, rotate it.
@@ -110,6 +112,8 @@ Inside the REPL:
 /usage login
 /model llama-3.1-70b
 /effort high
+/effort budget 2048
+/effort max-tokens 4096
 /config
 /config edit
 /mode auto
@@ -126,6 +130,8 @@ Common workflows:
 - `/config edit` switches provider, API key, and model.
 - `/model <name>` switches and persists the default model.
 - `/effort <level>` switches and persists reasoning effort.
+- `/effort budget <tokens|default>` sets or clears a hard reasoning-token budget.
+- `/effort max-tokens <tokens|default>` sets or clears the total completion limit.
 - `/usage` shows token totals and, for Ollama Cloud, quota information.
 - `/usage login` opens a browser once to save Ollama Cloud usage-session state.
 - `/mode ask|agent|auto|yolo` changes tool approval behavior.
@@ -142,12 +148,26 @@ high
 auto
 ```
 
-`auto` leaves model behavior unchanged. Other levels add a lightweight system
-hint for the current LLM call. `HARNESS_LLM_MAX_COMPLETION_TOKENS`, when set, is
-sent as `max_completion_tokens` to OpenAI-compatible chat-completions endpoints.
+`auto` leaves provider reasoning controls unchanged. Other levels add a
+lightweight system hint and are translated by the active provider adapter:
 
-This is the first layer of the feature. Provider-specific adapters for models
-with special thinking controls are tracked in `feature-worl.md`.
+| Adapter | Reasoning control | Completion limit |
+| --- | --- | --- |
+| OpenAI | `reasoning_effort` for supported reasoning models | `max_completion_tokens` |
+| Ollama | `reasoning_effort`; GPT-OSS maps `off` to `low` | `max_tokens` |
+| OpenRouter | `reasoning.effort` or `reasoning.max_tokens` | `max_tokens` |
+| NVIDIA NIM | Nemotron `chat_template_kwargs` and model-specific budgets | `max_tokens` |
+| Compatible | no provider-specific reasoning fields | `max_tokens` |
+
+Marcus detects known providers from the base URL. Set `HARNESS_LLM_PROVIDER` to
+`openai`, `openrouter`, `ollama`, `nvidia`, or `compatible` when using a proxy or
+custom endpoint. If an endpoint rejects an adapter's reasoning field, Marcus
+retries once without it and remembers that result for the model for the rest of
+the session and matching effort shape.
+
+Reasoning metadata required across tool calls, such as OpenRouter
+`reasoning_details`, is retained and sent only when the active provider protocol
+allows it. See `feature-worl.md` for implementation details and remaining work.
 
 ## Agent Modes
 
@@ -274,4 +294,5 @@ sha256sum -c SHA256SUMS --ignore-missing
 - Marcus currently uses OpenAI-compatible chat completions.
 - Tool calling is required for agentic coding workflows.
 - Some providers omit usage fields; Marcus estimates token usage in that case.
-- Full provider-specific reasoning adapters are planned but not complete.
+- Reasoning adapters cover OpenAI, Ollama, OpenRouter, NVIDIA NIM, and strict
+  OpenAI-compatible fallback endpoints.

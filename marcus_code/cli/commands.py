@@ -40,6 +40,7 @@ class CommandContext:
         self.loop.model = new_settings.llm_model
         self.loop.reasoning_effort = new_settings.llm_reasoning_effort
         self.loop.max_completion_tokens = new_settings.llm_max_completion_tokens
+        self.loop.reasoning_budget_tokens = new_settings.llm_reasoning_budget_tokens
         self.settings = new_settings
         await old_llm.aclose()
 
@@ -67,8 +68,10 @@ async def _cmd_model(ctx: CommandContext, args: str) -> None:
             api_key=api_key,
             base_url=ctx.settings.llm_base_url,
             model=name,
+            provider=ctx.settings.llm_provider,
             reasoning_effort=ctx.settings.llm_reasoning_effort,
             max_completion_tokens=ctx.settings.llm_max_completion_tokens,
+            reasoning_budget_tokens=ctx.settings.llm_reasoning_budget_tokens,
         )
     except ValueError as exc:
         ctx.ui.print_error(f"Model switched for this session, but could not save default: {exc}")
@@ -80,12 +83,51 @@ async def _cmd_effort(ctx: CommandContext, args: str) -> None:
     value = args.strip().lower()
     if not value:
         max_tokens = ctx.loop.max_completion_tokens
-        suffix = (
+        max_suffix = (
             f"; max completion tokens: {max_tokens:,}"
             if max_tokens is not None
             else "; max completion tokens: provider default"
         )
-        ctx.ui.print_info(f"Current reasoning effort: {ctx.loop.reasoning_effort}{suffix}")
+        budget = ctx.loop.reasoning_budget_tokens
+        budget_suffix = (
+            f"; reasoning budget: {budget:,} tokens"
+            if budget is not None
+            else "; reasoning budget: provider default"
+        )
+        ctx.ui.print_info(
+            f"Current reasoning effort: {ctx.loop.reasoning_effort}{max_suffix}{budget_suffix}"
+        )
+        return
+    parts = value.split()
+    if parts[0] in {"budget", "max-tokens"}:
+        if len(parts) != 2:
+            ctx.ui.print_error(
+                "usage: /effort budget <tokens|default> or /effort max-tokens <tokens|default>"
+            )
+            return
+        if parts[1] == "default":
+            token_limit = None
+        else:
+            try:
+                token_limit = int(parts[1])
+            except ValueError:
+                token_limit = 0
+            if token_limit <= 0:
+                ctx.ui.print_error("token limit must be a positive integer or 'default'")
+                return
+        setting_name = (
+            "llm_reasoning_budget_tokens" if parts[0] == "budget" else "llm_max_completion_tokens"
+        )
+        loop_name = "reasoning_budget_tokens" if parts[0] == "budget" else "max_completion_tokens"
+        setattr(ctx.loop, loop_name, token_limit)
+        ctx.settings = ctx.settings.model_copy(update={setting_name: token_limit})
+        if not _save_effort_config(ctx):
+            return
+        if hasattr(ctx.ui, "refresh_status"):
+            ctx.ui.refresh_status()
+        shown = f"{token_limit:,}" if token_limit is not None else "provider default"
+        label = "Reasoning budget" if parts[0] == "budget" else "Max completion tokens"
+        ctx.ui.print_info(f"{label} set to {shown} and saved as default.")
         return
     try:
         effort = validate_reasoning_effort(value)
@@ -94,21 +136,29 @@ async def _cmd_effort(ctx: CommandContext, args: str) -> None:
         return
     ctx.loop.reasoning_effort = effort
     ctx.settings = ctx.settings.model_copy(update={"llm_reasoning_effort": effort})
+    if not _save_effort_config(ctx):
+        return
+    if hasattr(ctx.ui, "refresh_status"):
+        ctx.ui.refresh_status()
+    ctx.ui.print_info(f"Reasoning effort switched to {effort!r} and saved as default.")
+
+
+def _save_effort_config(ctx: CommandContext) -> bool:
     api_key = ctx.settings.llm_api_key if has_llm_credentials(ctx.settings) else ""
     try:
         save_user_config(
             api_key=api_key,
             base_url=ctx.settings.llm_base_url,
             model=ctx.settings.llm_model,
-            reasoning_effort=effort,
+            provider=ctx.settings.llm_provider,
+            reasoning_effort=ctx.settings.llm_reasoning_effort,
             max_completion_tokens=ctx.settings.llm_max_completion_tokens,
+            reasoning_budget_tokens=ctx.settings.llm_reasoning_budget_tokens,
         )
     except ValueError as exc:
-        ctx.ui.print_error(f"Reasoning effort switched for this session, but could not save default: {exc}")
-        return
-    if hasattr(ctx.ui, "refresh_status"):
-        ctx.ui.refresh_status()
-    ctx.ui.print_info(f"Reasoning effort switched to {effort!r} and saved as default.")
+        ctx.ui.print_error(f"Reasoning settings changed for this session, but could not save: {exc}")
+        return False
+    return True
 
 
 async def _cmd_usage(ctx: CommandContext, args: str) -> None:
@@ -318,8 +368,10 @@ async def _cmd_config(ctx: CommandContext, args: str) -> None:
                 api_key=new_key,
                 base_url=base_url,
                 model=model,
+                provider=ctx.settings.llm_provider,
                 reasoning_effort=ctx.settings.llm_reasoning_effort,
                 max_completion_tokens=ctx.settings.llm_max_completion_tokens,
+                reasoning_budget_tokens=ctx.settings.llm_reasoning_budget_tokens,
             )
         except ValueError as exc:
             ctx.ui.print_error(str(exc))

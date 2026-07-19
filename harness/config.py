@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from harness.llm.types import LLMProvider
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="HARNESS_", extra="ignore")
@@ -17,8 +19,10 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://ollama.com/v1"
     llm_api_key: str = "changeme"
     llm_model: str = "gpt-oss:120b"
+    llm_provider: LLMProvider = "auto"
     llm_reasoning_effort: Literal["off", "low", "medium", "high", "auto"] = "auto"
     llm_max_completion_tokens: int | None = None
+    llm_reasoning_budget_tokens: int | None = None
     llm_timeout_seconds: float = 60.0
 
     secret_key: str = "changeme-32-bytes-minimum-secret-key!!"
@@ -105,6 +109,8 @@ class Settings(BaseSettings):
             raise ValueError(f"settings must be positive: {', '.join(invalid)}")
         if self.llm_max_completion_tokens is not None and self.llm_max_completion_tokens <= 0:
             raise ValueError("llm_max_completion_tokens must be positive when set")
+        if self.llm_reasoning_budget_tokens is not None and self.llm_reasoning_budget_tokens <= 0:
+            raise ValueError("llm_reasoning_budget_tokens must be positive when set")
         if self.cli_max_argument_repairs < 0 or self.run_max_argument_repairs < 0:
             raise ValueError("max_argument_repairs must be zero or greater")
         if not 0 < self.run_compact_threshold_percent < 100:

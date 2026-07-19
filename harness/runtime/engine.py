@@ -355,6 +355,8 @@ class RunEngine:
             "finish_reason": response.finish_reason,
             "model": response.model,
         }
+        if response.provider_fields:
+            payload["provider_fields"] = response.provider_fields
         await self.repo.add_step(
             run.id,
             step_no,
@@ -364,6 +366,7 @@ class RunEngine:
                 "prompt_tokens": response.usage.prompt_tokens,
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
+                "reasoning_tokens": response.usage.reasoning_tokens,
             },
         )
         await record_usage(
