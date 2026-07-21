@@ -60,9 +60,30 @@ without coupling the agent runtime to one provider's request format.
   streaming and non-streaming fallback, fallback caching, and reasoning
   continuation.
 
+### Phase 4: Auto Effort Router
+
+- Added `marcus_code/runtime/effort_router.py`. When effort is `auto` the CLI
+  loop resolves a concrete level per turn from the task contract:
+  - Direct questions map to `low`.
+  - Repository reading and explanation map to `medium`.
+  - Changes and operations (multi-file edits, CI, releases, debugging) map to
+    `high`.
+- Added a graceful downgrade: when the remaining session token budget falls
+  below `LOW_BUDGET_RATIO` (20%) the routed level steps down once, with `low`
+  as the floor. No downgrade applies when no session budget is configured.
+- The router runs per LLM call, so effort tracks the budget as it depletes
+  within a long turn, including the planning call.
+- An explicit effort level (`off`/`low`/`medium`/`high`) bypasses the router
+  entirely; the persisted setting stays `auto` so status still shows `auto`.
+- Added unit tests for the router mapping and budget downgrade, plus loop
+  integration tests for direct/change routing, budget step-down, and explicit
+  override.
+
 ## Behavior Notes
 
-- `auto` does not add a provider reasoning field.
+- `auto` now resolves to a concrete level per turn via the effort router, so it
+  adds the same reasoning hint and provider field as an explicit level. Only an
+  unroutable case (no router in a non-CLI caller) leaves `auto` as a no-op.
 - A generic system hint remains in place for explicit effort values. It provides
   a useful fallback for models that do not expose native controls.
 - Provider-generated reasoning traces are retained for protocol continuity but
@@ -74,13 +95,7 @@ without coupling the agent runtime to one provider's request format.
 
 ## Next Work
 
-1. Add the auto effort router.
-   - Direct questions: `low` or `off`.
-   - Code reading and explanation: `medium`.
-   - Multi-file edits, CI, releases, and debugging: `high`.
-   - Downgrade effort when the remaining token budget is low.
-
-2. Add effort observability.
+1. Add effort observability.
    - requested and effective effort
    - reasoning tokens
    - latency
@@ -88,11 +103,11 @@ without coupling the agent runtime to one provider's request format.
    - fallback count
    - guardrail stops
 
-3. Add provider capability discovery where APIs expose model metadata.
+2. Add provider capability discovery where APIs expose model metadata.
    - OpenRouter model reasoning capabilities
    - mandatory reasoning models
    - supported effort levels
    - hard-budget support
 
-4. Add opt-in live smoke tests using provider credentials. Unit tests remain
+3. Add opt-in live smoke tests using provider credentials. Unit tests remain
    deterministic and do not make billable requests.

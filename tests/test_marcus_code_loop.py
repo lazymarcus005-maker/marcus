@@ -123,6 +123,64 @@ async def test_reasoning_effort_adds_hint_and_options_to_llm_call():
     assert options.reasoning_budget_tokens == 512
 
 
+def _effort_of(llm) -> str:
+    return llm.calls[0]["options"].reasoning_effort
+
+
+def _effort_hint(llm) -> str | None:
+    for message in llm.calls[0]["messages"]:
+        content = message.content or ""
+        if message.role == "system" and content.startswith("Reasoning effort:"):
+            return content
+    return None
+
+
+@pytest.mark.asyncio
+async def test_auto_effort_routes_direct_question_to_low():
+    llm = ScriptedLLMGateway([text_response("42")])
+    loop = MarcusLoop(llm, [], _FakeUI(), reasoning_effort="auto")
+
+    await loop.run_turn("What is six times seven?")
+
+    assert _effort_of(llm) == "low"
+    assert "Reasoning effort: low" in (_effort_hint(llm) or "")
+
+
+@pytest.mark.asyncio
+async def test_auto_effort_routes_change_request_to_high():
+    # A change request is agentic: the first call is the planning call, which
+    # still carries the routed effort.
+    llm = ScriptedLLMGateway([text_response("plan"), text_response("done")])
+    loop = MarcusLoop(llm, [], _FakeUI(), reasoning_effort="auto")
+
+    await loop.run_turn("Fix the failing test in agent.py")
+
+    assert _effort_of(llm) == "high"
+
+
+@pytest.mark.asyncio
+async def test_auto_effort_steps_down_when_budget_is_low():
+    llm = ScriptedLLMGateway([text_response("plan"), text_response("done")])
+    loop = MarcusLoop(llm, [], _FakeUI(), reasoning_effort="auto", max_total_tokens=1000)
+    loop.usage.total_tokens = 900  # 10% of budget remaining
+
+    await loop.run_turn("Fix the failing test in agent.py")
+
+    assert _effort_of(llm) == "medium"
+
+
+@pytest.mark.asyncio
+async def test_explicit_effort_ignores_the_auto_router():
+    llm = ScriptedLLMGateway([text_response("plan"), text_response("done")])
+    loop = MarcusLoop(llm, [], _FakeUI(), reasoning_effort="off")
+
+    await loop.run_turn("Fix the failing test in agent.py")
+
+    options = llm.calls[0]["options"]
+    assert options.reasoning_effort == "off"
+    assert options.thinking_enabled is False
+
+
 @pytest.mark.asyncio
 async def test_provider_reasoning_fields_survive_local_tool_turn():
     first = tool_call_response("peek", {})

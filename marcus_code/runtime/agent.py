@@ -14,6 +14,7 @@ from harness.runtime.guardrails import REPEATED_CALL_WINDOW
 from harness.runtime.result_pipeline import truncate_result
 from harness.runtime.tool_validation import ToolArgumentError, normalize_and_validate_arguments
 from harness.runtime.tools import Tool
+from marcus_code.runtime.effort_router import route_reasoning_effort
 from marcus_code.runtime.event_bus import EventBus
 from marcus_code.runtime.events import (
     AssistantMessage,
@@ -360,12 +361,13 @@ class MarcusLoop:
                             ),
                         )
                     )
-                effort_hint = _reasoning_effort_hint(self.reasoning_effort)
+                effective_effort = self._effective_reasoning_effort(contract)
+                effort_hint = _reasoning_effort_hint(effective_effort)
                 if effort_hint:
                     call_messages.append(LLMMessage(role="system", content=effort_hint))
                 options = LLMOptions(
-                    reasoning_effort=self.reasoning_effort,
-                    thinking_enabled=False if self.reasoning_effort == "off" else None,
+                    reasoning_effort=effective_effort,
+                    thinking_enabled=False if effective_effort == "off" else None,
                     max_completion_tokens=self.max_completion_tokens,
                     reasoning_budget_tokens=self.reasoning_budget_tokens,
                 )
@@ -986,6 +988,24 @@ class MarcusLoop:
             "total_tokens": self.usage.total_tokens,
             "tokens_per_second": self.usage.last_tokens_per_second,
         }
+
+    def _budget_remaining_ratio(self) -> float | None:
+        """Fraction of the session token budget still available, or None when
+        no budget is configured."""
+        if self.max_total_tokens is None or self.max_total_tokens <= 0:
+            return None
+        remaining = self.max_total_tokens - self.usage.total_tokens
+        return max(0.0, remaining / self.max_total_tokens)
+
+    def _effective_reasoning_effort(self, contract: TaskContract) -> ReasoningEffort:
+        """Resolve the configured effort for this call. An explicit level is
+        used verbatim; ``auto`` is routed from the task contract and the
+        remaining session token budget."""
+        if self.reasoning_effort != "auto":
+            return self.reasoning_effort
+        return route_reasoning_effort(
+            contract, budget_remaining_ratio=self._budget_remaining_ratio()
+        )
 
     def _update_ui_status(self) -> None:
         if hasattr(self.ui, "refresh_status"):
